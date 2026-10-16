@@ -1,0 +1,11 @@
+{
+  "name": "Context Pilot - Jira Ticket Analyzer",
+  "description": "AI-powered Jira ticket analyzer predicting affected codebase files, components, and APIs with GitHub verification and usage tracking.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
