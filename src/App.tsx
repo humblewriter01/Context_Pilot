@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { JiraSimulatorView } from './components/JiraSimulatorView';
 import { DashboardView } from './components/DashboardView';
@@ -6,18 +7,73 @@ import { GitHubVerifierView } from './components/GitHubVerifierView';
 import { HistoryFeedbackView } from './components/HistoryFeedbackView';
 import { ExtensionSimulatorView } from './components/ExtensionSimulatorView';
 import { SubscriptionPlansView } from './components/SubscriptionPlansView';
+import { AdminPortal } from './components/AdminPortal';
+import { AuthModal } from './components/AuthModal';
+import { AccountModal } from './components/AccountModal';
 import { storageService } from './services/storage';
 import { UserProfile, UsageStats, AnalysisRecord, FeedbackRecord, SubscriptionTier } from './types';
-import { CheckCircle2, GitBranch, Layers, ShieldCheck } from 'lucide-react';
 
 export const App: React.FC = () => {
-  const [user, setUser] = useState<UserProfile>(() => storageService.getUser());
+  const [user, setUser] = useState<UserProfile | null>(() => storageService.getUser());
   const [usage, setUsage] = useState<UsageStats>(() => storageService.getUsage());
   const [analyses, setAnalyses] = useState<AnalysisRecord[]>(() => storageService.getAnalyses());
   const [feedback, setFeedback] = useState<FeedbackRecord[]>(() => storageService.getFeedback());
 
-  const [activeTab, setActiveTab] = useState<string>('jira');
+  const [activeTab, setActiveTab] = useState<string>(() => {
+    const hash = window.location.hash.replace('#', '').toLowerCase();
+    if (['jira', 'dashboard', 'github', 'history', 'subscription', 'extension'].includes(hash)) {
+      return hash;
+    }
+    const pinned = localStorage.getItem('cp_pinned_tab');
+    if (pinned && ['jira', 'dashboard', 'github', 'history', 'subscription', 'extension'].includes(pinned)) {
+      return pinned;
+    }
+    return 'jira';
+  });
   const [gitHubFiles, setGitHubFiles] = useState<string[]>([]);
+  // Responsive sidebar open state: open by default on desktop (>=768px), closed on mobile
+  const [sidebarOpen, setSidebarOpen] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return window.innerWidth >= 768;
+    }
+    return true;
+  });
+
+  // Modals
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
+
+  // URL route handling for /admin
+  const checkIsAdmin = () => {
+    const path = window.location.pathname.toLowerCase();
+    const hash = window.location.hash.toLowerCase();
+    return path === '/admin' || path.startsWith('/admin/') || hash === '#/admin' || hash === '#admin';
+  };
+
+  const [isAdminRoute, setIsAdminRoute] = useState(checkIsAdmin);
+
+  useEffect(() => {
+    const handleLocationChange = () => {
+      setIsAdminRoute(checkIsAdmin());
+      const hash = window.location.hash.replace('#', '').toLowerCase();
+      if (['jira', 'dashboard', 'github', 'history', 'subscription', 'extension'].includes(hash)) {
+        setActiveTab(hash);
+      }
+    };
+
+    window.addEventListener('popstate', handleLocationChange);
+    window.addEventListener('hashchange', handleLocationChange);
+    return () => {
+      window.removeEventListener('popstate', handleLocationChange);
+      window.removeEventListener('hashchange', handleLocationChange);
+    };
+  }, []);
+
+  const navigateToApp = () => {
+    window.history.pushState({}, '', '/');
+    window.location.hash = '';
+    setIsAdminRoute(false);
+  };
 
   const refreshAllData = () => {
     setUser(storageService.getUser());
@@ -32,9 +88,18 @@ export const App: React.FC = () => {
     setUsage(storageService.getUsage());
   };
 
-  const handleUsageReset = () => {
-    const updatedUsage = storageService.resetUsage();
-    setUsage(updatedUsage);
+  const handleLogout = () => {
+    storageService.logoutUser();
+    setUser(null);
+    setUsage(storageService.getUsage());
+  };
+
+  const handleAccountDeleted = () => {
+    setUser(null);
+    setAnalyses([]);
+    setFeedback([]);
+    setUsage(storageService.getUsage());
+    setActiveTab('jira');
   };
 
   const handleNavigateToGitHub = (files: string[]) => {
@@ -48,95 +113,164 @@ export const App: React.FC = () => {
       ...(record.backend_files || []),
       ...(record.database_files || []),
       ...(record.config_files || []),
-      ...(record.test_files || [])
+      ...(record.test_files || []),
     ];
     setGitHubFiles(files);
     setActiveTab('github');
   };
 
+  // If path is /admin or #/admin, render protected Enterprise Admin Portal
+  if (isAdminRoute) {
+    return <AdminPortal onBackToApp={navigateToApp} />;
+  }
+
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col text-slate-900 font-sans">
-      {/* Top Header */}
-      <Header
+    <div className="min-h-screen bg-slate-50 flex text-slate-900 font-sans relative overflow-x-hidden">
+      {/* Responsive Left Sidebar */}
+      <Sidebar
         user={user}
         usage={usage}
         activeTab={activeTab}
-        onTabChange={setActiveTab}
-        onTierChange={handleTierChange}
+        onTabChange={(tab) => {
+          setActiveTab(tab);
+          // On mobile, auto-close drawer upon navigation
+          if (typeof window !== 'undefined' && window.innerWidth < 768) {
+            setSidebarOpen(false);
+          }
+        }}
+        isOpen={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        onOpenAuthModal={() => setIsAuthModalOpen(true)}
+        onOpenAccountModal={() => setIsAccountModalOpen(true)}
+        onLogout={handleLogout}
       />
 
-      {/* Main View Area */}
-      <main className="flex-1 pb-16">
-        {activeTab === 'jira' && (
-          <JiraSimulatorView
-            usage={usage}
-            onUsageUpdated={setUsage}
-            onNavigateToGitHub={handleNavigateToGitHub}
-            onNavigateToPlans={() => setActiveTab('subscription')}
-          />
-        )}
+      {/* Main Content Area */}
+      <div className="flex-1 flex flex-col min-w-0 w-full overflow-y-auto">
+        <Header
+          user={user}
+          usage={usage}
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
+          onOpenAuthModal={() => setIsAuthModalOpen(true)}
+          onOpenAccountModal={() => setIsAccountModalOpen(true)}
+          onLogout={handleLogout}
+          onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+          isSidebarOpen={sidebarOpen}
+        />
 
-        {activeTab === 'dashboard' && (
-          <DashboardView
-            user={user}
-            usage={usage}
-            analyses={analyses}
-            feedback={feedback}
-            onSelectAnalysis={handleSelectAnalysis}
-            onNavigateToPlans={() => setActiveTab('subscription')}
-          />
-        )}
+        <main className="flex-1 pb-16">
+          {activeTab === 'jira' && (
+            <JiraSimulatorView
+              usage={usage}
+              onUsageUpdated={setUsage}
+              onNavigateToGitHub={handleNavigateToGitHub}
+              onNavigateToPlans={() => setActiveTab('subscription')}
+            />
+          )}
 
-        {activeTab === 'github' && (
-          <GitHubVerifierView initialFiles={gitHubFiles} />
-        )}
+          {activeTab === 'dashboard' && (
+            <DashboardView
+              user={user}
+              usage={usage}
+              analyses={analyses}
+              feedback={feedback}
+              onSelectAnalysis={handleSelectAnalysis}
+              onNavigateToPlans={() => setActiveTab('subscription')}
+            />
+          )}
 
-        {activeTab === 'history' && (
-          <HistoryFeedbackView
-            analyses={analyses}
-            feedback={feedback}
-            onVerifyOnGitHub={handleNavigateToGitHub}
-            onRefreshData={refreshAllData}
-          />
-        )}
+          {activeTab === 'github' && (
+            <GitHubVerifierView initialFiles={gitHubFiles} />
+          )}
 
-        {activeTab === 'extension' && (
-          <ExtensionSimulatorView
-            user={user}
-            usage={usage}
-            onNavigateToJira={() => setActiveTab('jira')}
-          />
-        )}
+          {activeTab === 'history' && (
+            <HistoryFeedbackView
+              analyses={analyses}
+              feedback={feedback}
+              onVerifyOnGitHub={handleNavigateToGitHub}
+              onRefreshData={refreshAllData}
+            />
+          )}
 
-        {activeTab === 'subscription' && (
-          <SubscriptionPlansView
-            user={user}
-            usage={usage}
-            onTierChanged={handleTierChange}
-            onUsageReset={handleUsageReset}
-          />
-        )}
-      </main>
+          {activeTab === 'extension' && (
+            <ExtensionSimulatorView
+              user={user || {
+                id: 0,
+                firebaseUid: 'guest',
+                email: 'developer@workspace.com',
+                displayName: 'Developer',
+                subscriptionTier: 'pro',
+                createdAt: new Date().toISOString(),
+                lastLoginAt: new Date().toISOString(),
+                status: 'active',
+              }}
+              usage={usage}
+              onNavigateToJira={() => setActiveTab('jira')}
+            />
+          )}
 
-      {/* Footer */}
-      <footer className="bg-white border-t border-slate-200 py-6 text-xs text-slate-500">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4">
-          <div className="flex items-center gap-2">
-            <div className="w-5 h-5 rounded-md bg-gradient-to-br from-[#667eea] to-[#764ba2] flex items-center justify-center text-white text-[10px] font-bold">
-              CP
+          {activeTab === 'subscription' && (
+            <SubscriptionPlansView
+              user={user}
+              usage={usage}
+              onTierChanged={handleTierChange}
+              onOpenAuthModal={() => setIsAuthModalOpen(true)}
+            />
+          )}
+        </main>
+
+        {/* Professional Enterprise Footer */}
+        <footer className="bg-white border-t border-slate-200 py-6 text-xs text-slate-500">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4">
+            <div className="flex items-center gap-2">
+              <div className="w-5 h-5 rounded-md bg-gradient-to-br from-[#667eea] to-[#764ba2] flex items-center justify-center text-white text-[10px] font-bold">
+                CP
+              </div>
+              <span className="font-semibold text-slate-800">Context Pilot</span>
+              <span>•</span>
+              <span>AI Code Impact & Jira Prediction Engine</span>
             </div>
-            <span className="font-semibold text-slate-700">Context Pilot</span>
-            <span>•</span>
-            <span>AI Code Impact & Jira Ticket Prediction System</span>
-          </div>
 
-          <div className="flex items-center gap-4 text-slate-400">
-            <span>Powered by Google Gemini 3.8 Flash</span>
-            <span>•</span>
-            <span className="text-indigo-600 font-semibold">Context Pilot v3.0</span>
+            <div className="flex items-center gap-4 text-slate-400">
+              <span>Enterprise Architecture</span>
+              <span>•</span>
+              <span>Paystack Secured</span>
+              <span>•</span>
+              <span>© {new Date().getFullYear()} Hausa Cybertech</span>
+            </div>
           </div>
-        </div>
-      </footer>
+        </footer>
+      </div>
+
+      {/* Auth Modal (Sign In, Sign Up, Forgot Password, GitHub) */}
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
+        onAuthSuccess={(authedUser) => {
+          setUser(authedUser);
+          setUsage(storageService.getUsage());
+          setIsAuthModalOpen(false);
+        }}
+      />
+
+      {/* Account Settings & Danger Zone Modal (with Account Deletion) */}
+      {user && (
+        <AccountModal
+          isOpen={isAccountModalOpen}
+          onClose={() => setIsAccountModalOpen(false)}
+          user={user}
+          usage={usage}
+          onUserUpdated={(updated) => {
+            setUser(updated);
+          }}
+          onAccountDeleted={handleAccountDeleted}
+          onNavigateToPlans={() => {
+            setIsAccountModalOpen(false);
+            setActiveTab('subscription');
+          }}
+        />
+      )}
     </div>
   );
 };

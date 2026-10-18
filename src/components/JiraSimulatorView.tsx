@@ -4,21 +4,17 @@ import { JiraAnalyzerPopover } from './JiraAnalyzerPopover';
 import { analyzeTicket } from '../services/analyzer';
 import { storageService } from '../services/storage';
 import {
-  FileCode,
-  Tag,
-  User,
   AlertCircle,
   CheckCircle2,
   Share2,
   MoreHorizontal,
-  Bookmark,
   Clock,
   Sparkles,
   Edit3,
   RefreshCw,
-  PlusCircle,
-  Cpu,
-  AlertTriangle
+  AlertTriangle,
+  FileCode2,
+  Code
 } from 'lucide-react';
 
 interface JiraSimulatorViewProps {
@@ -155,7 +151,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
         ...result,
         processingTimeMs: processingTime,
         createdAt: new Date().toISOString(),
-        userTier: storageService.getUser().subscriptionTier,
+        userTier: storageService.getUser()?.subscriptionTier || 'pro',
       };
 
       storageService.saveAnalysis(record);
@@ -169,8 +165,8 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
         id: record.id,
       });
     } catch (err: any) {
-      console.error('Gemini Analysis failed:', err);
-      setAnalysisError(err?.message || 'Failed to complete analysis. Please verify your Gemini connection.');
+      console.error('Analysis failed:', err);
+      setAnalysisError(err?.message || 'Failed to complete analysis. Please try again.');
     } finally {
       setAnalyzing(false);
     }
@@ -178,28 +174,23 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
-      {/* Top Banner explaining Jira simulator and Gemini Model */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-xl bg-slate-900 text-white shadow-md">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-indigo-500/20 border border-indigo-400/30 flex items-center justify-center shrink-0">
-            <Cpu className="w-5 h-5 text-indigo-400" />
+      {/* Top Banner */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-5 rounded-2xl bg-slate-900 text-white shadow-md">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <h2 className="font-bold text-base sm:text-lg tracking-tight">Code Impact Predictor</h2>
+            <span className="px-2.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-[10px] font-bold uppercase tracking-wider">
+              Intelligent Engine
+            </span>
           </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <h2 className="font-semibold text-sm sm:text-base">Real-Time Jira Ticket Analyzer</h2>
-              <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold uppercase tracking-wider">
-                Gemini 3.8 Flash
-              </span>
-            </div>
-            <p className="text-xs text-slate-300">
-              Live AI analysis without mock data. Evaluates requirements to predict impacted files across the full stack.
-            </p>
-          </div>
+          <p className="text-xs text-slate-300 max-w-xl">
+            Analyze any feature request or bug report to identify impacted components across frontend, backend, database migrations, and test suites.
+          </p>
         </div>
 
         {/* Quick Template Picker */}
         <div className="flex items-center gap-2 self-start sm:self-auto">
-          <span className="text-xs text-slate-400">Load Template:</span>
+          <span className="text-xs text-slate-400">Templates:</span>
           <div className="flex bg-slate-800 p-1 rounded-lg border border-slate-700">
             {TEMPLATES.map((tmpl) => (
               <button
@@ -223,7 +214,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
         <div className="p-4 bg-rose-50 border border-rose-200 rounded-xl flex items-start gap-3 text-rose-900 text-sm animate-in fade-in">
           <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
           <div className="space-y-1">
-            <strong className="font-semibold">Analysis Error:</strong>
+            <strong className="font-semibold">Analysis Failed:</strong>
             <p className="text-xs text-rose-800 leading-relaxed">{analysisError}</p>
           </div>
         </div>
@@ -235,37 +226,40 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
           <div className="flex items-center gap-3">
             <AlertCircle className="w-5 h-5 text-amber-600 shrink-0" />
             <div>
-              <strong>Monthly ticket limit reached!</strong> You have processed {usage.ticketsProcessedThisMonth} of{' '}
-              {usage.monthlyLimit} tickets on your current tier.
+              <strong>Monthly quota reached.</strong> You have analyzed {usage.ticketsProcessedThisMonth} of{' '}
+              {usage.monthlyLimit} tickets this month.
             </div>
           </div>
           <button
             onClick={onNavigateToPlans}
             className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-medium rounded-lg text-xs transition-colors shrink-0"
           >
-            Upgrade Plan or Reset Usage
+            Upgrade Plan
           </button>
         </div>
       )}
 
       {/* Jira Browser Container */}
-      <div className="bg-white border border-slate-200 rounded-xl shadow-xs overflow-hidden">
+      <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
         {/* Atlassian Jira Header Chrome */}
-        <div className="bg-slate-100/80 border-b border-slate-200 px-6 py-3 flex items-center justify-between text-xs text-slate-500">
-          <div className="flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-slate-300" />
-            <span className="w-2.5 h-2.5 rounded-full bg-slate-300" />
-            <span className="w-2.5 h-2.5 rounded-full bg-slate-300" />
-            <span className="ml-3 font-mono text-slate-400">
-              https://company.atlassian.net/browse/{ticketKey || 'PROJ-XXX'}
+        <div className="bg-slate-50 border-b border-slate-200 px-3.5 sm:px-6 py-2.5 sm:py-3 flex items-center justify-between gap-3 text-xs text-slate-500 overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className="w-2.5 h-2.5 rounded-full bg-slate-300" />
+              <span className="w-2.5 h-2.5 rounded-full bg-slate-300" />
+              <span className="w-2.5 h-2.5 rounded-full bg-slate-300" />
+            </div>
+            <span className="ml-1 sm:ml-2 font-mono text-[11px] sm:text-xs text-slate-400 truncate min-w-0">
+              jira.company.com/browse/{ticketKey || 'PROJ-101'}
             </span>
           </div>
-          <div className="flex items-center gap-2 font-medium text-slate-600">
-            <span>Jira Software Cloud</span>
+          <div className="flex items-center gap-1.5 font-medium text-slate-600 shrink-0 text-[11px] sm:text-xs whitespace-nowrap">
+            <span className="hidden sm:inline-block w-2 h-2 rounded-full bg-emerald-500" />
+            <span>Issue View</span>
           </div>
         </div>
 
-        {/* Jira Issue Content Layout */}
+        {/* Issue Content Layout */}
         <div className="p-6 grid grid-cols-1 lg:grid-cols-3 gap-8">
           {/* Main Issue Column */}
           <div className="lg:col-span-2 space-y-6">
@@ -273,7 +267,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
             <div className="flex items-center gap-2 text-xs text-slate-500">
               <span className="font-medium text-slate-700">Projects</span>
               <span>/</span>
-              <span className="font-medium text-slate-700">Core Engineering</span>
+              <span className="font-medium text-slate-700">Engineering</span>
               <span>/</span>
               <span className="font-semibold text-indigo-600">{ticketKey || 'PROJ-101'}</span>
             </div>
@@ -286,20 +280,19 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                   placeholder="Ticket Key (e.g. CORE-101)"
                   value={ticketKey}
                   onChange={(e) => setTicketKey(e.target.value)}
-                  className="w-full sm:w-36 px-3 py-1.5 border border-slate-300 rounded-md text-sm font-bold text-slate-900 font-mono bg-white focus:outline-indigo-500"
+                  className="w-full sm:w-36 px-3 py-1.5 border border-slate-300 rounded-lg text-sm font-bold text-slate-900 font-mono bg-white focus:outline-indigo-500"
                 />
                 <input
                   type="text"
                   placeholder="Ticket Summary / Title"
                   value={ticketTitle}
                   onChange={(e) => setTicketTitle(e.target.value)}
-                  className="flex-1 px-3 py-1.5 border border-slate-300 rounded-md text-sm sm:text-base font-bold text-slate-900 bg-white focus:outline-indigo-500"
+                  className="flex-1 px-3 py-1.5 border border-slate-300 rounded-lg text-sm sm:text-base font-bold text-slate-900 bg-white focus:outline-indigo-500"
                 />
               </div>
 
               {/* Action Bar with the Iconic Analyze Button */}
               <div className="flex flex-wrap items-center gap-3 pt-1">
-                {/* INJECTED ANALYZE BUTTON */}
                 <button
                   id="jira-analyzer-btn"
                   onClick={handleAnalyze}
@@ -309,7 +302,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                   {analyzing ? (
                     <>
                       <div className="spinner" />
-                      <span>Gemini Analyzing...</span>
+                      <span>Analyzing Codebase Impact...</span>
                     </>
                   ) : (
                     <>
@@ -317,25 +310,20 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                         <path d="M8 2L2 6L8 10L14 6L8 2Z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round"/>
                         <path d="M2 10L8 14L14 10" stroke="currentColor" strokeWidth="2" strokeLinejoin="round"/>
                       </svg>
-                      <span>Analyze Files (Gemini)</span>
+                      <span>Analyze Code Impact</span>
                     </>
                   )}
                 </button>
-
-                <div className="text-xs text-slate-400 hidden sm:flex items-center gap-1.5 pl-2">
-                  <Sparkles className="w-3.5 h-3.5 text-indigo-500" />
-                  <span>Powered by Gemini 3.8 Flash</span>
-                </div>
               </div>
             </div>
 
             {/* Description Section */}
             <div className="space-y-2 pt-2">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
                 <label className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                  Ticket Description & Acceptance Criteria
+                  Issue Description & Acceptance Criteria
                 </label>
-                <span className="text-[11px] text-slate-400">Edit or paste directly from Jira</span>
+                <span className="text-[11px] text-slate-400">Enter ticket details to predict affected files</span>
               </div>
 
               <textarea
@@ -343,7 +331,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                 placeholder="Enter or paste the full ticket description, error traces, or acceptance criteria here..."
                 value={ticketDescription}
                 onChange={(e) => setTicketDescription(e.target.value)}
-                className="w-full p-4 border border-slate-300 rounded-lg text-xs sm:text-sm font-normal text-slate-800 bg-slate-50/50 focus:bg-white focus:outline-indigo-500 leading-relaxed font-mono"
+                className="w-full p-4 border border-slate-300 rounded-xl text-xs sm:text-sm font-normal text-slate-800 bg-slate-50/50 focus:bg-white focus:outline-indigo-500 leading-relaxed font-mono"
               />
             </div>
 
@@ -354,10 +342,9 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                   <div className="flex items-center gap-2">
                     <CheckCircle2 className="w-5 h-5 text-emerald-600" />
                     <h3 className="font-bold text-slate-900 text-base">
-                      Prediction Output for {activeAnalysisTicketKey}
+                      Predicted File Impact for {activeAnalysisTicketKey}
                     </h3>
                   </div>
-                  <span className="text-xs text-slate-500">Live Gemini 3.8 Flash Output</span>
                 </div>
 
                 <JiraAnalyzerPopover
@@ -378,7 +365,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
               <select
                 value={status}
                 onChange={(e: any) => setStatus(e.target.value)}
-                className="w-full px-3 py-1.5 bg-blue-50 border border-blue-200 text-blue-700 rounded-md font-semibold text-xs focus:outline-blue-500"
+                className="w-full px-3 py-2 bg-blue-50 border border-blue-200 text-blue-700 rounded-lg font-semibold text-xs focus:outline-blue-500"
               >
                 <option value="To Do">To Do</option>
                 <option value="In Progress">In Progress</option>
@@ -393,7 +380,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
               <select
                 value={priority}
                 onChange={(e: any) => setPriority(e.target.value)}
-                className="w-full px-3 py-1.5 bg-slate-50 border border-slate-300 text-slate-800 rounded-md font-semibold text-xs focus:outline-indigo-500"
+                className="w-full px-3 py-2 bg-slate-50 border border-slate-300 text-slate-800 rounded-lg font-semibold text-xs focus:outline-indigo-500"
               >
                 <option value="Highest">Highest</option>
                 <option value="High">High</option>
@@ -409,19 +396,19 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                 type="text"
                 value={componentsList}
                 onChange={(e) => setComponentsList(e.target.value)}
-                placeholder="Comma separated components"
-                className="w-full px-3 py-1.5 bg-white border border-slate-300 text-slate-800 rounded-md text-xs font-mono focus:outline-indigo-500"
+                placeholder="e.g. Authentication, Backend, API"
+                className="w-full px-3 py-2 bg-white border border-slate-300 text-slate-800 rounded-lg text-xs font-mono focus:outline-indigo-500"
               />
             </div>
 
-            {/* Extension Active Helper */}
-            <div className="p-4 rounded-xl bg-indigo-50/60 border border-indigo-100 text-xs space-y-2 text-indigo-900">
-              <div className="flex items-center gap-1.5 font-semibold text-indigo-950">
-                <Sparkles className="w-4 h-4 text-indigo-600" />
-                <span>Live Gemini Integration</span>
+            {/* Clean Feature Overview */}
+            <div className="p-4 rounded-2xl bg-indigo-50/60 border border-indigo-100 text-xs space-y-2 text-indigo-950">
+              <div className="flex items-center gap-1.5 font-bold">
+                <Code className="w-4 h-4 text-indigo-600" />
+                <span>Codebase Impact Analysis</span>
               </div>
               <p className="text-slate-600 text-[11px] leading-relaxed">
-                Every analysis invokes Google's Gemini 3.8 Flash model on the server to inspect the issue and return verified impacted files with architectural reasoning.
+                Clicking "Analyze Code Impact" reads the ticket requirements and outlines the exact files across the repository that require changes before engineering starts.
               </p>
             </div>
           </div>

@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: context-pilot
+    env: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_VERSION
+        value: 22.0.0
+      - key: PORT
+        value: 3000
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_PUBLIC_KEY
+        sync: false
+      - key: ADMIN_EMAIL
+        value: admin@contextpilot.com
+      - key: ADMIN_PASSWORD
+        sync: false

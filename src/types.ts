@@ -5,6 +5,7 @@ export interface SubscriptionPlan {
   name: string;
   monthlyTicketLimit: number; // -1 for unlimited
   priceUsd: number;
+  priceNgn: number;
   features: {
     analysis: boolean;
     github_verification: boolean;
@@ -25,6 +26,7 @@ export interface UserProfile {
   subscriptionTier: SubscriptionTier;
   createdAt: string;
   lastLoginAt: string;
+  status: 'active' | 'suspended';
 }
 
 export interface UsageStats {
@@ -110,4 +112,55 @@ export interface JiraTicket {
   created: string;
   updated: string;
   components: string[];
+}
+
+export interface PaystackTransaction {
+  id: string;
+  reference: string;
+  amount: number; // in NGN or USD
+  currency: string;
+  email: string;
+  tier: SubscriptionTier;
+  status: 'success' | 'failed' | 'pending';
+  channel?: string;
+  paidAt?: string;
+  createdAt: string;
+}
+
+export interface AdminProfile {
+  email: string;
+  name: string;
+  role: 'superadmin' | 'admin';
+  token: string;
+}
+
+export interface PromoCode {
+  id: string;
+  code: string;
+  discountType: 'percentage' | 'fixed';
+  discountValue: number;
+  applicableTiers: ('pro' | 'enterprise')[];
+  maxUses: number;
+  usedCount: number;
+  isActive: boolean;
+  expiresAt?: string;
+  createdAt: string;
+}
+
+export interface AdminSystemSettings {
+  paystackPublicKey: string;
+  hasPaystackSecretKey: boolean;
+  paystackSecretKeyMasked?: string;
+  isLiveMode: boolean;
+  currency: 'NGN' | 'USD';
+  proPriceNgn: number;
+  enterprisePriceNgn: number;
+  freeLimit: number;
+  proLimit: number;
+  adminPassword?: string;
+  maintenanceMode: boolean;
+  geminiModel: string;
+  githubClientId?: string;
+  hasGithubClientSecret?: boolean;
+  githubClientSecretMasked?: string;
 }

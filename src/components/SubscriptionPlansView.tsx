@@ -1,198 +1,478 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { SubscriptionPlan, SubscriptionTier, UsageStats, UserProfile } from '../types';
 import { SUBSCRIPTION_PLANS, storageService } from '../services/storage';
+import { paystackService } from '../services/paystack';
+import { adminService } from '../services/admin';
 import {
   Check,
   Zap,
-  RotateCcw,
   ShieldCheck,
-  Sparkles,
   CreditCard,
-  CheckCircle2
+  CheckCircle2,
+  RefreshCw,
+  Lock,
+  Tag,
+  Shield,
+  HelpCircle,
+  Clock,
+  Sparkles
 } from 'lucide-react';
 
 interface SubscriptionPlansViewProps {
-  user: UserProfile;
+  user: UserProfile | null;
   usage: UsageStats;
   onTierChanged: (tier: SubscriptionTier) => void;
-  onUsageReset: () => void;
+  onOpenAuthModal: () => void;
 }
 
 export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
   user,
   usage,
   onTierChanged,
-  onUsageReset
+  onOpenAuthModal,
 }) => {
   const plans = Object.values(SUBSCRIPTION_PLANS);
+  const [paystackConfig, setPaystackConfig] = useState<any>(null);
+  const [billingCycle, setBillingCycle] = useState<'monthly' | 'annual'>('monthly');
+  const [loadingTier, setLoadingTier] = useState<string | null>(null);
+  const [paymentNotice, setPaymentNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // Promo Code State
+  const [promoInput, setPromoInput] = useState('');
+  const [appliedPromo, setAppliedPromo] = useState<{
+    code: string;
+    discountType: 'percentage' | 'fixed';
+    discountValue: number;
+    discountAmount: number;
+  } | null>(null);
+  const [promoError, setPromoError] = useState<string | null>(null);
+  const [validatingPromo, setValidatingPromo] = useState(false);
+
+  useEffect(() => {
+    paystackService
+      .getConfig()
+      .then((cfg) => setPaystackConfig(cfg))
+      .catch(console.error);
+
+    // Check if redirected from Paystack with ?payment_ref= or ?reference=
+    const params = new URLSearchParams(window.location.search);
+    const ref = params.get('payment_ref') || params.get('reference');
+    if (ref) {
+      handleVerifyReference(ref);
+    }
+  }, []);
+
+  const handleVerifyReference = async (ref: string) => {
+    setPaymentNotice(null);
+    try {
+      const res = await paystackService.verifyTransaction(ref);
+      if (res.success) {
+        onTierChanged(res.tier);
+        setPaymentNotice({
+          type: 'success',
+          message: `Payment confirmed on Paystack! Your workspace has been upgraded to ${res.tier.toUpperCase()} tier. Reference: ${res.reference}`,
+        });
+      } else {
+        setPaymentNotice({
+          type: 'error',
+          message: `Payment verification notice: ${res.gateway_response || 'Transaction not yet finalized.'}`,
+        });
+      }
+    } catch (err: any) {
+      setPaymentNotice({
+        type: 'error',
+        message: err?.message || 'Verification error occurred.',
+      });
+    }
+  };
+
+  const handleApplyPromo = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!promoInput.trim()) return;
+
+    setValidatingPromo(true);
+    setPromoError(null);
+
+    try {
+      // Check for Pro tier by default as baseline
+      const baseAmount = paystackConfig?.proPriceNgn || 15000;
+      const res = await adminService.validatePromo(promoInput.trim().toUpperCase(), 'pro', baseAmount);
+
+      if (res.valid) {
+        setAppliedPromo({
+          code: res.code,
+          discountType: res.discountType,
+          discountValue: res.discountValue,
+          discountAmount: res.discountAmount,
+        });
+        setPromoInput('');
+      }
+    } catch (err: any) {
+      setPromoError(err?.message || 'Invalid or expired promo code.');
+    } finally {
+      setValidatingPromo(false);
+    }
+  };
+
+  const handlePaystackCheckout = async (plan: SubscriptionPlan) => {
+    if (!user) {
+      onOpenAuthModal();
+      return;
+    }
+
+    if (plan.tier === 'free') {
+      onTierChanged('free');
+      setPaymentNotice({
+        type: 'success',
+        message: 'Workspace set to Free tier.',
+      });
+      return;
+    }
+
+    setLoadingTier(plan.tier);
+    setPaymentNotice(null);
+
+    let baseAmount =
+      plan.tier === 'pro'
+        ? paystackConfig?.proPriceNgn || 15000
+        : paystackConfig?.enterprisePriceNgn || 75000;
+
+    // Apply 20% discount for annual billing
+    if (billingCycle === 'annual') {
+      baseAmount = Math.round(baseAmount * 12 * 0.8);
+    }
+
+    // Apply promo code discount if active
+    let promoCodeToPass: string | undefined = undefined;
+    if (appliedPromo) {
+      promoCodeToPass = appliedPromo.code;
+      if (appliedPromo.discountType === 'percentage') {
+        const disc = (baseAmount * appliedPromo.discountValue) / 100;
+        baseAmount = Math.max(100, baseAmount - disc);
+      } else {
+        baseAmount = Math.max(100, baseAmount - appliedPromo.discountAmount);
+      }
+    }
+
+    try {
+      const initRes = await paystackService.initializeTransaction(
+        user.email,
+        plan.tier,
+        baseAmount,
+        window.location.href,
+        promoCodeToPass
+      );
+
+      if (initRes.authorization_url) {
+        // Direct redirect to Paystack secure checkout
+        window.location.href = initRes.authorization_url;
+      } else {
+        throw new Error('No authorization URL returned from Paystack API');
+      }
+    } catch (err: any) {
+      console.error(err);
+      setPaymentNotice({
+        type: 'error',
+        message:
+          err?.message ||
+          'Failed to initialize Paystack checkout. Please verify payment gateway configuration.',
+      });
+    } finally {
+      setLoadingTier(null);
+    }
+  };
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-      {/* Title */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold text-slate-900 tracking-tight flex items-center gap-2">
-            <CreditCard className="w-6 h-6 text-indigo-600" />
-            Subscription Plans & Quota Management
-          </h1>
-          <p className="text-sm text-slate-500">
-            Backed by PostgreSQL <code className="text-indigo-600 font-mono text-xs">subscription_plans</code> and <code className="text-indigo-600 font-mono text-xs">can_analyze_ticket()</code> stored procedure.
-          </p>
+      {/* Title & Billing Toggle Header */}
+      <div className="text-center max-w-3xl mx-auto space-y-4">
+        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-bold">
+          <Sparkles className="w-3.5 h-3.5" />
+          <span>Simple, Transparent Engineering Plans</span>
         </div>
 
-        {/* Developer Testing Controls */}
-        <div className="flex items-center gap-3">
-          <button
-            onClick={onUsageReset}
-            className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg transition-colors flex items-center gap-2 border border-slate-300 shadow-2xs"
-            title="Reset monthly usage counter to 0 for testing"
-          >
-            <RotateCcw className="w-3.5 h-3.5 text-slate-500" />
-            Reset Monthly Usage (Testing)
-          </button>
-        </div>
-      </div>
+        <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-900 tracking-tight">
+          Accelerate your sprints with intelligent file impact prediction
+        </h1>
 
-      {/* Current Quota Status Banner */}
-      <div className="p-5 rounded-xl bg-white border border-slate-200 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-indigo-50 border border-indigo-200 text-indigo-600 flex items-center justify-center shrink-0">
-            <Zap className="w-5 h-5" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-slate-900 text-base">Current Plan:</span>
-              <span className="uppercase text-xs font-extrabold px-2.5 py-0.5 rounded bg-indigo-100 text-indigo-700">
-                {user.subscriptionTier}
-              </span>
-            </div>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Processed {usage.ticketsProcessedThisMonth} of {usage.monthlyLimit === -1 ? 'Unlimited' : usage.monthlyLimit} tickets in {usage.monthYear}.
-            </p>
-          </div>
-        </div>
+        <p className="text-sm sm:text-base text-slate-500 max-w-xl mx-auto">
+          Predict exact codebase files, API routes, database migrations, and test suites directly from Jira issues before writing code.
+        </p>
 
-        <div className="flex items-center gap-3">
-          <span className="text-xs font-semibold text-slate-600">Quick Test Tier:</span>
-          {(['free', 'pro', 'enterprise'] as SubscriptionTier[]).map((t) => (
+        {/* Monthly vs Annual Toggle */}
+        <div className="pt-2 flex items-center justify-center gap-3">
+          <div className="bg-slate-100 p-1 rounded-xl flex items-center border border-slate-200">
             <button
-              key={t}
-              onClick={() => onTierChanged(t)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold capitalize transition-all ${
-                user.subscriptionTier === t
-                  ? 'bg-indigo-600 text-white shadow-2xs'
-                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+              onClick={() => setBillingCycle('monthly')}
+              className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                billingCycle === 'monthly'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-500 hover:text-slate-800'
               }`}
             >
-              {t}
+              Monthly Billing
             </button>
-          ))}
+            <button
+              onClick={() => setBillingCycle('annual')}
+              className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 ${
+                billingCycle === 'annual'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-500 hover:text-slate-800'
+              }`}
+            >
+              <span>Annual Billing</span>
+              <span className="px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-bold">
+                Save 20%
+              </span>
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* Pricing Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+      {/* Payment Notice Banner */}
+      {paymentNotice && (
+        <div
+          className={`p-4 rounded-xl border text-sm flex items-start gap-3 max-w-3xl mx-auto animate-in fade-in ${
+            paymentNotice.type === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+              : 'bg-rose-50 border-rose-200 text-rose-800'
+          }`}
+        >
+          {paymentNotice.type === 'success' ? (
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+          ) : (
+            <Lock className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+          )}
+          <div className="flex-1 text-xs sm:text-sm">{paymentNotice.message}</div>
+        </div>
+      )}
+
+      {/* Promo Code Input Card */}
+      <div className="max-w-md mx-auto p-3.5 bg-slate-50 border border-slate-200 rounded-2xl flex flex-col sm:flex-row items-center gap-2">
+        <div className="relative flex-1 w-full">
+          <Tag className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+          <input
+            type="text"
+            placeholder="Have a promo code? (e.g. LAUNCH25)"
+            value={promoInput}
+            onChange={(e) => setPromoInput(e.target.value.toUpperCase())}
+            className="w-full pl-9 pr-3 py-1.5 text-xs bg-white border border-slate-300 rounded-xl font-mono uppercase focus:outline-indigo-500"
+          />
+        </div>
+        <button
+          onClick={handleApplyPromo}
+          disabled={validatingPromo || !promoInput.trim()}
+          className="w-full sm:w-auto px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-xl transition-colors shrink-0 disabled:opacity-50"
+        >
+          {validatingPromo ? 'Validating...' : 'Apply Code'}
+        </button>
+      </div>
+
+      {promoError && (
+        <p className="text-center text-xs text-rose-600 font-medium -mt-4">{promoError}</p>
+      )}
+
+      {appliedPromo && (
+        <div className="max-w-md mx-auto p-2.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-xs flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Check className="w-4 h-4 text-emerald-600" />
+            <span>
+              Promo code <strong className="font-mono">{appliedPromo.code}</strong> applied (
+              {appliedPromo.discountType === 'percentage'
+                ? `${appliedPromo.discountValue}% OFF`
+                : `₦${appliedPromo.discountValue} OFF`}
+              )!
+            </span>
+          </div>
+          <button
+            onClick={() => setAppliedPromo(null)}
+            className="text-xs text-slate-400 hover:text-slate-600 underline font-medium"
+          >
+            Remove
+          </button>
+        </div>
+      )}
+
+      {/* Pricing Cards Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-8 items-stretch pt-2">
         {plans.map((plan) => {
-          const isCurrent = user.subscriptionTier === plan.tier;
+          const isCurrent = user?.subscriptionTier === plan.tier;
           const isPro = plan.tier === 'pro';
+          const isLoading = loadingTier === plan.tier;
+
+          let monthlyNgn =
+            plan.tier === 'pro'
+              ? paystackConfig?.proPriceNgn || 15000
+              : paystackConfig?.enterprisePriceNgn || 75000;
+
+          if (billingCycle === 'annual') {
+            monthlyNgn = Math.round(monthlyNgn * 0.8);
+          }
+
+          let discountedNgn = monthlyNgn;
+          if (appliedPromo && plan.tier !== 'free') {
+            if (appliedPromo.discountType === 'percentage') {
+              discountedNgn = Math.round(monthlyNgn * (1 - appliedPromo.discountValue / 100));
+            } else {
+              discountedNgn = Math.max(100, monthlyNgn - appliedPromo.discountAmount);
+            }
+          }
 
           return (
             <div
               key={plan.tier}
-              className={`bg-white rounded-2xl p-6 border transition-all flex flex-col justify-between relative ${
-                isCurrent
-                  ? 'border-indigo-600 ring-2 ring-indigo-600/20 shadow-md'
-                  : 'border-slate-200 hover:border-slate-300 shadow-2xs'
+              className={`bg-white rounded-3xl p-6 sm:p-8 border transition-all flex flex-col justify-between relative ${
+                isPro
+                  ? 'border-indigo-600 ring-2 ring-indigo-600/20 shadow-xl'
+                  : 'border-slate-200 hover:border-slate-300 shadow-xs'
               }`}
             >
               {isPro && (
-                <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 bg-gradient-to-r from-[#667eea] to-[#764ba2] text-white text-[11px] font-bold rounded-full uppercase tracking-wider shadow-sm">
-                  Most Popular
+                <div className="absolute -top-3.5 left-1/2 -translate-x-1/2 px-3 py-1 bg-gradient-to-r from-[#667eea] to-[#764ba2] text-white text-[11px] font-bold rounded-full uppercase tracking-wider shadow-sm">
+                  Recommended for Teams
                 </div>
               )}
 
-              <div className="space-y-4">
+              <div className="space-y-5">
                 <div>
-                  <h3 className="text-lg font-bold text-slate-900">{plan.name}</h3>
+                  <h3 className="text-xl font-bold text-slate-900">{plan.name}</h3>
                   <p className="text-xs text-slate-500 mt-1">
-                    {plan.tier === 'free' && 'For individual developers trying out predictions.'}
-                    {plan.tier === 'pro' && 'For engineering teams moving fast on active sprints.'}
-                    {plan.tier === 'enterprise' && 'For large engineering organizations & custom models.'}
+                    {plan.tier === 'free' && 'For developers exploring automated Jira file predictions.'}
+                    {plan.tier === 'pro' && 'For active software engineering teams running 2-week sprints.'}
+                    {plan.tier === 'enterprise' && 'For engineering organizations auditing full multi-repo codebases.'}
                   </p>
                 </div>
 
-                <div className="flex items-baseline gap-1">
-                  <span className="text-3xl font-extrabold text-slate-900">
-                    ${plan.priceUsd.toFixed(2)}
-                  </span>
-                  <span className="text-xs text-slate-400 font-medium">/ month</span>
+                <div>
+                  <div className="flex items-baseline gap-1.5">
+                    {plan.tier === 'free' ? (
+                      <span className="text-3xl sm:text-4xl font-extrabold text-slate-900">₦0</span>
+                    ) : (
+                      <>
+                        <span className="text-3xl sm:text-4xl font-extrabold text-slate-900">
+                          ₦{discountedNgn.toLocaleString()}
+                        </span>
+                        {appliedPromo && (
+                          <span className="text-sm text-slate-400 line-through">
+                            ₦{monthlyNgn.toLocaleString()}
+                          </span>
+                        )}
+                      </>
+                    )}
+                    <span className="text-xs text-slate-400 font-medium">/ month</span>
+                  </div>
+
+                  {plan.tier !== 'free' && (
+                    <div className="text-[11px] text-slate-400 font-mono mt-1">
+                      {billingCycle === 'annual'
+                        ? 'Billed annually (₦' + (discountedNgn * 12).toLocaleString() + '/yr)'
+                        : 'Billed monthly via Paystack'}
+                    </div>
+                  )}
                 </div>
 
-                <div className="pt-2 border-t border-slate-100 space-y-3 text-xs text-slate-600">
-                  <div className="flex items-center gap-2">
+                <div className="pt-4 border-t border-slate-100 space-y-3.5 text-xs text-slate-700">
+                  <div className="flex items-center gap-2.5">
                     <Check className="w-4 h-4 text-emerald-600 shrink-0" />
                     <span>
                       <strong>
                         {plan.monthlyTicketLimit === -1 ? 'Unlimited' : plan.monthlyTicketLimit}
                       </strong>{' '}
-                      ticket analyses per month
+                      ticket predictions per month
                     </span>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2.5">
                     <Check
                       className={`w-4 h-4 ${
                         plan.features.github_verification ? 'text-emerald-600' : 'text-slate-300'
                       } shrink-0`}
                     />
-                    <span className={plan.features.github_verification ? '' : 'text-slate-400 line-through'}>
+                    <span
+                      className={
+                        plan.features.github_verification
+                          ? 'font-medium text-slate-800'
+                          : 'text-slate-400 line-through'
+                      }
+                    >
                       GitHub Repository Verification
                     </span>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2.5">
                     <Check className="w-4 h-4 text-emerald-600 shrink-0" />
                     <span>{plan.features.history_retention_days} days audit history retention</span>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2.5">
                     <Check className="w-4 h-4 text-emerald-600 shrink-0" />
-                    <span className="capitalize">{plan.features.support} support</span>
+                    <span className="capitalize">{plan.features.support} support response</span>
                   </div>
 
                   {plan.features.priority_processing && (
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2.5">
                       <Check className="w-4 h-4 text-emerald-600 shrink-0" />
                       <span>Priority processing speed</span>
                     </div>
                   )}
 
                   {plan.features.custom_models && (
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2.5">
                       <Check className="w-4 h-4 text-emerald-600 shrink-0" />
-                      <span>Fine-tuned models on company codebase</span>
+                      <span>Custom architecture fine-tuning</span>
                     </div>
                   )}
                 </div>
               </div>
 
-              <div className="pt-6">
+              <div className="pt-8">
                 <button
-                  onClick={() => onTierChanged(plan.tier)}
-                  className={`w-full py-2.5 px-4 rounded-xl font-semibold text-xs transition-all ${
+                  onClick={() => handlePaystackCheckout(plan)}
+                  disabled={isLoading || isCurrent}
+                  className={`w-full py-3 px-4 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-2 shadow-xs ${
                     isCurrent
-                      ? 'bg-slate-100 text-slate-800 border border-slate-300 hover:bg-slate-200'
+                      ? 'bg-slate-100 text-slate-500 border border-slate-200 cursor-default'
                       : isPro
-                      ? 'bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 text-white shadow-sm'
+                      ? 'bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 text-white shadow-md'
                       : 'bg-indigo-600 hover:bg-indigo-700 text-white'
                   }`}
                 >
-                  {isCurrent ? 'Current Active Tier' : `Switch to ${plan.name}`}
+                  {isLoading ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>Securing Paystack Checkout...</span>
+                    </>
+                  ) : isCurrent ? (
+                    'Current Plan'
+                  ) : plan.tier === 'free' ? (
+                    'Downgrade to Free'
+                  ) : (
+                    <>
+                      <CreditCard className="w-4 h-4" />
+                      <span>Upgrade via Paystack</span>
+                    </>
+                  )}
                 </button>
               </div>
             </div>
           );
         })}
+      </div>
+
+      {/* Enterprise Security Badges */}
+      <div className="pt-6 border-t border-slate-200 max-w-4xl mx-auto flex flex-wrap items-center justify-center gap-8 text-xs text-slate-500">
+        <div className="flex items-center gap-2">
+          <ShieldCheck className="w-4 h-4 text-emerald-600" />
+          <span>Paystack PCI-DSS Level 1 Certified</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <Lock className="w-4 h-4 text-indigo-600" />
+          <span>256-bit TLS Bank Encryption</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <Clock className="w-4 h-4 text-purple-600" />
+          <span>Instant Activation & Cancel Anytime</span>
+        </div>
       </div>
     </div>
   );

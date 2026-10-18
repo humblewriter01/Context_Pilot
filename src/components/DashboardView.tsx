@@ -9,15 +9,13 @@ import {
   AlertTriangle,
   Zap,
   ArrowUpRight,
-  FileCode,
-  ShieldCheck,
   Calendar,
   Sparkles,
   Inbox
 } from 'lucide-react';
 
 interface DashboardViewProps {
-  user: UserProfile;
+  user: UserProfile | null;
   usage: UsageStats;
   analyses: AnalysisRecord[];
   feedback: FeedbackRecord[];
@@ -70,18 +68,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       {/* Top Banner / Welcome */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900 tracking-tight">Usage & Analytics Dashboard</h1>
+          <h1 className="text-2xl font-bold text-slate-900 tracking-tight">Codebase Impact Analytics</h1>
           <p className="text-sm text-slate-500">
-            Real-time telemetry and audit records generated via live <strong className="text-indigo-600 font-semibold">Gemini 3.8 Flash</strong> analyses.
+            Real-time insights and architectural impact metrics from your analyzed Jira issues.
           </p>
         </div>
         <div className="flex items-center gap-3">
           <button
             onClick={onNavigateToPlans}
-            className="px-4 py-2 bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 text-white text-xs font-semibold rounded-lg shadow-sm transition-all flex items-center gap-2"
+            className="px-4 py-2 bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 text-white text-xs font-semibold rounded-xl shadow-xs transition-all flex items-center gap-2"
           >
             <Zap className="w-4 h-4" />
-            Manage Subscription
+            <span>Manage Plan</span>
           </button>
         </div>
       </div>
@@ -89,7 +87,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       {/* KPI Cards Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
         {/* Monthly Quota */}
-        <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-2xs space-y-3">
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
           <div className="flex items-center justify-between text-slate-500 text-xs font-semibold uppercase tracking-wider">
             <span>Monthly Usage</span>
             <Calendar className="w-4 h-4 text-indigo-500" />
@@ -117,32 +115,32 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             />
           </div>
           <div className="text-[11px] text-slate-500 flex justify-between">
-            <span>Quota for {usage.monthYear}</span>
+            <span>Current Billing Cycle</span>
             <span className="font-semibold text-indigo-600">
-              {usage.remainingTickets === -1 ? 'Unlimited' : `${usage.remainingTickets} left`}
+              {usage.remainingTickets === -1 ? 'Unlimited' : `${usage.remainingTickets} remaining`}
             </span>
           </div>
         </div>
 
         {/* Total Analyses */}
-        <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-2xs space-y-3">
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
           <div className="flex items-center justify-between text-slate-500 text-xs font-semibold uppercase tracking-wider">
             <span>Total Analyses</span>
             <Layers className="w-4 h-4 text-purple-500" />
           </div>
           <div className="flex items-baseline gap-2">
             <span className="text-2xl font-bold text-slate-900">{totalAnalyses}</span>
-            <span className="text-xs font-medium text-indigo-600 flex items-center">
-              Gemini 3.8 Flash
+            <span className="text-xs font-medium text-emerald-600 flex items-center">
+              Active
             </span>
           </div>
-          <p className="text-xs text-slate-500">Live analyses stored in history</p>
+          <p className="text-xs text-slate-500">Processed issue specifications</p>
         </div>
 
         {/* Avg Confidence */}
-        <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-2xs space-y-3">
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
           <div className="flex items-center justify-between text-slate-500 text-xs font-semibold uppercase tracking-wider">
-            <span>Avg Confidence</span>
+            <span>Prediction Confidence</span>
             <BarChart3 className="w-4 h-4 text-blue-500" />
           </div>
           <div className="flex items-baseline gap-2">
@@ -155,13 +153,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </span>
             )}
           </div>
-          <p className="text-xs text-slate-500">Mean model confidence rating</p>
+          <p className="text-xs text-slate-500">Average model confidence rating</p>
         </div>
 
         {/* Feedback Accuracy */}
-        <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-2xs space-y-3">
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
           <div className="flex items-center justify-between text-slate-500 text-xs font-semibold uppercase tracking-wider">
-            <span>Model Accuracy</span>
+            <span>Accuracy Rating</span>
             <CheckCircle2 className="w-4 h-4 text-emerald-500" />
           </div>
           <div className="flex items-baseline gap-2">
@@ -172,14 +170,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               ({feedback.length} {feedback.length === 1 ? 'rating' : 'ratings'})
             </span>
           </div>
-          <p className="text-xs text-slate-500">Engineer ratings on predictions</p>
+          <p className="text-xs text-slate-500">Verified by engineering teams</p>
         </div>
       </div>
 
       {/* Main Content Grid: File Distribution & Recent Analyses */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Predicted Files by Category */}
-        <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-2xs space-y-5">
+        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs space-y-5">
           <div className="flex items-center justify-between">
             <h3 className="text-base font-bold text-slate-900">Impact by Category</h3>
             <span className="text-xs text-slate-400 font-mono">
@@ -190,8 +188,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {grandTotal === 0 ? (
             <div className="p-8 text-center text-slate-400 text-xs space-y-2">
               <Inbox className="w-8 h-8 text-slate-300 mx-auto" />
-              <p>No file categories to display yet.</p>
-              <p className="text-slate-400">Run an analysis in the Jira simulator to see live statistics.</p>
+              <p>No category metrics yet.</p>
+              <p className="text-slate-400">Analyze an issue to see file distributions across your repository.</p>
             </div>
           ) : (
             <div className="space-y-4">
@@ -225,26 +223,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               })}
             </div>
           )}
-
-          <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-600">
-            <strong>Architecture Note:</strong> Powered by Gemini 3.8 Flash, predicting cross-stack impact to keep frontend, backend, database migrations, and tests in sync.
-          </div>
         </div>
 
         {/* Recent Analyses List */}
-        <div className="lg:col-span-2 bg-white p-6 rounded-xl border border-slate-200 shadow-2xs space-y-4">
+        <div className="lg:col-span-2 bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs space-y-4">
           <div className="flex items-center justify-between">
-            <h3 className="text-base font-bold text-slate-900">Recent Ticket Analyses</h3>
-            <span className="text-xs text-slate-500">Live Gemini Analysis History</span>
+            <h3 className="text-base font-bold text-slate-900">Recent Predictions</h3>
+            <span className="text-xs text-slate-500">Audit History</span>
           </div>
 
           <div className="divide-y divide-slate-100 overflow-hidden">
             {analyses.length === 0 ? (
               <div className="py-12 text-center text-slate-400 space-y-2">
                 <Inbox className="w-10 h-10 text-slate-300 mx-auto" />
-                <p className="text-sm font-medium text-slate-600">No ticket analyses recorded yet.</p>
+                <p className="text-sm font-medium text-slate-600">No predictions recorded yet.</p>
                 <p className="text-xs text-slate-400">
-                  Switch to the Jira Issue Analyzer tab and click "Analyze Files" to run your first real prediction with Gemini!
+                  Switch to the Ticket Analyzer tab to run your first codebase impact prediction.
                 </p>
               </div>
             ) : (
@@ -252,7 +246,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <div
                   key={record.id}
                   onClick={() => onSelectAnalysis(record)}
-                  className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-slate-50/80 px-2 rounded-lg cursor-pointer transition-colors"
+                  className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-slate-50/80 px-2 rounded-xl cursor-pointer transition-colors"
                 >
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">
@@ -260,7 +254,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                         {record.ticketKey}
                       </span>
                       <h4 className="font-semibold text-sm text-slate-900 truncate max-w-md">
-                        {record.ticketTitle || 'Ticket Analysis'}
+                        {record.ticketTitle || 'Issue Analysis'}
                       </h4>
                     </div>
                     <p className="text-xs text-slate-500 truncate max-w-lg">{record.reasoning}</p>
