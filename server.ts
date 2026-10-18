@@ -1133,7 +1133,7 @@ async function startServer() {
   } else {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
+    app.use((_req, res) => {
       res.sendFile(path.resolve(distPath, 'index.html'));
     });
   }
