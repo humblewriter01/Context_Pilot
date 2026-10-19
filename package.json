@@ -7,7 +7,7 @@
     "dev": "tsx server.ts",
     "build": "vite build",
     "lint": "tsc --noEmit",
-    "start": "vite build && tsx server.ts",
+    "start": "tsx server.ts",
     "preview": "vite preview --port 3000"
   },
   "dependencies": {
@@ -22,16 +22,16 @@
     "react-router-dom": "^7.18.4",
     "recharts": "^3.10.1",
     "tailwind-merge": "^3.0.2",
-    "tsx": "^4.23.15"
+    "tsx": "^4.23.15",
+    "vite": "^6.2.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "^4.0.9",
+    "@tailwindcss/vite": "^4.0.9"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.0.9",
     "@types/express": "^5.0.6",
     "@types/react": "^19.0.10",
     "@types/react-dom": "^19.0.4",
-    "@vitejs/plugin-react": "^4.3.4",
-    "tailwindcss": "^4.0.9",
-    "typescript": "^5.7.3",
-    "vite": "^6.2.0"
+    "typescript": "^5.7.3"
   }
 }
