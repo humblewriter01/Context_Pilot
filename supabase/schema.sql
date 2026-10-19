@@ -1,15 +1,19 @@
 -- ===================================================================
 -- Context Pilot - Complete Supabase Production Database Schema
--- Run this entire script in Supabase Dashboard -> SQL Editor -> New Query -> Run
+-- Run this entire script in Supabase Dashboard -> SQL Editor -> Run
 -- ===================================================================
 
 -- 1. Enable UUID Extension
 create extension if not exists "uuid-ossp";
 
+-- ===================================================================
+-- TABLES CREATION
+-- ===================================================================
+
 -- 2. Users Table
 create table if not exists public.users (
   id uuid primary key default uuid_generate_v4(),
-  auth_id uuid references auth.users(id) on delete cascade,
+  auth_id uuid references auth.users(id) on delete cascade unique,
   email text not null unique,
   display_name text,
   photo_url text,
@@ -33,7 +37,7 @@ create table if not exists public.user_usage (
 -- 4. Analysis History Table (Predictions & Impacted Files)
 create table if not exists public.analysis_history (
   id uuid primary key default uuid_generate_v4(),
-  user_email text not null,
+  user_email text not null references public.users(email) on delete cascade,
   ticket_key text not null,
   ticket_title text not null,
   reasoning text,
@@ -54,7 +58,7 @@ create table if not exists public.feedback (
   id uuid primary key default uuid_generate_v4(),
   analysis_id uuid references public.analysis_history(id) on delete set null,
   ticket_key text not null,
-  user_email text not null,
+  user_email text not null references public.users(email) on delete cascade,
   was_accurate boolean not null,
   actual_files jsonb default '[]'::jsonb,
   comments text,
@@ -80,7 +84,7 @@ create table if not exists public.promo_codes (
 create table if not exists public.transactions (
   id uuid primary key default uuid_generate_v4(),
   reference text not null unique,
-  user_email text not null,
+  user_email text not null references public.users(email) on delete cascade,
   tier text not null check (tier in ('free', 'pro', 'enterprise')),
   amount numeric(12, 2) not null,
   currency text not null default 'NGN' check (currency in ('NGN', 'USD')),
@@ -105,12 +109,16 @@ create table if not exists public.system_settings (
   updated_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
 
--- Insert default system settings row if not present
+-- Seed initial default system settings
 insert into public.system_settings (id, currency, pro_price_ngn, pro_price_usd, enterprise_price_ngn, enterprise_price_usd, free_limit, pro_limit, is_live_mode)
 values (1, 'NGN', 15000, 10.00, 75000, 50.00, 10, 150, false)
 on conflict (id) do nothing;
 
--- 9. Row Level Security (RLS) Setup
+
+-- ===================================================================
+-- ROW LEVEL SECURITY (RLS) SETUP
+-- ===================================================================
+
 alter table public.users enable row level security;
 alter table public.user_usage enable row level security;
 alter table public.analysis_history enable row level security;
@@ -147,20 +155,47 @@ create policy "Allow users to insert feedback"
   on public.feedback for insert
   with check (auth.jwt() ->> 'email' = user_email);
 
--- Promo Codes RLS (Public read for active validation)
+-- Promo Codes RLS (Public read for active validation during checkout)
 drop policy if exists "Allow public to validate active promos" on public.promo_codes;
 create policy "Allow public to validate active promos"
   on public.promo_codes for select
   using (is_active = true);
 
--- System Settings RLS (Public read for frontend pricing display)
+-- System Settings RLS (Public read for plan prices in NGN and USD)
 drop policy if exists "Allow public to read system settings" on public.system_settings;
 create policy "Allow public to read system settings"
   on public.system_settings for select
   using (true);
 
--- Transactions RLS (Users can view their own transactions)
+-- Transactions RLS (Users can view their own receipts)
 drop policy if exists "Allow users to read own transactions" on public.transactions;
 create policy "Allow users to read own transactions"
   on public.transactions for select
   using (auth.jwt() ->> 'email' = user_email);
+
+
+-- ===================================================================
+-- AUTH TRIGGER (Auto-create user profile on signup)
+-- ===================================================================
+
+-- Create a function to handle new user signups
+create or replace function public.handle_new_user() 
+returns trigger as $$
+begin
+  insert into public.users (auth_id, email, display_name)
+  values (
+    new.id, 
+    new.email, 
+    coalesce(new.raw_user_meta_data->>'full_name', 'Developer')
+  )
+  on conflict (email) do update 
+    set auth_id = excluded.auth_id; -- Syncs the auth_id if the user existed beforehand
+  return new;
+end;
+$$ language plpgsql security definer;
+
+-- Trigger the function every time a user is created
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute procedure public.handle_new_user();
