@@ -1,9 +1,9 @@
 -- ===================================================================
--- Context Pilot - Supabase Production Database Schema
--- Run this script in your Supabase Project -> SQL Editor
+-- Context Pilot - Complete Supabase Production Database Schema
+-- Run this entire script in Supabase Dashboard -> SQL Editor -> New Query -> Run
 -- ===================================================================
 
--- 1. Enable UUID extension
+-- 1. Enable UUID Extension
 create extension if not exists "uuid-ossp";
 
 -- 2. Users Table
@@ -62,40 +62,105 @@ create table if not exists public.feedback (
   created_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
 
--- 6. Paystack Transactions Table
+-- 6. Promo Codes Table (Admin Management & Discounts)
+create table if not exists public.promo_codes (
+  id text primary key,
+  code text not null unique,
+  discount_type text not null check (discount_type in ('percentage', 'fixed')),
+  discount_value numeric(10, 2) not null,
+  applicable_tiers text[] not null default '{"pro", "enterprise"}',
+  max_uses integer not null default 100,
+  times_used integer not null default 0,
+  is_active boolean not null default true,
+  expires_at timestamp with time zone,
+  created_at timestamp with time zone default timezone('utc'::text, now()) not null
+);
+
+-- 7. Paystack Transactions Table (Multi-currency NGN & USD)
 create table if not exists public.transactions (
   id uuid primary key default uuid_generate_v4(),
   reference text not null unique,
   user_email text not null,
   tier text not null check (tier in ('free', 'pro', 'enterprise')),
-  amount integer not null, -- In smallest currency unit (e.g. Kobo for NGN or Cents for USD)
-  currency text not null default 'NGN',
+  amount numeric(12, 2) not null,
+  currency text not null default 'NGN' check (currency in ('NGN', 'USD')),
+  promo_code text,
   status text not null default 'pending' check (status in ('success', 'failed', 'pending')),
   channel text,
   paid_at timestamp with time zone,
   created_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
 
--- 7. Row Level Security (RLS) Configuration
+-- 8. System & Pricing Settings Table (Dual Currency NGN & USD)
+create table if not exists public.system_settings (
+  id integer primary key default 1 check (id = 1), -- Singleton row
+  currency text not null default 'NGN' check (currency in ('NGN', 'USD')),
+  pro_price_ngn integer not null default 15000,
+  pro_price_usd numeric(10, 2) not null default 10.00,
+  enterprise_price_ngn integer not null default 75000,
+  enterprise_price_usd numeric(10, 2) not null default 50.00,
+  free_limit integer not null default 10,
+  pro_limit integer not null default 150,
+  is_live_mode boolean not null default false,
+  updated_at timestamp with time zone default timezone('utc'::text, now()) not null
+);
+
+-- Insert default system settings row if not present
+insert into public.system_settings (id, currency, pro_price_ngn, pro_price_usd, enterprise_price_ngn, enterprise_price_usd, free_limit, pro_limit, is_live_mode)
+values (1, 'NGN', 15000, 10.00, 75000, 50.00, 10, 150, false)
+on conflict (id) do nothing;
+
+-- 9. Row Level Security (RLS) Setup
 alter table public.users enable row level security;
 alter table public.user_usage enable row level security;
 alter table public.analysis_history enable row level security;
 alter table public.feedback enable row level security;
 alter table public.transactions enable row level security;
+alter table public.promo_codes enable row level security;
+alter table public.system_settings enable row level security;
 
--- Basic RLS Policies (allows authenticated users to query their own records)
+-- Users RLS
+drop policy if exists "Allow users to read own profile" on public.users;
 create policy "Allow users to read own profile"
   on public.users for select
   using (auth.uid() = auth_id or auth.jwt() ->> 'email' = email);
 
+drop policy if exists "Allow users to update own profile" on public.users;
+create policy "Allow users to update own profile"
+  on public.users for update
+  using (auth.uid() = auth_id or auth.jwt() ->> 'email' = email);
+
+-- Analysis History RLS
+drop policy if exists "Allow users to read own analyses" on public.analysis_history;
 create policy "Allow users to read own analyses"
   on public.analysis_history for select
   using (auth.jwt() ->> 'email' = user_email);
 
+drop policy if exists "Allow users to insert own analyses" on public.analysis_history;
 create policy "Allow users to insert own analyses"
   on public.analysis_history for insert
   with check (auth.jwt() ->> 'email' = user_email);
 
+-- Feedback RLS
+drop policy if exists "Allow users to insert feedback" on public.feedback;
 create policy "Allow users to insert feedback"
   on public.feedback for insert
   with check (auth.jwt() ->> 'email' = user_email);
+
+-- Promo Codes RLS (Public read for active validation)
+drop policy if exists "Allow public to validate active promos" on public.promo_codes;
+create policy "Allow public to validate active promos"
+  on public.promo_codes for select
+  using (is_active = true);
+
+-- System Settings RLS (Public read for frontend pricing display)
+drop policy if exists "Allow public to read system settings" on public.system_settings;
+create policy "Allow public to read system settings"
+  on public.system_settings for select
+  using (true);
+
+-- Transactions RLS (Users can view their own transactions)
+drop policy if exists "Allow users to read own transactions" on public.transactions;
+create policy "Allow users to read own transactions"
+  on public.transactions for select
+  using (auth.jwt() ->> 'email' = user_email);
