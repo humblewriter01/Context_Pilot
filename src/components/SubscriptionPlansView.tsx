@@ -34,6 +34,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
   const plans = Object.values(SUBSCRIPTION_PLANS);
   const [paystackConfig, setPaystackConfig] = useState<any>(null);
   const [billingCycle, setBillingCycle] = useState<'monthly' | 'annual'>('monthly');
+  const [selectedCurrency, setSelectedCurrency] = useState<'NGN' | 'USD'>('NGN');
   const [loadingTier, setLoadingTier] = useState<string | null>(null);
   const [paymentNotice, setPaymentNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
@@ -51,7 +52,12 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
   useEffect(() => {
     paystackService
       .getConfig()
-      .then((cfg) => setPaystackConfig(cfg))
+      .then((cfg) => {
+        setPaystackConfig(cfg);
+        if (cfg?.currency === 'USD' || cfg?.currency === 'NGN') {
+          setSelectedCurrency(cfg.currency);
+        }
+      })
       .catch(console.error);
 
     // Check if redirected from Paystack with ?payment_ref= or ?reference=
@@ -132,10 +138,18 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
     setLoadingTier(plan.tier);
     setPaymentNotice(null);
 
-    let baseAmount =
-      plan.tier === 'pro'
-        ? paystackConfig?.proPriceNgn || 15000
-        : paystackConfig?.enterprisePriceNgn || 75000;
+    let baseAmount = 0;
+    if (selectedCurrency === 'USD') {
+      baseAmount =
+        plan.tier === 'pro'
+          ? paystackConfig?.proPriceUsd || 10
+          : paystackConfig?.enterprisePriceUsd || 50;
+    } else {
+      baseAmount =
+        plan.tier === 'pro'
+          ? paystackConfig?.proPriceNgn || 15000
+          : paystackConfig?.enterprisePriceNgn || 75000;
+    }
 
     // Apply 20% discount for annual billing
     if (billingCycle === 'annual') {
@@ -148,9 +162,9 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
       promoCodeToPass = appliedPromo.code;
       if (appliedPromo.discountType === 'percentage') {
         const disc = (baseAmount * appliedPromo.discountValue) / 100;
-        baseAmount = Math.max(100, baseAmount - disc);
+        baseAmount = Math.max(1, baseAmount - disc);
       } else {
-        baseAmount = Math.max(100, baseAmount - appliedPromo.discountAmount);
+        baseAmount = Math.max(1, baseAmount - appliedPromo.discountAmount);
       }
     }
 
@@ -160,7 +174,8 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
         plan.tier,
         baseAmount,
         window.location.href,
-        promoCodeToPass
+        promoCodeToPass,
+        selectedCurrency
       );
 
       if (initRes.authorization_url) {
@@ -199,8 +214,8 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
           Predict exact codebase files, API routes, database migrations, and test suites directly from Jira issues before writing code.
         </p>
 
-        {/* Monthly vs Annual Toggle */}
-        <div className="pt-2 flex items-center justify-center gap-3">
+        {/* Monthly vs Annual Toggle & Currency Switcher */}
+        <div className="pt-2 flex flex-wrap items-center justify-center gap-3">
           <div className="bg-slate-100 p-1 rounded-xl flex items-center border border-slate-200">
             <button
               onClick={() => setBillingCycle('monthly')}
@@ -224,6 +239,30 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
               <span className="px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-bold">
                 Save 20%
               </span>
+            </button>
+          </div>
+
+          {/* Currency Toggle */}
+          <div className="bg-slate-100 p-1 rounded-xl flex items-center border border-slate-200">
+            <button
+              onClick={() => setSelectedCurrency('NGN')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                selectedCurrency === 'NGN'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'text-slate-500 hover:text-slate-800'
+              }`}
+            >
+              ₦ NGN
+            </button>
+            <button
+              onClick={() => setSelectedCurrency('USD')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                selectedCurrency === 'USD'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'text-slate-500 hover:text-slate-800'
+              }`}
+            >
+              $ USD
             </button>
           </div>
         </div>
@@ -280,7 +319,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
               Promo code <strong className="font-mono">{appliedPromo.code}</strong> applied (
               {appliedPromo.discountType === 'percentage'
                 ? `${appliedPromo.discountValue}% OFF`
-                : `₦${appliedPromo.discountValue} OFF`}
+                : `${selectedCurrency === 'USD' ? '$' : '₦'}${appliedPromo.discountValue} OFF`}
               )!
             </span>
           </div>
@@ -299,22 +338,27 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
           const isCurrent = user?.subscriptionTier === plan.tier;
           const isPro = plan.tier === 'pro';
           const isLoading = loadingTier === plan.tier;
+          const isUsd = selectedCurrency === 'USD';
+          const currencySymbol = isUsd ? '$' : '₦';
 
-          let monthlyNgn =
-            plan.tier === 'pro'
-              ? paystackConfig?.proPriceNgn || 15000
-              : paystackConfig?.enterprisePriceNgn || 75000;
-
-          if (billingCycle === 'annual') {
-            monthlyNgn = Math.round(monthlyNgn * 0.8);
+          let basePrice = 0;
+          if (plan.tier === 'pro') {
+            basePrice = isUsd ? (paystackConfig?.proPriceUsd || 10) : (paystackConfig?.proPriceNgn || 15000);
+          } else if (plan.tier === 'enterprise') {
+            basePrice = isUsd ? (paystackConfig?.enterprisePriceUsd || 50) : (paystackConfig?.enterprisePriceNgn || 75000);
           }
 
-          let discountedNgn = monthlyNgn;
+          let monthlyPrice = basePrice;
+          if (billingCycle === 'annual') {
+            monthlyPrice = Math.round(monthlyPrice * 0.8);
+          }
+
+          let discountedPrice = monthlyPrice;
           if (appliedPromo && plan.tier !== 'free') {
             if (appliedPromo.discountType === 'percentage') {
-              discountedNgn = Math.round(monthlyNgn * (1 - appliedPromo.discountValue / 100));
+              discountedPrice = Math.round(monthlyPrice * (1 - appliedPromo.discountValue / 100));
             } else {
-              discountedNgn = Math.max(100, monthlyNgn - appliedPromo.discountAmount);
+              discountedPrice = Math.max(1, monthlyPrice - appliedPromo.discountAmount);
             }
           }
 
@@ -346,15 +390,17 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
                 <div>
                   <div className="flex items-baseline gap-1.5">
                     {plan.tier === 'free' ? (
-                      <span className="text-3xl sm:text-4xl font-extrabold text-slate-900">₦0</span>
+                      <span className="text-3xl sm:text-4xl font-extrabold text-slate-900">
+                        {currencySymbol}0
+                      </span>
                     ) : (
                       <>
                         <span className="text-3xl sm:text-4xl font-extrabold text-slate-900">
-                          ₦{discountedNgn.toLocaleString()}
+                          {currencySymbol}{discountedPrice.toLocaleString()}
                         </span>
                         {appliedPromo && (
                           <span className="text-sm text-slate-400 line-through">
-                            ₦{monthlyNgn.toLocaleString()}
+                            {currencySymbol}{monthlyPrice.toLocaleString()}
                           </span>
                         )}
                       </>
@@ -365,7 +411,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
                   {plan.tier !== 'free' && (
                     <div className="text-[11px] text-slate-400 font-mono mt-1">
                       {billingCycle === 'annual'
-                        ? 'Billed annually (₦' + (discountedNgn * 12).toLocaleString() + '/yr)'
+                        ? `Billed annually (${currencySymbol}${(discountedPrice * 12).toLocaleString()}/yr)`
                         : 'Billed monthly via Paystack'}
                     </div>
                   )}

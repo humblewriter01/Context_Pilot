@@ -53,18 +53,6 @@ export const SUBSCRIPTION_PLANS: Record<SubscriptionTier, SubscriptionPlan> = {
   }
 };
 
-const DEFAULT_USER: UserProfile = {
-  id: 1,
-  firebaseUid: 'usr_context_pilot_default',
-  email: 'ameenujaafar432@gmail.com',
-  displayName: 'Ameenu Jaafar',
-  photoUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&h=120&fit=crop&crop=faces',
-  subscriptionTier: 'pro',
-  createdAt: '2026-01-15T09:00:00.000Z',
-  lastLoginAt: new Date().toISOString(),
-  status: 'active'
-};
-
 function getCurrentMonthYear(): string {
   const d = new Date();
   const year = d.getFullYear();
@@ -94,9 +82,7 @@ export const storageService = {
       const data = localStorage.getItem(STORAGE_KEYS.USER);
       if (data) return JSON.parse(data);
 
-      // First time initialization: seed default active user
-      this.saveUser(DEFAULT_USER);
-      return DEFAULT_USER;
+      return null;
     } catch (e) {
       console.warn('Failed to load user', e);
       return null;
@@ -211,8 +197,9 @@ export const storageService = {
     localStorage.removeItem(STORAGE_KEYS.GITHUB_USER);
   },
 
-  updateTier(tier: SubscriptionTier): UserProfile {
-    const user = this.getUser() || DEFAULT_USER;
+  updateTier(tier: SubscriptionTier): UserProfile | null {
+    const user = this.getUser();
+    if (!user) return null;
     user.subscriptionTier = tier;
     this.saveUser(user);
     return user;

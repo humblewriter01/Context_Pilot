@@ -86,7 +86,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
 
   // Pricing & Limit Settings
   const [proPriceNgn, setProPriceNgn] = useState(15000);
+  const [proPriceUsd, setProPriceUsd] = useState(10);
   const [enterprisePriceNgn, setEnterprisePriceNgn] = useState(75000);
+  const [enterprisePriceUsd, setEnterprisePriceUsd] = useState(50);
+  const [currency, setCurrency] = useState<'NGN' | 'USD'>('NGN');
   const [freeLimit, setFreeLimit] = useState(10);
   const [proLimit, setProLimit] = useState(150);
 
@@ -136,8 +139,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
       setGithubClientId(st.githubClientId || '');
       setGithubClientSecret(st.githubClientSecretMasked || '');
       setIsLiveMode(st.isLiveMode);
-      setProPriceNgn(st.proPriceNgn);
-      setEnterprisePriceNgn(st.enterprisePriceNgn);
+      setCurrency(st.currency || 'NGN');
+      setProPriceNgn(st.proPriceNgn || 15000);
+      setProPriceUsd(st.proPriceUsd || 10);
+      setEnterprisePriceNgn(st.enterprisePriceNgn || 75000);
+      setEnterprisePriceUsd(st.enterprisePriceUsd || 50);
       setFreeLimit(st.freeLimit || 10);
       setProLimit(st.proLimit || 150);
     } catch (err: any) {
@@ -195,7 +201,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
     try {
       await adminService.updateSettings({
         proPriceNgn: Number(proPriceNgn),
+        proPriceUsd: Number(proPriceUsd),
         enterprisePriceNgn: Number(enterprisePriceNgn),
+        enterprisePriceUsd: Number(enterprisePriceUsd),
+        currency,
         freeLimit: Number(freeLimit),
         proLimit: Number(proLimit),
       });
@@ -1090,11 +1099,39 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                 <span>Subscription Pricing & Quota Control</span>
               </h2>
               <p className="text-xs text-slate-400">
-                Adjust plan subscription fees in Nigerian Naira (NGN) and monthly ticket analysis quotas.
+                Configure plan prices in both Nigerian Naira (NGN) and US Dollars (USD) for Paystack billing.
               </p>
             </div>
 
             <form onSubmit={handleSavePricing} className="space-y-6">
+              {/* Default Currency Switcher */}
+              <div className="p-4 bg-slate-950 rounded-xl border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                  <label className="block text-xs font-bold text-white mb-0.5">Primary Default Currency</label>
+                  <p className="text-[11px] text-slate-400">Select the default checkout currency displayed to users</p>
+                </div>
+                <div className="flex bg-slate-900 p-1 rounded-xl border border-slate-700">
+                  <button
+                    type="button"
+                    onClick={() => setCurrency('NGN')}
+                    className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${
+                      currency === 'NGN' ? 'bg-emerald-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    ₦ NGN (Naira)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCurrency('USD')}
+                    className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${
+                      currency === 'USD' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    $ USD (Dollar)
+                  </button>
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div className="p-4 bg-slate-950 rounded-xl border border-slate-800 space-y-3">
                   <span className="text-xs font-bold text-indigo-400 uppercase tracking-wider block">
@@ -1106,6 +1143,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                       type="number"
                       value={proPriceNgn}
                       onChange={(e) => setProPriceNgn(Number(e.target.value))}
+                      className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-white focus:outline-indigo-500 font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-300 mb-1">Price per Month ($ USD)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={proPriceUsd}
+                      onChange={(e) => setProPriceUsd(Number(e.target.value))}
                       className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-white focus:outline-indigo-500 font-mono"
                     />
                   </div>
@@ -1130,6 +1177,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                       type="number"
                       value={enterprisePriceNgn}
                       onChange={(e) => setEnterprisePriceNgn(Number(e.target.value))}
+                      className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-white focus:outline-indigo-500 font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-300 mb-1">Price per Month ($ USD)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={enterprisePriceUsd}
+                      onChange={(e) => setEnterprisePriceUsd(Number(e.target.value))}
                       className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-white focus:outline-indigo-500 font-mono"
                     />
                   </div>
@@ -1280,42 +1337,53 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800">
-                    {promos.map((p) => (
-                      <tr key={p.id} className="hover:bg-slate-800/40">
-                        <td className="p-3 font-mono font-bold text-white">{p.code}</td>
-                        <td className="p-3 text-emerald-400 font-semibold">
-                          {p.discountType === 'percentage' ? `${p.discountValue}% OFF` : `₦${p.discountValue} OFF`}
-                        </td>
-                        <td className="p-3 text-slate-300 capitalize">{p.applicableTiers.join(', ')}</td>
-                        <td className="p-3 text-slate-300">
-                          {p.usedCount} / {p.maxUses === -1 ? '∞' : p.maxUses}
-                        </td>
-                        <td className="p-3">
-                          <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                              p.isActive ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-800 text-slate-500'
-                            }`}
-                          >
-                            {p.isActive ? 'Active' : 'Disabled'}
-                          </span>
-                        </td>
-                        <td className="p-3 text-right space-x-2">
-                          <button
-                            onClick={() => handleTogglePromo(p.id)}
-                            className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors text-[11px]"
-                          >
-                            {p.isActive ? 'Disable' : 'Enable'}
-                          </button>
-                          <button
-                            onClick={() => handleDeletePromo(p.id)}
-                            className="p-1 rounded bg-rose-500/20 hover:bg-rose-500/40 text-rose-300 transition-colors"
-                            title="Delete promo code"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                    {promos.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="p-8 text-center text-slate-400">
+                          No promo codes created yet. Use the form above to create your first discount code.
                         </td>
                       </tr>
-                    ))}
+                    ) : (
+                      promos.map((p) => (
+                        <tr key={p.id} className="hover:bg-slate-800/40">
+                          <td className="p-3 font-mono font-bold text-white">{p.code}</td>
+                          <td className="p-3 text-emerald-400 font-semibold">
+                            {p.discountType === 'percentage'
+                              ? `${p.discountValue}% OFF`
+                              : `${currency === 'USD' ? '$' : '₦'}${p.discountValue} OFF`}
+                          </td>
+                          <td className="p-3 text-slate-300 capitalize">{p.applicableTiers.join(', ')}</td>
+                          <td className="p-3 text-slate-300">
+                            {p.usedCount} / {p.maxUses === -1 ? '∞' : p.maxUses}
+                          </td>
+                          <td className="p-3">
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                p.isActive ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-800 text-slate-500'
+                              }`}
+                            >
+                              {p.isActive ? 'Active' : 'Disabled'}
+                            </span>
+                          </td>
+                          <td className="p-3 text-right space-x-2">
+                            <button
+                              onClick={() => handleTogglePromo(p.id)}
+                              className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors text-[11px]"
+                            >
+                              {p.isActive ? 'Disable' : 'Enable'}
+                            </button>
+                            <button
+                              onClick={() => handleDeletePromo(p.id)}
+                              className="p-1.5 rounded bg-rose-500/20 hover:bg-rose-500/40 text-rose-300 transition-colors inline-flex items-center gap-1 text-[11px]"
+                              title="Delete promo code"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              <span>Delete</span>
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               </div>

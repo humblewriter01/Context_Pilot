@@ -10,6 +10,7 @@ import { SubscriptionPlansView } from './components/SubscriptionPlansView';
 import { AdminPortal } from './components/AdminPortal';
 import { AuthModal } from './components/AuthModal';
 import { AccountModal } from './components/AccountModal';
+import { SignInGate } from './components/SignInGate';
 import { storageService } from './services/storage';
 import { UserProfile, UsageStats, AnalysisRecord, FeedbackRecord, SubscriptionTier } from './types';
 
@@ -84,8 +85,10 @@ export const App: React.FC = () => {
 
   const handleTierChange = (tier: SubscriptionTier) => {
     const updatedUser = storageService.updateTier(tier);
-    setUser(updatedUser);
-    setUsage(storageService.getUsage());
+    if (updatedUser) {
+      setUser(updatedUser);
+      setUsage(storageService.getUsage());
+    }
   };
 
   const handleLogout = () => {
@@ -122,6 +125,20 @@ export const App: React.FC = () => {
   // If path is /admin or #/admin, render protected Enterprise Admin Portal
   if (isAdminRoute) {
     return <AdminPortal onBackToApp={navigateToApp} />;
+  }
+
+  // Strict Authentication Gate: User must sign in before accessing any application features
+  if (!user) {
+    return (
+      <SignInGate
+        onAuthSuccess={(authedUser) => {
+          setUser(authedUser);
+          setUsage(storageService.getUsage());
+          setAnalyses(storageService.getAnalyses());
+          setFeedback(storageService.getFeedback());
+        }}
+      />
+    );
   }
 
   return (
@@ -195,16 +212,7 @@ export const App: React.FC = () => {
 
           {activeTab === 'extension' && (
             <ExtensionSimulatorView
-              user={user || {
-                id: 0,
-                firebaseUid: 'guest',
-                email: 'developer@workspace.com',
-                displayName: 'Developer',
-                subscriptionTier: 'pro',
-                createdAt: new Date().toISOString(),
-                lastLoginAt: new Date().toISOString(),
-                status: 'active',
-              }}
+              user={user}
               usage={usage}
               onNavigateToJira={() => setActiveTab('jira')}
             />

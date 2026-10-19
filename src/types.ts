@@ -154,7 +154,9 @@ export interface AdminSystemSettings {
   isLiveMode: boolean;
   currency: 'NGN' | 'USD';
   proPriceNgn: number;
+  proPriceUsd: number;
   enterprisePriceNgn: number;
+  enterprisePriceUsd: number;
   freeLimit: number;
   proLimit: number;
   adminPassword?: string;

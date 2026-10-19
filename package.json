@@ -7,11 +7,12 @@
     "dev": "tsx server.ts",
     "build": "vite build",
     "lint": "tsc --noEmit",
-    "start": "tsx server.ts",
+    "start": "vite build && tsx server.ts",
     "preview": "vite preview --port 3000"
   },
   "dependencies": {
     "@google/genai": "^2.30.0",
+    "@supabase/supabase-js": "^2.118.0",
     "clsx": "^2.1.1",
     "dotenv": "^18.0.8",
     "express": "^5.3.0",

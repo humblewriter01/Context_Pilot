@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { UserProfile } from '../types';
 import { storageService } from '../services/storage';
+import { resetPasswordForEmail } from '../services/supabase';
 import {
   X,
   Mail,
@@ -67,8 +68,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
         if (!email.trim() || !email.includes('@')) {
           throw new Error('Please enter a valid email address');
         }
-        await new Promise((r) => setTimeout(r, 600));
-        setSuccessMessage(`Password reset instructions have been dispatched to ${email}. Please check your inbox.`);
+
+        const { error: resetErr } = await resetPasswordForEmail(email.trim());
+        if (resetErr) {
+          throw new Error(resetErr.message || 'Failed to dispatch reset email via Supabase');
+        }
+
+        setSuccessMessage(`Password reset link has been dispatched to ${email.trim()} via Supabase. Please check your inbox.`);
         return;
       }
 

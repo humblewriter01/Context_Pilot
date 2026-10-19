@@ -41,19 +41,21 @@ export const paystackService = {
   async initializeTransaction(
     email: string,
     tier: SubscriptionTier,
-    amountNgn: number,
+    amount: number,
     callbackUrl?: string,
-    promoCode?: string
+    promoCode?: string,
+    currency?: 'NGN' | 'USD'
   ): Promise<{ authorization_url: string; reference: string; finalAmount?: number }> {
     const res = await fetch('/api/paystack/initialize', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         email,
-        amount: amountNgn,
+        amount,
         tier,
         callback_url: callbackUrl,
         promo_code: promoCode,
+        currency,
       }),
     });
 
