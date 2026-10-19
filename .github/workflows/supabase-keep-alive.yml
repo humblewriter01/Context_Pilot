@@ -21,15 +21,20 @@ jobs:
             exit 0
           fi
 
-          echo "Sending keep-alive heartbeat to Supabase..."
+          echo "Sending keep-alive heartbeat to Supabase database..."
+          # UPDATED: Pinging the 'system_settings' table to force a real database query
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
-            "${SUPABASE_URL}/rest/v1/")
+            "${SUPABASE_URL}/rest/v1/system_settings?select=id&limit=1")
 
           echo "Supabase heartbeat status: ${HTTP_STATUS}"
-          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 500 ]; then
+          
+          # Accept any 2xx or 3xx status as a successful ping
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 400 ]; then
             echo "✅ Supabase project pinged successfully! Active status preserved."
           else
             echo "⚠️ Non-200 status received: ${HTTP_STATUS}"
+            # Fail the action if the database is unreachable so GitHub notifies you
+            exit 1
           fi
