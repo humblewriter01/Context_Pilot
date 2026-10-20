@@ -50,23 +50,58 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
   const [validatingPromo, setValidatingPromo] = useState(false);
 
   useEffect(() => {
+    // 1. Fetch backend gateway config & live prices
     paystackService
       .getConfig()
       .then((cfg) => {
         setPaystackConfig(cfg);
-        if (cfg?.currency === 'USD' || cfg?.currency === 'NGN') {
-          setSelectedCurrency(cfg.currency);
-        }
       })
       .catch(console.error);
 
-    // Check if redirected from Paystack with ?payment_ref= or ?reference=
+    // 2. Auto-Currency Detection (Geo-IP)
+    const storedCurrency = sessionStorage.getItem('cp_selected_currency') as 'NGN' | 'USD' | null;
+    if (storedCurrency === 'NGN' || storedCurrency === 'USD') {
+      setSelectedCurrency(storedCurrency);
+    } else {
+      fetch('https://ipapi.co/json/')
+        .then((res) => {
+          if (!res.ok) throw new Error('Geo-IP lookup failed');
+          return res.json();
+        })
+        .then((data) => {
+          const isNigeria =
+            data?.country_code === 'NG' ||
+            data?.country === 'Nigeria' ||
+            data?.country_name === 'Nigeria';
+          const detected: 'NGN' | 'USD' = isNigeria ? 'NGN' : 'USD';
+          setSelectedCurrency(detected);
+          sessionStorage.setItem('cp_selected_currency', detected);
+        })
+        .catch(() => {
+          // Fallback: check browser locale / timezone if ipapi is unreachable
+          try {
+            const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+            const isNgTz = timeZone.includes('Lagos') || timeZone.includes('Africa/Lagos');
+            const detected: 'NGN' | 'USD' = isNgTz ? 'NGN' : 'USD';
+            setSelectedCurrency(detected);
+          } catch {
+            setSelectedCurrency('USD');
+          }
+        });
+    }
+
+    // 3. Check if redirected from Paystack with ?payment_ref= or ?reference=
     const params = new URLSearchParams(window.location.search);
     const ref = params.get('payment_ref') || params.get('reference');
     if (ref) {
       handleVerifyReference(ref);
     }
   }, []);
+
+  const handleCurrencySelect = (curr: 'NGN' | 'USD') => {
+    setSelectedCurrency(curr);
+    sessionStorage.setItem('cp_selected_currency', curr);
+  };
 
   const handleVerifyReference = async (ref: string) => {
     setPaymentNotice(null);
@@ -169,6 +204,29 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
     }
 
     try {
+      // Attempt inline popup checkout if public key is active
+      if (paystackConfig?.paystackPublicKey) {
+        const popupOpened = await paystackService.openInlineCheckout({
+          publicKey: paystackConfig.paystackPublicKey,
+          email: user.email,
+          amount: baseAmount,
+          currency: selectedCurrency,
+          tier: plan.tier,
+          promoCode: promoCodeToPass,
+          onSuccess: (ref) => {
+            handleVerifyReference(ref);
+          },
+          onClose: () => {
+            setLoadingTier(null);
+          },
+        });
+
+        if (popupOpened) {
+          return;
+        }
+      }
+
+      // Standard Paystack authorization redirect flow
       const initRes = await paystackService.initializeTransaction(
         user.email,
         plan.tier,
@@ -179,7 +237,6 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
       );
 
       if (initRes.authorization_url) {
-        // Direct redirect to Paystack secure checkout
         window.location.href = initRes.authorization_url;
       } else {
         throw new Error('No authorization URL returned from Paystack API');
@@ -245,7 +302,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
           {/* Currency Toggle */}
           <div className="bg-slate-100 p-1 rounded-xl flex items-center border border-slate-200">
             <button
-              onClick={() => setSelectedCurrency('NGN')}
+              onClick={() => handleCurrencySelect('NGN')}
               className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
                 selectedCurrency === 'NGN'
                   ? 'bg-emerald-600 text-white shadow-xs'
@@ -255,7 +312,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
               ₦ NGN
             </button>
             <button
-              onClick={() => setSelectedCurrency('USD')}
+              onClick={() => handleCurrencySelect('USD')}
               className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
                 selectedCurrency === 'USD'
                   ? 'bg-indigo-600 text-white shadow-xs'

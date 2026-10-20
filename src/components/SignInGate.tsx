@@ -63,7 +63,8 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
     try {
       if (tab === 'forgot') {
         if (!email.trim() || !email.includes('@')) throw new Error('Please enter a valid email address');
-        const { error: resetErr } = await resetPasswordForEmail(email.trim());
+        const dynamicRedirect = `${window.location.origin}/#reset-password`;
+        const { error: resetErr } = await resetPasswordForEmail(email.trim(), dynamicRedirect);
         if (resetErr) {
           throw new Error(resetErr.message || 'Failed to dispatch reset link via Supabase');
         }

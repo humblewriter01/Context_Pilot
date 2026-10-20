@@ -1,18 +1,38 @@
 import { CategorizedFiles } from '../types';
+import { storageService } from './storage';
+
+export interface AnalysisResponse extends CategorizedFiles {
+  processingTimeMs?: number;
+  usage?: {
+    ticketsProcessed: number;
+    monthlyLimit: number;
+    remainingTickets: number;
+  };
+}
 
 /**
- * Analyzes a Jira ticket via the server-side Gemini 3.8 Flash API route.
- * No mock data: sends the real ticket text and key to /api/analyze.
+ * Analyzes a Jira ticket via the server-side Gemini 3.8 Flash API route (/api/analyze-ticket).
+ * Passes user email for server-side Supabase quota enforcement and history logging.
  */
-export async function analyzeTicket(ticketText: string, ticketKey: string): Promise<CategorizedFiles> {
-  const response = await fetch('/api/analyze', {
+export async function analyzeTicket(
+  ticketText: string,
+  ticketKey: string,
+  userEmail?: string,
+  ticketTitle?: string
+): Promise<AnalysisResponse> {
+  const email = userEmail || storageService.getUser()?.email || '';
+
+  const response = await fetch('/api/analyze-ticket', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...(email ? { 'x-user-email': email } : {}),
     },
     body: JSON.stringify({
       ticket_text: ticketText,
       ticket_key: ticketKey,
+      ticket_title: ticketTitle,
+      user_email: email,
     }),
   });
 
@@ -54,5 +74,7 @@ export async function analyzeTicket(ticketText: string, ticketKey: string): Prom
     confidence_score: typeof result.confidence_score === 'number' ? result.confidence_score : 0.85,
     reasoning: result.reasoning || 'Identified impacted files via Gemini 3.8 Flash analysis.',
     total_files,
+    processingTimeMs: result.processingTimeMs,
+    usage: result.usage,
   };
 }

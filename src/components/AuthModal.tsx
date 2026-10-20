@@ -69,7 +69,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
           throw new Error('Please enter a valid email address');
         }
 
-        const { error: resetErr } = await resetPasswordForEmail(email.trim());
+        const dynamicRedirect = `${window.location.origin}/#reset-password`;
+        const { error: resetErr } = await resetPasswordForEmail(email.trim(), dynamicRedirect);
         if (resetErr) {
           throw new Error(resetErr.message || 'Failed to dispatch reset email via Supabase');
         }

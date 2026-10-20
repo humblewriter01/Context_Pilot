@@ -24,82 +24,18 @@ interface JiraSimulatorViewProps {
   onNavigateToPlans: () => void;
 }
 
-interface TicketTemplate {
-  label: string;
-  key: string;
-  title: string;
-  description: string;
-  priority: 'Highest' | 'High' | 'Medium' | 'Low';
-  components: string[];
-}
-
-const TEMPLATES: TicketTemplate[] = [
-  {
-    label: 'OAuth 2.0 Auth Flow',
-    key: 'PROJ-101',
-    title: 'Implement Google OAuth 2.0 and JWT Refresh Session Tokens',
-    description: `Implement Google OAuth 2.0 flow for web and mobile clients.
-Users should be able to click 'Sign In with Google' from the login page and get redirected through the consent screen.
-
-Requirements:
-1. Handle callback at /auth/callback and exchange authorization code for Google profile and JWT tokens.
-2. Store refresh tokens encrypted in PostgreSQL database (users table / user_sessions).
-3. Implement express authentication middleware verifying bearer JWT tokens on all protected API endpoints.
-4. Add client-side GoogleSignInButton component with loading states and session context provider.
-5. Provide unit tests for token verification and integration tests for authentication lifecycle.`,
-    priority: 'High',
-    components: ['Authentication', 'Backend API', 'Frontend Client'],
-  },
-  {
-    label: 'Stripe Webhook Bug',
-    key: 'PROJ-102',
-    title: 'Fix Stripe Webhook Signature Verification in Checkout Flow',
-    description: `Users report subscription upgrades failing silently. Webhook endpoint /api/webhooks/stripe returns 400 bad signature because express.json() parses the raw payload before Stripe SDK can verify stripe-signature header.
-
-Steps to reproduce:
-1. Trigger checkout.session.completed test event from Stripe CLI.
-2. Server logs: Error: Webhook signature verification failed.
-3. Subscription status remains inactive.
-
-Fix needed:
-- Mount express.raw({ type: 'application/json' }) specifically on the webhook route before global JSON body parser.
-- Update stripe.service.ts to handle customer.subscription.updated and invoice.payment_succeeded.
-- Add database transaction updating user subscription tier and invoice history.`,
-    priority: 'Highest',
-    components: ['Billing', 'Payment Gateways'],
-  },
-  {
-    label: 'Dark Mode & Navbar',
-    key: 'PROJ-103',
-    title: 'Responsive Dashboard Navigation Bar with Dark Mode Theme',
-    description: `Redesign the main navigation bar to be fully responsive on mobile devices and support seamless dark mode switching.
-
-Details:
-- Add a sticky top navigation bar with collapsible hamburger sidebar for screens under 768px.
-- Create ThemeToggle component supporting system preference, light, and dark mode.
-- Store user preference in localStorage and synchronize with UserPreferences table on backend.
-- Configure Tailwind CSS dark mode selector and audit contrast ratios for WCAG AA compliance.`,
-    priority: 'Medium',
-    components: ['Design System', 'Frontend Client'],
-  },
-];
-
 export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
   usage,
   onUsageUpdated,
   onNavigateToGitHub,
   onNavigateToPlans,
 }) => {
-  const [ticketKey, setTicketKey] = useState('PROJ-101');
-  const [ticketTitle, setTicketTitle] = useState(
-    'Implement Google OAuth 2.0 and JWT Refresh Session Tokens'
-  );
-  const [ticketDescription, setTicketDescription] = useState(
-    TEMPLATES[0].description
-  );
-  const [priority, setPriority] = useState<'Highest' | 'High' | 'Medium' | 'Low'>('High');
+  const [ticketKey, setTicketKey] = useState('');
+  const [ticketTitle, setTicketTitle] = useState('');
+  const [ticketDescription, setTicketDescription] = useState('');
+  const [priority, setPriority] = useState<'Highest' | 'High' | 'Medium' | 'Low'>('Medium');
   const [status, setStatus] = useState<'To Do' | 'In Progress' | 'In Review' | 'Done'>('In Progress');
-  const [componentsList, setComponentsList] = useState<string>('Authentication, Backend API, Frontend');
+  const [componentsList, setComponentsList] = useState<string>('');
 
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<
@@ -108,16 +44,6 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [quotaExceeded, setQuotaExceeded] = useState(false);
   const [activeAnalysisTicketKey, setActiveAnalysisTicketKey] = useState<string>('');
-
-  const handleApplyTemplate = (tmpl: TicketTemplate) => {
-    setTicketKey(tmpl.key);
-    setTicketTitle(tmpl.title);
-    setTicketDescription(tmpl.description);
-    setPriority(tmpl.priority);
-    setComponentsList(tmpl.components.join(', '));
-    setAnalysisResult(null);
-    setAnalysisError(null);
-  };
 
   const handleAnalyze = async () => {
     setAnalysisError(null);
@@ -139,7 +65,13 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
 
     try {
       const fullText = `${ticketTitle}\n\n${ticketDescription}`;
-      const result = await analyzeTicket(fullText, ticketKey || 'TICKET-01');
+      const currentUser = storageService.getUser();
+      const result = await analyzeTicket(
+        fullText,
+        ticketKey || 'TICKET-01',
+        currentUser?.email,
+        ticketTitle || 'Untitled Ticket'
+      );
       const processingTime = Date.now() - startTime;
 
       const record: AnalysisRecord = {
@@ -155,6 +87,10 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
       };
 
       storageService.saveAnalysis(record);
+      if (result.usage) {
+        const currentMonth = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+        localStorage.setItem(`context_pilot_usage_${currentMonth}`, String(result.usage.ticketsProcessed));
+      }
       const updatedUsage = storageService.getUsage();
       onUsageUpdated(updatedUsage);
 
@@ -166,6 +102,9 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
       });
     } catch (err: any) {
       console.error('Analysis failed:', err);
+      if (err?.message?.includes('Monthly ticket limit') || err?.message?.includes('quota exceeded') || err?.message?.includes('429')) {
+        setQuotaExceeded(true);
+      }
       setAnalysisError(err?.message || 'Failed to complete analysis. Please try again.');
     } finally {
       setAnalyzing(false);
@@ -186,26 +125,6 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
           <p className="text-xs text-slate-300 max-w-xl">
             Analyze any feature request or bug report to identify impacted components across frontend, backend, database migrations, and test suites.
           </p>
-        </div>
-
-        {/* Quick Template Picker */}
-        <div className="flex items-center gap-2 self-start sm:self-auto">
-          <span className="text-xs text-slate-400">Templates:</span>
-          <div className="flex bg-slate-800 p-1 rounded-lg border border-slate-700">
-            {TEMPLATES.map((tmpl) => (
-              <button
-                key={tmpl.key}
-                onClick={() => handleApplyTemplate(tmpl)}
-                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-all ${
-                  ticketKey === tmpl.key
-                    ? 'bg-indigo-600 text-white shadow-2xs'
-                    : 'text-slate-300 hover:text-white'
-                }`}
-              >
-                {tmpl.label}
-              </button>
-            ))}
-          </div>
         </div>
       </div>
 
@@ -250,7 +169,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
               <span className="w-2.5 h-2.5 rounded-full bg-slate-300" />
             </div>
             <span className="ml-1 sm:ml-2 font-mono text-[11px] sm:text-xs text-slate-400 truncate min-w-0">
-              jira.company.com/browse/{ticketKey || 'PROJ-101'}
+              jira.company.com/browse/{ticketKey || 'PROJ-123'}
             </span>
           </div>
           <div className="flex items-center gap-1.5 font-medium text-slate-600 shrink-0 text-[11px] sm:text-xs whitespace-nowrap">
@@ -269,7 +188,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
               <span>/</span>
               <span className="font-medium text-slate-700">Engineering</span>
               <span>/</span>
-              <span className="font-semibold text-indigo-600">{ticketKey || 'PROJ-101'}</span>
+              <span className="font-semibold text-indigo-600">{ticketKey || 'PROJ-123'}</span>
             </div>
 
             {/* Editable Issue Header */}
@@ -277,14 +196,14 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
               <div className="flex flex-col sm:flex-row gap-2">
                 <input
                   type="text"
-                  placeholder="Ticket Key (e.g. CORE-101)"
+                  placeholder="e.g. PROJ-123"
                   value={ticketKey}
                   onChange={(e) => setTicketKey(e.target.value)}
                   className="w-full sm:w-36 px-3 py-1.5 border border-slate-300 rounded-lg text-sm font-bold text-slate-900 font-mono bg-white focus:outline-indigo-500"
                 />
                 <input
                   type="text"
-                  placeholder="Ticket Summary / Title"
+                  placeholder="e.g. Implement Google OAuth 2.0 with session tokens"
                   value={ticketTitle}
                   onChange={(e) => setTicketTitle(e.target.value)}
                   className="flex-1 px-3 py-1.5 border border-slate-300 rounded-lg text-sm sm:text-base font-bold text-slate-900 bg-white focus:outline-indigo-500"
@@ -328,7 +247,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
 
               <textarea
                 rows={9}
-                placeholder="Enter or paste the full ticket description, error traces, or acceptance criteria here..."
+                placeholder="Paste or describe the issue requirements, expected behavior, or bug details here..."
                 value={ticketDescription}
                 onChange={(e) => setTicketDescription(e.target.value)}
                 className="w-full p-4 border border-slate-300 rounded-xl text-xs sm:text-sm font-normal text-slate-800 bg-slate-50/50 focus:bg-white focus:outline-indigo-500 leading-relaxed font-mono"
@@ -399,17 +318,6 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                 placeholder="e.g. Authentication, Backend, API"
                 className="w-full px-3 py-2 bg-white border border-slate-300 text-slate-800 rounded-lg text-xs font-mono focus:outline-indigo-500"
               />
-            </div>
-
-            {/* Clean Feature Overview */}
-            <div className="p-4 rounded-2xl bg-indigo-50/60 border border-indigo-100 text-xs space-y-2 text-indigo-950">
-              <div className="flex items-center gap-1.5 font-bold">
-                <Code className="w-4 h-4 text-indigo-600" />
-                <span>Codebase Impact Analysis</span>
-              </div>
-              <p className="text-slate-600 text-[11px] leading-relaxed">
-                Clicking "Analyze Code Impact" reads the ticket requirements and outlines the exact files across the repository that require changes before engineering starts.
-              </p>
             </div>
           </div>
         </div>

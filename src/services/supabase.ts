@@ -20,9 +20,10 @@ export const supabase: SupabaseClient | null = isSupabaseConfigured
   : null;
 
 export async function resetPasswordForEmail(email: string, redirectTo?: string) {
+  const dynamicRedirect = redirectTo || `${window.location.origin}/#reset-password`;
   if (supabase) {
     return await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: redirectTo || `${window.location.origin}/#reset-password`,
+      redirectTo: dynamicRedirect,
     });
   }
 
@@ -30,7 +31,7 @@ export async function resetPasswordForEmail(email: string, redirectTo?: string) 
   const res = await fetch('/api/auth/reset-password', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, redirectTo: redirectTo || `${window.location.origin}/#reset-password` }),
+    body: JSON.stringify({ email, redirectTo: dynamicRedirect }),
   });
 
   const data = await res.json();

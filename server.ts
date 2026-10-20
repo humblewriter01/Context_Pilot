@@ -1,8 +1,9 @@
 import express from 'express';
 import fs from 'fs';
+import crypto from 'crypto';
 import { createServer as createViteServer, build as buildVite } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -13,14 +14,48 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(express.json());
 
-// Initialize Supabase Server Client (if environment variables configured)
+// Express JSON middleware with rawBody capture for Paystack signature verification
+app.use(
+  express.json({
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
+
+// Helper to get current YYYY-MM
+function getCurrentMonthYear(): string {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  return `${year}-${month}`;
+}
+
+// Initialize Supabase Admin Client using SUPABASE_SERVICE_ROLE_KEY to bypass RLS for webhook & admin operations
 const supabaseUrl = process.env.SUPABASE_URL || '';
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || '';
-const supabaseServer = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
-if (supabaseServer) {
-  console.log('Supabase database client initialized successfully.');
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || '';
+
+export const supabaseAdmin: SupabaseClient | null = supabaseUrl && supabaseServiceRoleKey
+  ? createClient(supabaseUrl, supabaseServiceRoleKey, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+      },
+    })
+  : supabaseUrl && supabaseAnonKey
+  ? createClient(supabaseUrl, supabaseAnonKey)
+  : null;
+
+export const supabaseServer = supabaseAdmin;
+
+if (supabaseAdmin) {
+  if (supabaseServiceRoleKey) {
+    console.log('✅ Supabase Admin Client initialized with SERVICE_ROLE_KEY (RLS bypassed).');
+  } else {
+    console.log('ℹ️ Supabase Client initialized with ANON_KEY (RLS active).');
+  }
 }
 
 // Initialize Google Gen AI client with server-side API key if available
@@ -300,6 +335,43 @@ app.get('/api/paystack/verify/:reference', async (req, res) => {
           ticketsUsedThisMonth: 0,
         });
       }
+
+      // Sync with Supabase if configured
+      if (supabaseAdmin) {
+        await supabaseAdmin.from('transactions').upsert(
+          {
+            reference,
+            user_email: customerEmail,
+            tier,
+            amount: txData.amount / 100,
+            currency: txData.currency,
+            status: 'success',
+            channel: txData.channel,
+            paid_at: txData.paid_at,
+          },
+          { onConflict: 'reference' }
+        );
+
+        await supabaseAdmin
+          .from('users')
+          .update({
+            subscription_tier: tier,
+            last_login_at: new Date().toISOString(),
+          })
+          .eq('email', customerEmail);
+
+        const currentMonth = getCurrentMonthYear();
+        const limit = tier === 'enterprise' ? -1 : (tier === 'pro' ? (SERVER_STORE.settings.proLimit || 150) : 10);
+        await supabaseAdmin.from('user_usage').upsert(
+          {
+            user_email: customerEmail,
+            month_year: currentMonth,
+            monthly_limit: limit,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_email,month_year' }
+        );
+      }
     }
 
     return res.json({
@@ -315,6 +387,133 @@ app.get('/api/paystack/verify/:reference', async (req, res) => {
   } catch (error: any) {
     console.error('Paystack verification error:', error);
     return res.status(500).json({ error: error?.message || 'Verification error' });
+  }
+});
+
+// ===================================================================
+// Paystack Webhook Handler (/api/paystack/webhook)
+// Verifies HMAC-SHA512 signature and processes charge.success
+// ===================================================================
+app.post('/api/paystack/webhook', async (req: any, res) => {
+  try {
+    const paystackSecret = process.env.PAYSTACK_SECRET_KEY || SERVER_STORE.settings.paystackSecretKey;
+    if (!paystackSecret) {
+      console.warn('[Paystack Webhook] PAYSTACK_SECRET_KEY not set.');
+      return res.status(400).json({ error: 'Paystack Secret Key is not configured on server' });
+    }
+
+    const signature = req.headers['x-paystack-signature'];
+    if (!signature) {
+      return res.status(400).json({ error: 'Missing x-paystack-signature header' });
+    }
+
+    // Verify HMAC-SHA512 signature using raw body buffer
+    const hash = crypto
+      .createHmac('sha512', paystackSecret.trim())
+      .update(req.rawBody || JSON.stringify(req.body))
+      .digest('hex');
+
+    if (hash !== signature) {
+      console.error('[Paystack Webhook] Signature verification failed');
+      return res.status(401).json({ error: 'Invalid Paystack webhook signature' });
+    }
+
+    const event = req.body;
+    if (event && event.event === 'charge.success') {
+      const data = event.data;
+      const userEmail = (data.customer?.email || '').toLowerCase().trim();
+      const reference = data.reference;
+      const amount = (data.amount || 0) / 100;
+      const currency = data.currency || 'NGN';
+      const channel = data.channel || 'card';
+      const paidAt = data.paid_at || new Date().toISOString();
+      const metadata = data.metadata || {};
+      const tier: 'free' | 'pro' | 'enterprise' =
+        metadata.tier || (amount >= (currency === 'USD' ? 40 : 50000) ? 'enterprise' : 'pro');
+      const promoCode = metadata.promo_code || null;
+
+      console.log(`[Paystack Webhook] charge.success received: ${userEmail} -> ${tier} (${currency} ${amount}) [Ref: ${reference}]`);
+
+      // 1. In-memory / server store update
+      const existingTx = SERVER_STORE.transactions.find((t) => t.reference === reference);
+      if (existingTx) {
+        existingTx.status = 'success';
+        existingTx.paidAt = paidAt;
+      } else {
+        SERVER_STORE.transactions.unshift({
+          id: reference,
+          reference,
+          amount,
+          currency,
+          email: userEmail,
+          tier,
+          status: 'success',
+          channel,
+          paidAt,
+          createdAt: new Date().toISOString(),
+          promoCode: promoCode || undefined,
+        });
+      }
+
+      const memUser = SERVER_STORE.users.find((u) => u.email.toLowerCase() === userEmail);
+      if (memUser) {
+        memUser.subscriptionTier = tier;
+      }
+
+      // 2. Persist to Supabase using supabaseAdmin (bypassing RLS)
+      if (supabaseAdmin && userEmail) {
+        // Record in transactions table
+        const { error: txError } = await supabaseAdmin.from('transactions').upsert(
+          {
+            reference,
+            user_email: userEmail,
+            tier,
+            amount,
+            currency,
+            promo_code: promoCode,
+            status: 'success',
+            channel,
+            paid_at: paidAt,
+          },
+          { onConflict: 'reference' }
+        );
+        if (txError) {
+          console.error('[Paystack Webhook] Supabase transaction upsert error:', txError);
+        }
+
+        // Upgrade user subscription_tier in public.users table
+        const { error: userError } = await supabaseAdmin
+          .from('users')
+          .update({
+            subscription_tier: tier,
+            last_login_at: new Date().toISOString(),
+          })
+          .eq('email', userEmail);
+        if (userError) {
+          console.error('[Paystack Webhook] Supabase user tier update error:', userError);
+        } else {
+          console.log(`[Paystack Webhook] Successfully updated ${userEmail} to ${tier} in Supabase public.users`);
+        }
+
+        // Update quota in user_usage table for current month
+        const currentMonth = getCurrentMonthYear();
+        const limit = tier === 'enterprise' ? -1 : (tier === 'pro' ? (SERVER_STORE.settings.proLimit || 150) : 10);
+        await supabaseAdmin.from('user_usage').upsert(
+          {
+            user_email: userEmail,
+            month_year: currentMonth,
+            monthly_limit: limit,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_email,month_year' }
+        );
+      }
+    }
+
+    return res.status(200).json({ received: true });
+  } catch (err: any) {
+    console.error('[Paystack Webhook Error]:', err);
+    return res.status(500).json({ error: err?.message || 'Paystack webhook processing error' });
   }
 });
 
@@ -947,17 +1146,109 @@ function heuristicAnalyzeTicket(ticketText: string, ticketKey: string) {
   };
 }
 
-app.post('/api/analyze', async (req, res) => {
+// ==========================================
+// Ticket Analysis Handler with Quota Enforcement
+// Checks user_usage before analysis, increments after successful completion
+// ==========================================
+async function handleTicketAnalysis(req: express.Request, res: express.Response) {
   const startTime = Date.now();
-  const { ticket_text, ticket_key } = req.body;
+  const { ticket_text, ticket_key, user_email, ticket_title } = req.body;
 
   if (!ticket_text || typeof ticket_text !== 'string' || ticket_text.trim().length < 5) {
     return res.status(400).json({ error: 'Missing or insufficient ticket_text for analysis' });
   }
 
   const key = ticket_key || 'TICKET-LIVE';
+  const email = (user_email || (req.headers['x-user-email'] as string) || '').toLowerCase().trim();
+  const currentMonth = getCurrentMonthYear();
 
-  // If GEMINI_API_KEY is available, analyze via Gemini
+  let userTier: 'free' | 'pro' | 'enterprise' = 'free';
+  let monthlyLimit = SERVER_STORE.settings.freeLimit || 10;
+  let ticketsProcessed = 0;
+
+  // 1. Quota Enforcement: Check user status and monthly limit before running AI
+  if (email) {
+    if (supabaseAdmin) {
+      try {
+        // Fetch user profile from Supabase
+        const { data: userData } = await supabaseAdmin
+          .from('users')
+          .select('subscription_tier, status')
+          .eq('email', email)
+          .maybeSingle();
+
+        if (userData) {
+          if (userData.status === 'suspended') {
+            return res.status(403).json({ error: 'Account is suspended. Please contact support.' });
+          }
+          userTier = userData.subscription_tier || 'free';
+        }
+
+        // Determine limit by tier
+        monthlyLimit =
+          userTier === 'enterprise'
+            ? -1
+            : userTier === 'pro'
+            ? (SERVER_STORE.settings.proLimit || 150)
+            : (SERVER_STORE.settings.freeLimit || 10);
+
+        // Fetch monthly usage
+        const { data: usageData } = await supabaseAdmin
+          .from('user_usage')
+          .select('tickets_processed, monthly_limit')
+          .eq('user_email', email)
+          .eq('month_year', currentMonth)
+          .maybeSingle();
+
+        if (usageData) {
+          ticketsProcessed = usageData.tickets_processed || 0;
+          if (typeof usageData.monthly_limit === 'number') {
+            monthlyLimit = usageData.monthly_limit;
+          }
+        }
+
+        // Enforce quota limit (if not unlimited -1)
+        if (monthlyLimit !== -1 && ticketsProcessed >= monthlyLimit) {
+          return res.status(429).json({
+            error: `Monthly ticket limit reached (${ticketsProcessed}/${monthlyLimit}). Upgrade your subscription tier to continue.`,
+            quotaExceeded: true,
+            ticketsProcessed,
+            monthlyLimit,
+            remainingTickets: 0,
+          });
+        }
+      } catch (quotaErr) {
+        console.warn('[Quota Check Warning]:', quotaErr);
+      }
+    } else {
+      // In-memory fallback
+      const memUser = SERVER_STORE.users.find((u) => u.email.toLowerCase() === email);
+      if (memUser) {
+        userTier = memUser.subscriptionTier;
+        monthlyLimit =
+          userTier === 'enterprise'
+            ? -1
+            : userTier === 'pro'
+            ? (SERVER_STORE.settings.proLimit || 150)
+            : (SERVER_STORE.settings.freeLimit || 10);
+        ticketsProcessed = memUser.ticketsUsedThisMonth || 0;
+
+        if (monthlyLimit !== -1 && ticketsProcessed >= monthlyLimit) {
+          return res.status(429).json({
+            error: `Monthly ticket limit reached (${ticketsProcessed}/${monthlyLimit}). Upgrade your subscription tier to continue.`,
+            quotaExceeded: true,
+            ticketsProcessed,
+            monthlyLimit,
+            remainingTickets: 0,
+          });
+        }
+      }
+    }
+  }
+
+  // 2. Run AI Analysis
+  let analysisResult: any = null;
+
   if (process.env.GEMINI_API_KEY) {
     try {
       const prompt = `Act as a senior software architect and tech lead. Analyze this Jira ticket carefully and predict all codebase files, components, and endpoints that will need to be added or modified.
@@ -1023,9 +1314,7 @@ Be realistic, precise, and practical for production codebases.`;
         config_files.length +
         test_files.length;
 
-      const processingTimeMs = Date.now() - startTime;
-
-      return res.json({
+      analysisResult = {
         frontend_files,
         backend_files,
         database_files,
@@ -1034,21 +1323,78 @@ Be realistic, precise, and practical for production codebases.`;
         confidence_score: typeof parsed.confidence_score === 'number' ? parsed.confidence_score : 0.9,
         reasoning: parsed.reasoning || 'Identified impacted files based on technical requirements and architectural impact.',
         total_files,
-        processingTimeMs,
         ticket_key: key,
-      });
+      };
     } catch (err: any) {
       console.warn('Gemini API call warning, falling back to heuristic engine:', err?.message);
     }
   }
 
-  // Robust Heuristic Analysis Engine Fallback
-  const fallbackResult = heuristicAnalyzeTicket(ticket_text, key);
-  return res.json({
-    ...fallbackResult,
-    processingTimeMs: Date.now() - startTime,
-  });
-});
+  // Fallback to heuristic engine if Gemini unavailable or failed
+  if (!analysisResult) {
+    analysisResult = heuristicAnalyzeTicket(ticket_text, key);
+  }
+
+  const processingTimeMs = Date.now() - startTime;
+  analysisResult.processingTimeMs = processingTimeMs;
+
+  // 3. Quota Update: Increment tickets_processed ONLY AFTER successful analysis
+  if (email) {
+    const updatedCount = ticketsProcessed + 1;
+
+    if (supabaseAdmin) {
+      try {
+        // Upsert into user_usage
+        await supabaseAdmin.from('user_usage').upsert(
+          {
+            user_email: email,
+            month_year: currentMonth,
+            tickets_processed: updatedCount,
+            monthly_limit: monthlyLimit,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_email,month_year' }
+        );
+
+        // Record in analysis_history table
+        await supabaseAdmin.from('analysis_history').insert({
+          user_email: email,
+          ticket_key: key,
+          ticket_title: ticket_title || key,
+          reasoning: analysisResult.reasoning,
+          frontend_files: analysisResult.frontend_files,
+          backend_files: analysisResult.backend_files,
+          database_files: analysisResult.database_files,
+          config_files: analysisResult.config_files,
+          test_files: analysisResult.test_files,
+          apis: analysisResult.apis || [],
+          confidence_score: analysisResult.confidence_score,
+          total_files: analysisResult.total_files,
+          processing_time_ms: processingTimeMs,
+        });
+      } catch (persistErr) {
+        console.warn('[Supabase Quota Update Warning]:', persistErr);
+      }
+    }
+
+    const memUser = SERVER_STORE.users.find((u) => u.email.toLowerCase() === email);
+    if (memUser) {
+      memUser.ticketsUsedThisMonth = updatedCount;
+    }
+
+    analysisResult.usage = {
+      ticketsProcessed: updatedCount,
+      monthlyLimit,
+      remainingTickets: monthlyLimit === -1 ? -1 : Math.max(0, monthlyLimit - updatedCount),
+    };
+  }
+
+  return res.json(analysisResult);
+}
+
+// Support both /api/analyze-ticket and /api/analyze
+app.post('/api/analyze-ticket', handleTicketAnalysis);
+app.post('/api/analyze', handleTicketAnalysis);
 
 // Health check endpoint
 app.get('/api/health', (_req, res) => {
