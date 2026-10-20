@@ -149,6 +149,14 @@ create policy "Allow users to insert own analyses"
   on public.analysis_history for insert
   with check (auth.jwt() ->> 'email' = user_email);
 
+drop policy if exists "Users can delete own analyses" on public.analysis_history;
+create policy "Users can delete own analyses"
+  on public.analysis_history for delete
+  using (auth.jwt() ->> 'email' = user_email);
+
+-- Explicitly grant DELETE permission to authenticated users
+grant delete on public.analysis_history to authenticated;
+
 -- Feedback RLS
 drop policy if exists "Allow users to insert feedback" on public.feedback;
 create policy "Allow users to insert feedback"

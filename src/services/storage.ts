@@ -266,6 +266,18 @@ export const storageService = {
     return updated;
   },
 
+  deleteAnalysis(id: number | string): AnalysisRecord[] {
+    const list = this.getAnalyses();
+    const updated = list.filter((a) => String(a.id) !== String(id));
+    localStorage.setItem(STORAGE_KEYS.ANALYSES, JSON.stringify(updated));
+    return updated;
+  },
+
+  clearAnalyses(): AnalysisRecord[] {
+    localStorage.removeItem(STORAGE_KEYS.ANALYSES);
+    return [];
+  },
+
   getFeedback(): FeedbackRecord[] {
     try {
       const stored = localStorage.getItem(STORAGE_KEYS.FEEDBACK);

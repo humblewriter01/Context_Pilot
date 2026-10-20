@@ -11,26 +11,41 @@ import {
   Clock,
   Sparkles,
   ExternalLink,
-  Layers
+  Layers,
+  Trash2,
+  AlertTriangle,
+  X
 } from 'lucide-react';
 import { JiraAnalyzerPopover } from './JiraAnalyzerPopover';
+import { storageService } from '../services/storage';
+import { supabase } from '../services/supabase';
 
 interface HistoryFeedbackViewProps {
   analyses: AnalysisRecord[];
   feedback: FeedbackRecord[];
   onVerifyOnGitHub: (files: string[]) => void;
   onRefreshData: () => void;
+  onAnalysesUpdated?: (updated: AnalysisRecord[]) => void;
 }
 
 export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
   analyses,
   feedback,
   onVerifyOnGitHub,
-  onRefreshData
+  onRefreshData,
+  onAnalysesUpdated
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedRecord, setSelectedRecord] = useState<AnalysisRecord | null>(null);
   const [activeTab, setActiveTab] = useState<'analyses' | 'feedback'>('analyses');
+
+  // Confirmation Modal State
+  const [deleteTarget, setDeleteTarget] = useState<
+    | { type: 'single'; record: AnalysisRecord }
+    | { type: 'all' }
+    | null
+  >(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   const filteredAnalyses = analyses.filter(
     (a) =>
@@ -38,6 +53,88 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
       a.ticketTitle.toLowerCase().includes(searchTerm.toLowerCase()) ||
       a.reasoning.toLowerCase().includes(searchTerm.toLowerCase())
   );
+
+  // Helper to obtain auth headers for backend DELETE endpoints
+  const getAuthHeaders = async (): Promise<Record<string, string>> => {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+    };
+
+    const user = storageService.getUser();
+    if (user?.email) {
+      headers['x-user-email'] = user.email;
+    }
+
+    if (supabase) {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session?.access_token) {
+          headers['Authorization'] = `Bearer ${session.access_token}`;
+        }
+      } catch (e) {
+        console.warn('Could not read session token', e);
+      }
+    }
+
+    return headers;
+  };
+
+  // Execute deletion after user confirms in the modal
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget) return;
+    setIsDeleting(true);
+
+    try {
+      const headers = await getAuthHeaders();
+
+      if (deleteTarget.type === 'single') {
+        const targetId = deleteTarget.record.id;
+
+        // 1. Optimistic UI update
+        const updated = storageService.deleteAnalysis(targetId);
+        if (onAnalysesUpdated) {
+          onAnalysesUpdated(updated);
+        }
+
+        // If the deleted record was currently open in details popover, close it
+        if (selectedRecord && selectedRecord.id === targetId) {
+          setSelectedRecord(null);
+        }
+
+        // 2. Dispatch DELETE request to backend
+        try {
+          await fetch(`/api/history/${encodeURIComponent(targetId)}`, {
+            method: 'DELETE',
+            headers
+          });
+        } catch (apiErr) {
+          console.warn('Backend delete notification error:', apiErr);
+        }
+      } else if (deleteTarget.type === 'all') {
+        // 1. Optimistic UI update
+        const updated = storageService.clearAnalyses();
+        if (onAnalysesUpdated) {
+          onAnalysesUpdated(updated);
+        }
+        setSelectedRecord(null);
+
+        // 2. Dispatch DELETE request to backend
+        try {
+          await fetch('/api/history', {
+            method: 'DELETE',
+            headers
+          });
+        } catch (apiErr) {
+          console.warn('Backend clear history error:', apiErr);
+        }
+      }
+
+      onRefreshData();
+    } finally {
+      setIsDeleting(false);
+      setDeleteTarget(null);
+    }
+  };
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
@@ -77,83 +174,109 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
 
       {activeTab === 'analyses' ? (
         <div className="space-y-4">
-          {/* Search bar */}
-          <div className="relative max-w-md">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              placeholder="Search by ticket key or keyword..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full pl-9 pr-4 py-2 border border-slate-300 rounded-lg text-xs sm:text-sm bg-white focus:outline-indigo-500"
-            />
+          {/* Controls Bar: Search & Clear All */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="relative max-w-md flex-1">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="Search by ticket key or keyword..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full pl-9 pr-4 py-2 border border-slate-300 rounded-lg text-xs sm:text-sm bg-white focus:outline-indigo-500"
+              />
+            </div>
+
+            {analyses.length > 0 && (
+              <button
+                onClick={() => setDeleteTarget({ type: 'all' })}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100/80 border border-rose-200 rounded-lg transition-colors self-start sm:self-auto"
+                title="Permanently clear all analysis history"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                <span>Clear All History</span>
+              </button>
+            )}
           </div>
 
           {/* Table */}
           <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase tracking-wider">
-                <tr>
-                  <th className="py-3 px-4">Ticket</th>
-                  <th className="py-3 px-4">Summary</th>
-                  <th className="py-3 px-4">Total Files</th>
-                  <th className="py-3 px-4">Confidence</th>
-                  <th className="py-3 px-4">Processing</th>
-                  <th className="py-3 px-4 text-right">Action</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {filteredAnalyses.length === 0 ? (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase tracking-wider">
                   <tr>
-                    <td colSpan={6} className="py-12 text-center text-slate-400">
-                      {analyses.length === 0
-                        ? 'No ticket analyses recorded yet. Run an analysis in the Jira simulator to build your audit log.'
-                        : 'No matching analysis records found.'}
-                    </td>
+                    <th className="py-3 px-4">Ticket</th>
+                    <th className="py-3 px-4">Summary</th>
+                    <th className="py-3 px-4">Total Files</th>
+                    <th className="py-3 px-4">Confidence</th>
+                    <th className="py-3 px-4">Processing</th>
+                    <th className="py-3 px-4 text-right">Actions</th>
                   </tr>
-                ) : (
-                  filteredAnalyses.map((item) => (
-                    <tr
-                      key={item.id}
-                      className="hover:bg-slate-50/80 transition-colors cursor-pointer"
-                      onClick={() => setSelectedRecord(item)}
-                    >
-                      <td className="py-3.5 px-4 font-bold text-indigo-700">
-                        <span className="bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded">
-                          {item.ticketKey}
-                        </span>
-                      </td>
-                      <td className="py-3.5 px-4 max-w-xs sm:max-w-md truncate font-medium text-slate-800">
-                        {item.ticketTitle || 'Ticket Analysis'}
-                      </td>
-                      <td className="py-3.5 px-4 font-semibold text-slate-700">
-                        {item.total_files} files
-                      </td>
-                      <td className="py-3.5 px-4">
-                        <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold text-[11px]">
-                          {Math.round((item.confidence_score || 0.85) * 100)}%
-                        </span>
-                      </td>
-                      <td className="py-3.5 px-4 text-slate-500 font-mono">
-                        {item.processingTimeMs}ms
-                      </td>
-                      <td className="py-3.5 px-4 text-right">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setSelectedRecord(item);
-                          }}
-                          className="px-2.5 py-1 text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 rounded font-medium text-xs inline-flex items-center gap-1"
-                        >
-                          View Details
-                          <ChevronRight className="w-3.5 h-3.5" />
-                        </button>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {filteredAnalyses.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-12 text-center text-slate-400">
+                        {analyses.length === 0
+                          ? 'No ticket analyses recorded yet. Run an analysis in the Jira simulator to build your audit log.'
+                          : 'No matching analysis records found.'}
                       </td>
                     </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+                  ) : (
+                    filteredAnalyses.map((item) => (
+                      <tr
+                        key={item.id}
+                        className="hover:bg-slate-50/80 transition-colors cursor-pointer group"
+                        onClick={() => setSelectedRecord(item)}
+                      >
+                        <td className="py-3.5 px-4 font-bold text-indigo-700 whitespace-nowrap">
+                          <span className="bg-indigo-50 border border-indigo-200 px-2.5 py-0.5 rounded-md whitespace-nowrap inline-block font-mono text-xs">
+                            {item.ticketKey}
+                          </span>
+                        </td>
+                        <td className="py-3.5 px-4 max-w-[180px] sm:max-w-xs md:max-w-md truncate font-medium text-slate-800" title={item.ticketTitle || 'Ticket Analysis'}>
+                          <span className="truncate block">
+                            {item.ticketTitle || 'Ticket Analysis'}
+                          </span>
+                        </td>
+                        <td className="py-3.5 px-4 font-semibold text-slate-700 whitespace-nowrap">
+                          {item.total_files} files
+                        </td>
+                        <td className="py-3.5 px-4 whitespace-nowrap">
+                          <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold text-[11px]">
+                            {Math.round((item.confidence_score || 0.85) * 100)}%
+                          </span>
+                        </td>
+                        <td className="py-3.5 px-4 text-slate-500 font-mono whitespace-nowrap">
+                          {item.processingTimeMs}ms
+                        </td>
+                        <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                          <div className="inline-flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                            <button
+                              onClick={() => setSelectedRecord(item)}
+                              className="px-2.5 py-1 text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 rounded font-medium text-xs inline-flex items-center gap-1 transition-colors"
+                            >
+                              Details
+                              <ChevronRight className="w-3.5 h-3.5" />
+                            </button>
+
+                            {/* Trash Delete Icon */}
+                            <button
+                              onClick={() => setDeleteTarget({ type: 'single', record: item })}
+                              className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
+                              title={`Delete ${item.ticketKey} record`}
+                              aria-label={`Delete ${item.ticketKey} record`}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       ) : (
@@ -168,7 +291,7 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
               <div key={item.id} className="p-5 flex flex-col sm:flex-row sm:items-start justify-between gap-4">
                 <div className="space-y-2">
                   <div className="flex items-center gap-2">
-                    <span className="font-bold text-xs bg-slate-100 text-slate-700 px-2 py-0.5 rounded border border-slate-200">
+                    <span className="font-bold text-xs bg-slate-100 text-slate-700 px-2.5 py-0.5 rounded-md border border-slate-200 whitespace-nowrap inline-block font-mono">
                       {item.ticketKey}
                     </span>
                     <div className="flex items-center gap-1">
@@ -227,6 +350,72 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
                 onRefreshData();
               }}
             />
+          </div>
+        </div>
+      )}
+
+      {/* Deletion Confirmation Modal */}
+      {deleteTarget && (
+        <div className="fixed inset-0 bg-slate-950/60 backdrop-blur-xs z-50 flex items-center justify-center p-4 animate-in fade-in">
+          <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl border border-slate-200 overflow-hidden">
+            <div className="p-6 space-y-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-rose-100 flex items-center justify-center text-rose-600 shrink-0">
+                  <AlertTriangle className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">
+                    {deleteTarget.type === 'single' ? 'Delete Analysis Record' : 'Clear All History'}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    {deleteTarget.type === 'single'
+                      ? deleteTarget.record.ticketKey
+                      : `${analyses.length} total records`}
+                  </p>
+                </div>
+              </div>
+
+              <p className="text-xs text-slate-600 leading-relaxed">
+                {deleteTarget.type === 'single' ? (
+                  <>
+                    Are you sure you want to delete the analysis record for{' '}
+                    <strong className="text-slate-800 font-semibold">{deleteTarget.record.ticketKey}</strong> (
+                    {deleteTarget.record.ticketTitle || 'Ticket Analysis'})? This action cannot be undone.
+                  </>
+                ) : (
+                  <>
+                    Are you sure you want to delete all <strong className="text-slate-800 font-semibold">{analyses.length}</strong> analysis
+                    records from your history? This action cannot be undone.
+                  </>
+                )}
+              </p>
+
+              <div className="pt-2 flex items-center justify-end gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => setDeleteTarget(null)}
+                  disabled={isDeleting}
+                  className="px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 rounded-lg transition-colors border border-slate-200"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmDelete}
+                  disabled={isDeleting}
+                  className="px-4 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 rounded-lg shadow-sm transition-colors flex items-center gap-1.5"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>
+                    {isDeleting
+                      ? 'Deleting...'
+                      : deleteTarget.type === 'single'
+                      ? 'Delete Record'
+                      : 'Clear All History'}
+                  </span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

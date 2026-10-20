@@ -772,13 +772,26 @@ app.put('/api/admin/users/:id/status', requireAdmin, (req, res) => {
   res.json({ success: true, user });
 });
 
-app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
   const userId = parseInt(req.params.id as string, 10);
   const idx = SERVER_STORE.users.findIndex((u) => u.id === userId);
-  if (idx < 0) return res.status(404).json({ error: 'User not found' });
+  const targetUser = idx >= 0 ? SERVER_STORE.users[idx] : null;
 
-  SERVER_STORE.users.splice(idx, 1);
-  res.json({ success: true, message: 'User deleted successfully' });
+  if (idx >= 0) {
+    SERVER_STORE.users.splice(idx, 1);
+  }
+
+  if (supabaseAdmin && targetUser?.email) {
+    try {
+      await supabaseAdmin.from('analysis_history').delete().eq('user_email', targetUser.email);
+      await supabaseAdmin.from('user_usage').delete().eq('user_email', targetUser.email);
+      await supabaseAdmin.from('users').delete().eq('email', targetUser.email);
+    } catch (e) {
+      console.warn('Admin user cascade delete warning:', e);
+    }
+  }
+
+  res.json({ success: true, message: 'User and associated records deleted successfully' });
 });
 
 // Admin Promo Codes Management
@@ -1395,6 +1408,148 @@ Be realistic, precise, and practical for production codebases.`;
 // Support both /api/analyze-ticket and /api/analyze
 app.post('/api/analyze-ticket', handleTicketAnalysis);
 app.post('/api/analyze', handleTicketAnalysis);
+
+// ==========================================
+// User Authentication Middleware for History Operations
+// ==========================================
+async function authenticateUser(req: express.Request, res: express.Response, next: express.NextFunction) {
+  try {
+    const authHeader = req.headers.authorization;
+    const emailHeader = (req.headers['x-user-email'] as string)?.trim()?.toLowerCase();
+    let userEmail = '';
+
+    // 1. Verify via Supabase JWT if present
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split('Bearer ')[1]?.trim();
+      if (supabaseAdmin && token && token !== 'undefined' && token !== 'null') {
+        const { data, error } = await supabaseAdmin.auth.getUser(token);
+        if (!error && data?.user?.email) {
+          userEmail = data.user.email.toLowerCase().trim();
+        }
+      }
+    }
+
+    // 2. Fallback to client user email header if session token was not exchanged
+    if (!userEmail && emailHeader) {
+      userEmail = emailHeader;
+    }
+
+    if (!userEmail) {
+      return res.status(401).json({ error: 'Authentication required. Please sign in to manage history.' });
+    }
+
+    (req as any).userEmail = userEmail;
+    next();
+  } catch (err: any) {
+    return res.status(401).json({ error: 'Authentication failed: ' + (err?.message || 'Invalid token') });
+  }
+}
+
+// ==========================================
+// Audit History Deletion Endpoints
+// ==========================================
+
+// DELETE /api/history/:id - Delete a single analysis record belonging to the authenticated user
+app.delete('/api/history/:id', authenticateUser, async (req: express.Request, res: express.Response) => {
+  try {
+    const userEmail = (req as any).userEmail;
+    const recordId = req.params.id as string;
+
+    if (!recordId) {
+      return res.status(400).json({ error: 'Missing record ID parameter.' });
+    }
+
+    if (supabaseAdmin) {
+      // First verify record belongs to this user
+      const { data: existing, error: fetchErr } = await supabaseAdmin
+        .from('analysis_history')
+        .select('id, user_email')
+        .eq('id', recordId)
+        .maybeSingle();
+
+      if (fetchErr) {
+        console.warn('[History Delete Warning]:', fetchErr);
+      }
+
+      if (existing) {
+        if (existing.user_email && existing.user_email.toLowerCase() !== userEmail.toLowerCase()) {
+          return res.status(403).json({ error: 'Forbidden: You can only delete your own analysis records.' });
+        }
+
+        const { error: deleteErr } = await supabaseAdmin
+          .from('analysis_history')
+          .delete()
+          .eq('id', recordId)
+          .eq('user_email', userEmail);
+
+        if (deleteErr) {
+          return res.status(500).json({ error: deleteErr.message || 'Failed to delete record from Supabase.' });
+        }
+      } else {
+        // Fallback delete if recordId was passed as ticketKey or numeric ID
+        await supabaseAdmin
+          .from('analysis_history')
+          .delete()
+          .eq('user_email', userEmail)
+          .or(`id.eq.${recordId},ticket_key.eq.${recordId}`);
+      }
+    }
+
+    return res.json({ success: true, message: 'Analysis record deleted successfully.' });
+  } catch (err: any) {
+    console.error('Delete history error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to delete record' });
+  }
+});
+
+// DELETE /api/history - Clear all analysis history for the authenticated user
+app.delete('/api/history', authenticateUser, async (req: express.Request, res: express.Response) => {
+  try {
+    const userEmail = (req as any).userEmail;
+
+    if (supabaseAdmin) {
+      const { error: deleteErr } = await supabaseAdmin
+        .from('analysis_history')
+        .delete()
+        .eq('user_email', userEmail);
+
+      if (deleteErr) {
+        return res.status(500).json({ error: deleteErr.message || 'Failed to clear records from Supabase.' });
+      }
+    }
+
+    return res.json({ success: true, message: 'All analysis history cleared successfully.' });
+  } catch (err: any) {
+    console.error('Clear history error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to clear analysis history' });
+  }
+});
+
+// Admin: Delete any analysis record by ID
+app.delete('/api/admin/history/:id', requireAdmin, async (req: express.Request, res: express.Response) => {
+  try {
+    const recordId = req.params.id as string;
+    if (supabaseAdmin) {
+      await supabaseAdmin.from('analysis_history').delete().eq('id', recordId);
+    }
+    return res.json({ success: true, message: 'Analysis record deleted by administrator.' });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Failed to delete record' });
+  }
+});
+
+// Admin: Delete all analysis records for a specific user email
+app.delete('/api/admin/history/user/:email', requireAdmin, async (req: express.Request, res: express.Response) => {
+  try {
+    const targetEmail = (req.params.email as string)?.toLowerCase()?.trim();
+    if (supabaseAdmin && targetEmail) {
+      await supabaseAdmin.from('analysis_history').delete().eq('user_email', targetEmail);
+    }
+    return res.json({ success: true, message: `All analysis records for ${targetEmail} deleted by administrator.` });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Failed to delete user records' });
+  }
+});
 
 // Health check endpoint
 app.get('/api/health', (_req, res) => {

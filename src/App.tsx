@@ -207,6 +207,7 @@ export const App: React.FC = () => {
               feedback={feedback}
               onVerifyOnGitHub={handleNavigateToGitHub}
               onRefreshData={refreshAllData}
+              onAnalysesUpdated={setAnalyses}
             />
           )}
 

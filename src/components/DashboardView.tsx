@@ -250,7 +250,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 >
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">
-                      <span className="font-bold text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded font-mono">
+                      <span className="font-bold text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded font-mono whitespace-nowrap inline-block shrink-0">
                         {record.ticketKey}
                       </span>
                       <h4 className="font-semibold text-sm text-slate-900 truncate max-w-md">

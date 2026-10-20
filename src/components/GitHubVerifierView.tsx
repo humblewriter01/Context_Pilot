@@ -439,7 +439,9 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 value={filesInput}
                 onChange={(e) => setFilesInput(e.target.value)}
                 placeholder="Enter repository relative file paths (one per line)...&#10;src/components/MyComponent.tsx&#10;api/routes.ts"
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-mono focus:outline-indigo-500 text-slate-800 leading-relaxed"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-mono focus:outline-indigo-500 text-slate-800 leading-relaxed whitespace-nowrap overflow-x-auto"
+                wrap="off"
+                spellCheck={false}
               />
             </div>
 
@@ -575,23 +577,30 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                     {result.missingFiles.map((missing) => (
                       <div
                         key={missing.path}
-                        className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2"
+                        className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2.5 overflow-hidden"
                       >
-                        <div className="flex items-center justify-between">
-                          <code className="font-mono text-rose-700 font-semibold">{missing.path}</code>
-                          <span className="text-[11px] text-slate-400">{missing.reason}</span>
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 sm:gap-3">
+                          <div className="min-w-0 flex-1">
+                            <code className="font-mono text-rose-700 font-semibold line-through break-all text-xs">
+                              {missing.path}
+                            </code>
+                          </div>
+                          <span className="self-start sm:self-auto shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-rose-100/80 text-rose-700 border border-rose-200/60 whitespace-nowrap">
+                            {missing.reason}
+                          </span>
                         </div>
 
                         {missing.suggestions && missing.suggestions.length > 0 && (
-                          <div className="pt-1.5 border-t border-slate-200/80 flex items-start gap-2">
-                            <span className="text-indigo-600 font-medium shrink-0 flex items-center gap-1">
+                          <div className="pt-2 border-t border-slate-200/80 flex flex-col sm:flex-row sm:items-start gap-1.5 sm:gap-2">
+                            <span className="text-indigo-600 font-medium shrink-0 flex items-center gap-1 text-[11px]">
                               <Sparkles className="w-3 h-3" /> Potential paths:
                             </span>
-                            <div className="flex flex-wrap gap-1">
+                            <div className="flex flex-wrap gap-1.5 min-w-0">
                               {missing.suggestions.map((sug) => (
                                 <code
                                   key={sug}
-                                  className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-mono text-[11px] border border-indigo-200/60"
+                                  title={sug}
+                                  className="inline-block max-w-full sm:max-w-xs md:max-w-md truncate px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 font-mono text-[11px] border border-indigo-200/60 hover:bg-indigo-100/60 transition-colors cursor-default"
                                 >
                                   {sug}
                                 </code>
