@@ -14,7 +14,9 @@ import {
   FolderGit2,
   RefreshCw,
   Sparkles,
-  Inbox
+  Inbox,
+  Copy,
+  Check
 } from 'lucide-react';
 
 interface GitHubVerifierViewProps {
@@ -57,6 +59,19 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
   const [successNotice, setSuccessNotice] = useState<string | null>(null);
   const [result, setResult] = useState<GitHubVerificationResult | null>(null);
   const [structure, setStructure] = useState<any>(null);
+
+  // Search filter and copy states for verified files
+  const [verifiedSearchTerm, setVerifiedSearchTerm] = useState('');
+  const [copiedFilePath, setCopiedFilePath] = useState<string | null>(null);
+
+  const handleCopyPath = (path: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    navigator.clipboard.writeText(path);
+    setCopiedFilePath(path);
+    setTimeout(() => {
+      setCopiedFilePath((curr) => (curr === path ? null : curr));
+    }, 2000);
+  };
 
   useEffect(() => {
     const handleOAuthMessage = (event: MessageEvent) => {
@@ -515,45 +530,117 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
 
               {/* Verified Files */}
               <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-2xs space-y-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                    Verified Files in Repo ({result.verifiedFiles.length})
-                  </h3>
-                  <span className="text-xs text-emerald-600 font-medium">Direct match</span>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                    <h3 className="text-sm font-bold text-slate-900">
+                      Verified Files in Repo ({result.verifiedFiles.length})
+                    </h3>
+                    {verifiedSearchTerm && (
+                      <span className="text-[11px] text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full font-medium">
+                        {result.verifiedFiles.filter((f) => f.path.toLowerCase().includes(verifiedSearchTerm.trim().toLowerCase())).length} matches
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Search Bar for filtering verified files by name or directory pattern */}
+                  {result.verifiedFiles.length > 0 && (
+                    <div className="relative w-full sm:w-72">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        type="text"
+                        placeholder="Filter by name or pattern (e.g. .tsx, auth/)..."
+                        value={verifiedSearchTerm}
+                        onChange={(e) => setVerifiedSearchTerm(e.target.value)}
+                        className="w-full pl-8 pr-7 py-1.5 border border-slate-300 rounded-lg text-xs bg-slate-50/50 focus:bg-white focus:outline-indigo-500 font-mono text-slate-800 placeholder:font-sans placeholder:text-slate-400 transition-colors"
+                      />
+                      {verifiedSearchTerm && (
+                        <button
+                          type="button"
+                          onClick={() => setVerifiedSearchTerm('')}
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 rounded"
+                          title="Clear search"
+                        >
+                          <XCircle className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {result.verifiedFiles.length === 0 ? (
                   <p className="text-xs text-slate-400 py-4 text-center">No exact file matches found in this branch.</p>
+                ) : result.verifiedFiles.filter((f) => !verifiedSearchTerm.trim() || f.path.toLowerCase().includes(verifiedSearchTerm.trim().toLowerCase())).length === 0 ? (
+                  <div className="py-6 text-center text-slate-400 text-xs space-y-1">
+                    <p>No verified files match "<span className="font-mono text-slate-700">{verifiedSearchTerm}</span>".</p>
+                    <button
+                      type="button"
+                      onClick={() => setVerifiedSearchTerm('')}
+                      className="text-indigo-600 hover:text-indigo-800 font-medium underline"
+                    >
+                      Clear filter
+                    </button>
+                  </div>
                 ) : (
                   <div className="space-y-2">
-                    {result.verifiedFiles.map((file) => (
-                      <div
-                        key={file.path}
-                        className="flex items-center justify-between gap-3 p-2.5 bg-emerald-50/50 border border-emerald-200/60 rounded-lg text-xs"
-                      >
-                        <div className="flex items-center gap-2 overflow-hidden">
-                          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                          <code className="font-mono text-slate-800 truncate">{file.path}</code>
+                    {result.verifiedFiles
+                      .filter((f) => !verifiedSearchTerm.trim() || f.path.toLowerCase().includes(verifiedSearchTerm.trim().toLowerCase()))
+                      .map((file) => (
+                        <div
+                          key={file.path}
+                          className="flex items-center justify-between gap-3 p-2.5 bg-emerald-50/50 hover:bg-emerald-50/90 border border-emerald-200/60 rounded-lg text-xs transition-colors group"
+                        >
+                          <div className="flex items-center gap-2 overflow-hidden min-w-0 flex-1">
+                            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                            <code
+                              className="font-mono text-slate-800 truncate block text-xs"
+                              title={file.path}
+                            >
+                              {file.path}
+                            </code>
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            {file.size && (
+                              <span className="text-slate-400 text-[11px] hidden sm:inline-block">
+                                {(file.size / 1024).toFixed(1)} KB
+                              </span>
+                            )}
+
+                            {/* Copy Path Button */}
+                            <button
+                              type="button"
+                              onClick={(e) => handleCopyPath(file.path, e)}
+                              className="px-2 py-1 text-slate-600 hover:text-indigo-700 bg-white hover:bg-indigo-50 border border-slate-200 hover:border-indigo-200 rounded-md text-[11px] font-medium flex items-center gap-1 transition-all shadow-2xs"
+                              title={`Copy path ${file.path}`}
+                              aria-label={`Copy path ${file.path}`}
+                            >
+                              {copiedFilePath === file.path ? (
+                                <>
+                                  <Check className="w-3 h-3 text-emerald-600" />
+                                  <span className="text-emerald-700 font-semibold">Copied!</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3 h-3 text-slate-400 group-hover:text-indigo-600" />
+                                  <span>Copy Path</span>
+                                </>
+                              )}
+                            </button>
+
+                            <a
+                              href={file.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-indigo-600 hover:text-indigo-800 flex items-center gap-1 font-medium px-1.5 py-1 hover:bg-indigo-50/60 rounded transition-colors"
+                              title="Open in GitHub"
+                            >
+                              <span className="hidden sm:inline">View</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-3 shrink-0">
-                          {file.size && (
-                            <span className="text-slate-400 text-[11px]">
-                              {(file.size / 1024).toFixed(1)} KB
-                            </span>
-                          )}
-                          <a
-                            href={file.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-indigo-600 hover:text-indigo-800 flex items-center gap-1 font-medium"
-                          >
-                            <span>View on GitHub</span>
-                            <ExternalLink className="w-3 h-3" />
-                          </a>
-                        </div>
-                      </div>
-                    ))}
+                      ))}
                   </div>
                 )}
               </div>
@@ -580,10 +667,34 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                         className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2.5 overflow-hidden"
                       >
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 sm:gap-3">
-                          <div className="min-w-0 flex-1">
-                            <code className="font-mono text-rose-700 font-semibold line-through break-all text-xs">
+                          <div className="min-w-0 flex-1 overflow-hidden flex items-center gap-2">
+                            <code
+                              className="font-mono text-rose-700 font-semibold line-through truncate block text-xs flex-1"
+                              title={missing.path}
+                            >
                               {missing.path}
                             </code>
+
+                            {/* Copy Missing Path Button */}
+                            <button
+                              type="button"
+                              onClick={(e) => handleCopyPath(missing.path, e)}
+                              className="px-2 py-0.5 text-slate-600 hover:text-rose-700 bg-white hover:bg-rose-50 border border-slate-200 hover:border-rose-200 rounded text-[10px] font-medium flex items-center gap-1 transition-all shadow-2xs shrink-0"
+                              title={`Copy path ${missing.path}`}
+                              aria-label={`Copy path ${missing.path}`}
+                            >
+                              {copiedFilePath === missing.path ? (
+                                <>
+                                  <Check className="w-2.5 h-2.5 text-emerald-600" />
+                                  <span className="text-emerald-700 font-semibold">Copied!</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-2.5 h-2.5 text-slate-400" />
+                                  <span>Copy</span>
+                                </>
+                              )}
+                            </button>
                           </div>
                           <span className="self-start sm:self-auto shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-rose-100/80 text-rose-700 border border-rose-200/60 whitespace-nowrap">
                             {missing.reason}
@@ -597,13 +708,20 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                             </span>
                             <div className="flex flex-wrap gap-1.5 min-w-0">
                               {missing.suggestions.map((sug) => (
-                                <code
+                                <button
                                   key={sug}
-                                  title={sug}
-                                  className="inline-block max-w-full sm:max-w-xs md:max-w-md truncate px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 font-mono text-[11px] border border-indigo-200/60 hover:bg-indigo-100/60 transition-colors cursor-default"
+                                  type="button"
+                                  onClick={(e) => handleCopyPath(sug, e)}
+                                  title={`Click to copy: ${sug}`}
+                                  className="inline-flex items-center gap-1 max-w-[220px] sm:max-w-xs md:max-w-md truncate px-2 py-0.5 rounded-md bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-mono text-[11px] border border-indigo-200/60 transition-colors text-left"
                                 >
-                                  {sug}
-                                </code>
+                                  {copiedFilePath === sug ? (
+                                    <Check className="w-2.5 h-2.5 text-emerald-600 shrink-0" />
+                                  ) : (
+                                    <Copy className="w-2.5 h-2.5 text-indigo-400 shrink-0" />
+                                  )}
+                                  <span className="truncate">{sug}</span>
+                                </button>
                               ))}
                             </div>
                           </div>

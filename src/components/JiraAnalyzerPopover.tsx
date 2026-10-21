@@ -128,6 +128,18 @@ export const JiraAnalyzerPopover: React.FC<JiraAnalyzerPopoverProps> = ({
 
       {/* Popover Content */}
       <div className="p-5 max-h-[70vh] overflow-y-auto space-y-4 bg-white">
+        {/* Full Ticket Summary */}
+        {(data as any).ticketTitle && (
+          <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 text-xs sm:text-sm text-slate-800 space-y-1">
+            <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">
+              Full Ticket Summary:
+            </span>
+            <p className="font-semibold text-slate-900 leading-relaxed break-words">
+              {(data as any).ticketTitle}
+            </p>
+          </div>
+        )}
+
         {/* Total files summary */}
         <div className="flex items-center justify-between p-3 rounded-lg bg-slate-50 border border-slate-200/80">
           <div className="flex items-center gap-2 text-sm text-slate-700">
@@ -193,7 +205,7 @@ export const JiraAnalyzerPopover: React.FC<JiraAnalyzerPopoverProps> = ({
                       key={file}
                       className="file-item flex items-center justify-between gap-3 p-2.5 bg-slate-50/80 hover:bg-slate-100/80 border border-slate-200/80 rounded-lg group transition-all"
                     >
-                      <div className="flex items-center gap-2 overflow-hidden">
+                      <div className="flex items-center gap-2 overflow-hidden min-w-0 flex-1">
                         <svg width="14" height="14" viewBox="0 0 16 16" fill="none" className="shrink-0">
                           <path
                             d="M9 1H3C2.4 1 2 1.4 2 2V14C2 14.6 2.4 15 3 15H13C13.6 15 14 14.6 14 14V6L9 1Z"
@@ -202,13 +214,19 @@ export const JiraAnalyzerPopover: React.FC<JiraAnalyzerPopoverProps> = ({
                           />
                           <path d="M9 1V6H14" stroke={cat.color} strokeWidth="1.6" />
                         </svg>
-                        <code className="text-xs text-slate-800 font-mono truncate">{file}</code>
+                        <code
+                          className="text-xs text-slate-800 font-mono truncate block flex-1"
+                          title={file}
+                        >
+                          {file}
+                        </code>
                       </div>
 
                       <button
                         onClick={() => handleCopy(file)}
-                        className="opacity-0 group-hover:opacity-100 transition-opacity p-1 text-slate-400 hover:text-slate-700 rounded hover:bg-slate-200/60"
-                        title="Copy file path"
+                        className="opacity-70 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity p-1 text-slate-400 hover:text-slate-700 rounded hover:bg-slate-200/60 shrink-0"
+                        title={`Copy: ${file}`}
+                        aria-label={`Copy ${file}`}
                       >
                         {copiedFile === file ? (
                           <Check className="w-3.5 h-3.5 text-emerald-600" />

@@ -234,8 +234,8 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
                             {item.ticketKey}
                           </span>
                         </td>
-                        <td className="py-3.5 px-4 max-w-[180px] sm:max-w-xs md:max-w-md truncate font-medium text-slate-800" title={item.ticketTitle || 'Ticket Analysis'}>
-                          <span className="truncate block">
+                        <td className="py-3.5 px-4 min-w-[180px] max-w-xs sm:max-w-sm md:max-w-md font-medium text-slate-800" title={item.ticketTitle || 'Ticket Analysis'}>
+                          <span className="line-clamp-2 leading-relaxed">
                             {item.ticketTitle || 'Ticket Analysis'}
                           </span>
                         </td>
