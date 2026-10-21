@@ -1,7 +1,12 @@
 import React, { useState } from 'react';
-import { UserProfile } from '../types';
+import { UserProfile, SubscriptionTier } from '../types';
 import { storageService } from '../services/storage';
-import { resetPasswordForEmail } from '../services/supabase';
+import {
+  signInWithEmailPassword,
+  signUpWithEmailPassword,
+  resetPasswordForEmail,
+  signInWithGitHub
+} from '../services/supabase';
 import {
   X,
   Mail,
@@ -11,10 +16,8 @@ import {
   AlertCircle,
   Eye,
   EyeOff,
-  GitBranch,
   ArrowLeft,
-  RefreshCw,
-  Key
+  RefreshCw
 } from 'lucide-react';
 
 interface AuthModalProps {
@@ -24,7 +27,7 @@ interface AuthModalProps {
 }
 
 export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuccess }) => {
-  const [mode, setMode] = useState<'signin' | 'signup' | 'forgot' | 'github'>('signin');
+  const [mode, setMode] = useState<'signin' | 'signup' | 'forgot'>('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
@@ -32,28 +35,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
-
-  // GitHub Auth Inputs
-  const [gitHubUsername, setGitHubUsername] = useState('');
-  const [gitHubToken, setGitHubToken] = useState('');
-
-  // Listen for GitHub OAuth popup message
-  React.useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      if (event.data?.type === 'GITHUB_OAUTH_SUCCESS') {
-        const { token, user: ghUser } = event.data;
-        const loggedUser = storageService.loginWithGitHub(
-          ghUser?.login || 'github_user',
-          ghUser?.name || ghUser?.login,
-          token
-        );
-        onAuthSuccess(loggedUser);
-        onClose();
-      }
-    };
-    window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
-  }, [onAuthSuccess, onClose]);
 
   if (!isOpen) return null;
 
@@ -84,68 +65,82 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
         if (!email.trim() || !email.includes('@')) throw new Error('Please enter a valid work email');
         if (!password || password.length < 6) throw new Error('Password must be at least 6 characters');
 
-        await new Promise((r) => setTimeout(r, 600));
-        const newUser = storageService.signupUser(email, displayName);
-        onAuthSuccess(newUser);
+        const data = await signUpWithEmailPassword(email.trim(), password, displayName.trim());
+        if (!data?.user) {
+          throw new Error('Registration failed: no user returned by Supabase');
+        }
+
+        if (!data.session) {
+          setSuccessMessage(`Account created for ${email.trim()}! Please check your email to verify your address before signing in.`);
+          setMode('signin');
+          return;
+        }
+
+        const u = data.user;
+        const profile: UserProfile = {
+          id: Date.now(),
+          firebaseUid: u.id,
+          email: u.email || email.trim().toLowerCase(),
+          displayName: displayName.trim() || u.user_metadata?.display_name || email.split('@')[0],
+          photoUrl: u.user_metadata?.avatar_url || '',
+          subscriptionTier: 'free',
+          createdAt: u.created_at || new Date().toISOString(),
+          lastLoginAt: new Date().toISOString(),
+          status: 'active',
+        };
+
+        storageService.saveUser(profile);
+        onAuthSuccess(profile);
         onClose();
         return;
       }
 
-      if (mode === 'github') {
-        if (!gitHubUsername.trim()) throw new Error('Please enter your GitHub username or email');
-        await new Promise((r) => setTimeout(r, 600));
-        const ghUser = storageService.loginWithGitHub(gitHubUsername, displayName, gitHubToken);
-        onAuthSuccess(ghUser);
-        onClose();
-        return;
-      }
-
-      // Default: Sign In mode
+      // Default: Sign In mode via Supabase
       if (!email.trim()) throw new Error('Please enter your work email');
       if (!password) throw new Error('Please enter your password');
 
-      await new Promise((r) => setTimeout(r, 500));
-      const user = storageService.loginUser(email, displayName || email.split('@')[0]);
-      onAuthSuccess(user);
+      const data = await signInWithEmailPassword(email.trim(), password);
+      if (!data?.user) {
+        throw new Error('Invalid login credentials');
+      }
+
+      const u = data.user;
+      const profile: UserProfile = {
+        id: Date.now(),
+        firebaseUid: u.id,
+        email: u.email || email.trim().toLowerCase(),
+        displayName:
+          u.user_metadata?.display_name ||
+          u.user_metadata?.full_name ||
+          displayName.trim() ||
+          email.split('@')[0],
+        photoUrl: u.user_metadata?.avatar_url || '',
+        subscriptionTier: (u.user_metadata?.subscription_tier as SubscriptionTier) || 'free',
+        createdAt: u.created_at || new Date().toISOString(),
+        lastLoginAt: new Date().toISOString(),
+        status: 'active',
+      };
+
+      storageService.saveUser(profile);
+      onAuthSuccess(profile);
       onClose();
     } catch (err: any) {
-      setError(err?.message || 'Authentication error. Please check your credentials.');
+      console.error('[Supabase Auth Modal Error]', err);
+      setError(err?.message || 'Invalid login credentials. Please check your credentials.');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleQuickGitHub = async () => {
+  const handleGitHubAuth = async () => {
     setError(null);
     setSuccessMessage(null);
     setLoading(true);
 
     try {
-      const res = await fetch(`/api/auth/github/url?origin=${encodeURIComponent(window.location.origin)}`);
-      const data = await res.json();
-
-      if (data.isConfigured && data.url) {
-        const popup = window.open(
-          data.url,
-          'github_oauth_auth_popup',
-          'width=600,height=720,menubar=no,toolbar=no'
-        );
-
-        if (!popup) {
-          setMode('github');
-          setLoading(false);
-          return;
-        }
-
-        // Listener is registered in useEffect
-        return;
-      }
-
-      // If OAuth App is not configured, fall back to GitHub username form
-      setMode('github');
-    } catch {
-      setMode('github');
-    } finally {
+      await signInWithGitHub(window.location.origin);
+    } catch (err: any) {
+      setError(err?.message || 'Failed to authenticate with GitHub.');
       setLoading(false);
     }
   };
@@ -156,7 +151,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
         {/* Close Button */}
         <button
           onClick={onClose}
-          className="absolute right-4 top-4 text-slate-400 hover:text-slate-700 p-1 rounded-lg transition-colors"
+          className="absolute right-4 top-4 text-slate-400 hover:text-slate-700 p-1 rounded-lg transition-colors cursor-pointer"
           title="Close"
         >
           <X className="w-5 h-5" />
@@ -173,30 +168,28 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
           <h2 className="text-xl font-bold text-slate-900 tracking-tight">
             {mode === 'signin' && 'Sign In to Context Pilot'}
             {mode === 'signup' && 'Create Your Account'}
-            {mode === 'forgot' && 'Reset Password'}
-            {mode === 'github' && 'Continue with GitHub'}
+            {mode === 'forgot' && 'Reset Password via Supabase'}
           </h2>
           <p className="text-xs text-slate-500 max-w-xs mx-auto">
             {mode === 'signin' && 'Access AI code impact predictions, audit history, and Jira tools'}
             {mode === 'signup' && 'Start predicting codebase changes and impact with engineering precision'}
-            {mode === 'forgot' && 'Enter your email address to receive password reset instructions'}
-            {mode === 'github' && 'Link your GitHub account to verify file paths and repository impact'}
+            {mode === 'forgot' && 'Enter your registered email address to receive password reset instructions'}
           </p>
         </div>
 
         {/* Content Body */}
         <div className="p-6 space-y-4">
           {error && (
-            <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-xs flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
-              <span>{error}</span>
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-xs flex items-start gap-2 animate-in fade-in duration-200">
+              <AlertCircle className="w-4 h-4 shrink-0 text-rose-600 mt-0.5" />
+              <span className="leading-relaxed">{error}</span>
             </div>
           )}
 
           {successMessage && (
-            <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-xs flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
-              <span>{successMessage}</span>
+            <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-xs flex items-start gap-2 animate-in fade-in duration-200">
+              <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600 mt-0.5" />
+              <span className="leading-relaxed">{successMessage}</span>
             </div>
           )}
 
@@ -205,9 +198,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
             <div className="space-y-3">
               <button
                 type="button"
-                onClick={handleQuickGitHub}
+                onClick={handleGitHubAuth}
                 disabled={loading}
-                className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-semibold flex items-center justify-center gap-2.5 transition-colors shadow-2xs disabled:opacity-50"
+                className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-semibold flex items-center justify-center gap-2.5 transition-colors shadow-2xs disabled:opacity-50 cursor-pointer"
               >
                 <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24">
                   <path
@@ -248,46 +241,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
               </div>
             )}
 
-            {mode === 'github' && (
-              <>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    GitHub Username or Email
-                  </label>
-                  <div className="relative">
-                    <User className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      required
-                      placeholder="e.g. humblewriter01"
-                      value={gitHubUsername}
-                      onChange={(e) => setGitHubUsername(e.target.value)}
-                      className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-xl text-xs text-slate-800 bg-white focus:outline-indigo-500"
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    GitHub Personal Access Token (Optional)
-                  </label>
-                  <div className="relative">
-                    <Key className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="password"
-                      placeholder="Enter personal access token"
-                      value={gitHubToken}
-                      onChange={(e) => setGitHubToken(e.target.value)}
-                      className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-xl text-xs text-slate-800 font-mono bg-white focus:outline-indigo-500"
-                    />
-                  </div>
-                  <p className="text-[10px] text-slate-400 mt-1">
-                    Allows repository file checking and avoids public GitHub rate limits.
-                  </p>
-                </div>
-              </>
-            )}
-
             {(mode === 'signin' || mode === 'signup' || mode === 'forgot') && (
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">Work Email</label>
@@ -317,7 +270,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
                         setSuccessMessage(null);
                         setMode('forgot');
                       }}
-                      className="text-[11px] text-indigo-600 hover:text-indigo-800 font-semibold"
+                      className="text-[11px] text-indigo-600 hover:text-indigo-800 font-semibold cursor-pointer"
                     >
                       Forgot password?
                     </button>
@@ -336,7 +289,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
                   <button
                     type="button"
                     onClick={() => setShowPassword(!showPassword)}
-                    className="p-1 text-slate-400 hover:text-slate-600 absolute right-2.5 top-1/2 -translate-y-1/2"
+                    className="p-1 text-slate-400 hover:text-slate-600 absolute right-2.5 top-1/2 -translate-y-1/2 cursor-pointer"
                   >
                     {showPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
                   </button>
@@ -347,19 +300,18 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
             <button
               type="submit"
               disabled={loading}
-              className="w-full py-2.5 bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 text-white font-bold rounded-xl text-xs transition-opacity shadow-md flex items-center justify-center gap-2 disabled:opacity-50"
+              className="w-full py-2.5 bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 text-white font-bold rounded-xl text-xs transition-opacity shadow-md flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
             >
               {loading ? (
                 <>
                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  <span>Processing...</span>
+                  <span>Processing with Supabase...</span>
                 </>
               ) : (
                 <span>
                   {mode === 'signin' && 'Sign In'}
-                  {mode === 'signup' && 'Create Free Account'}
+                  {mode === 'signup' && 'Create Account'}
                   {mode === 'forgot' && 'Send Reset Link'}
-                  {mode === 'github' && 'Authorize GitHub Account'}
                 </span>
               )}
             </button>
@@ -377,7 +329,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
                     setSuccessMessage(null);
                     setMode('signup');
                   }}
-                  className="text-indigo-600 font-bold hover:underline"
+                  className="text-indigo-600 font-bold hover:underline cursor-pointer"
                 >
                   Sign up
                 </button>
@@ -394,14 +346,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
                     setSuccessMessage(null);
                     setMode('signin');
                   }}
-                  className="text-indigo-600 font-bold hover:underline"
+                  className="text-indigo-600 font-bold hover:underline cursor-pointer"
                 >
                   Sign in
                 </button>
               </p>
             )}
 
-            {(mode === 'forgot' || mode === 'github') && (
+            {mode === 'forgot' && (
               <button
                 type="button"
                 onClick={() => {
@@ -409,7 +361,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
                   setSuccessMessage(null);
                   setMode('signin');
                 }}
-                className="text-indigo-600 font-semibold hover:underline flex items-center gap-1.5 mx-auto"
+                className="text-indigo-600 font-semibold hover:underline flex items-center gap-1.5 mx-auto cursor-pointer"
               >
                 <ArrowLeft className="w-3.5 h-3.5" />
                 <span>Back to Sign In</span>

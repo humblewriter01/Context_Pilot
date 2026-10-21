@@ -1570,6 +1570,17 @@ app.get('/api/supabase/status', (_req, res) => {
   });
 });
 
+// Supabase public client config endpoint (exposes public URL and ANON KEY for browser client)
+app.get('/api/supabase/config', (_req, res) => {
+  const url = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
+  const anonKey = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
+  res.json({
+    url,
+    anonKey,
+    configured: Boolean(url && anonKey),
+  });
+});
+
 // Supabase password reset endpoint
 app.post('/api/auth/reset-password', async (req, res) => {
   const { email, redirectTo } = req.body;
@@ -1591,8 +1602,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
     }
   }
 
-  // Graceful simulation when running without active Supabase server credentials
-  return res.json({ success: true, message: 'Password reset link dispatched' });
+  return res.status(503).json({
+    error: 'Supabase server is not configured. Please ensure SUPABASE_URL and SUPABASE_ANON_KEY are set in environment variables.',
+  });
 });
 
 const isProd = process.env.NODE_ENV === 'production';

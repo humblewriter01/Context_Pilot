@@ -1,7 +1,12 @@
 import React, { useState } from 'react';
-import { UserProfile } from '../types';
+import { UserProfile, SubscriptionTier } from '../types';
 import { storageService } from '../services/storage';
-import { resetPasswordForEmail } from '../services/supabase';
+import {
+  signInWithEmailPassword,
+  signUpWithEmailPassword,
+  resetPasswordForEmail,
+  signInWithGitHub
+} from '../services/supabase';
 import {
   Mail,
   Lock,
@@ -13,10 +18,10 @@ import {
   Sparkles,
   Eye,
   EyeOff,
-  CheckCircle2,
-  Key,
   Layers,
-  ExternalLink
+  AlertCircle,
+  CheckCircle2,
+  RefreshCw
 } from 'lucide-react';
 
 interface SignInGateProps {
@@ -24,7 +29,7 @@ interface SignInGateProps {
 }
 
 export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
-  const [tab, setTab] = useState<'signin' | 'signup' | 'github' | 'forgot'>('signin');
+  const [tab, setTab] = useState<'signin' | 'signup' | 'forgot'>('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
@@ -32,27 +37,6 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
-
-  // GitHub Quick Sign-in fields
-  const [gitHubUsername, setGitHubUsername] = useState('');
-  const [gitHubToken, setGitHubToken] = useState('');
-
-  // Handle GitHub OAuth popup message if opened
-  React.useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      if (event.data?.type === 'GITHUB_OAUTH_SUCCESS') {
-        const { token, user: ghUser } = event.data;
-        const logged = storageService.loginWithGitHub(
-          ghUser?.login || 'developer',
-          ghUser?.name || ghUser?.login,
-          token
-        );
-        onAuthSuccess(logged);
-      }
-    };
-    window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
-  }, [onAuthSuccess]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -62,13 +46,15 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
 
     try {
       if (tab === 'forgot') {
-        if (!email.trim() || !email.includes('@')) throw new Error('Please enter a valid email address');
+        if (!email.trim() || !email.includes('@')) {
+          throw new Error('Please enter a valid email address');
+        }
         const dynamicRedirect = `${window.location.origin}/#reset-password`;
         const { error: resetErr } = await resetPasswordForEmail(email.trim(), dynamicRedirect);
         if (resetErr) {
-          throw new Error(resetErr.message || 'Failed to dispatch reset link via Supabase');
+          throw new Error(resetErr.message || 'Failed to dispatch password recovery link.');
         }
-        setInfoMessage(`Password reset link sent to ${email.trim()} via Supabase! Please check your inbox.`);
+        setInfoMessage(`Password reset link dispatched to ${email.trim()} via Supabase. Please check your inbox.`);
         return;
       }
 
@@ -77,30 +63,83 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
         if (!email.trim() || !email.includes('@')) throw new Error('Please enter a valid email address');
         if (!password || password.length < 6) throw new Error('Password must be at least 6 characters');
 
-        await new Promise((r) => setTimeout(r, 400));
-        const newUser = storageService.signupUser(email, displayName);
-        onAuthSuccess(newUser);
+        const data = await signUpWithEmailPassword(email.trim(), password, displayName.trim());
+        if (!data?.user) {
+          throw new Error('Sign up failed: no user record returned by Supabase.');
+        }
+
+        // If email confirmation is required by Supabase configuration
+        if (!data.session) {
+          setInfoMessage(
+            `Registration successful! A confirmation email has been sent to ${email.trim()}. Please verify your email before signing in.`
+          );
+          setTab('signin');
+          return;
+        }
+
+        const u = data.user;
+        const profile: UserProfile = {
+          id: Date.now(),
+          firebaseUid: u.id,
+          email: u.email || email.trim().toLowerCase(),
+          displayName: displayName.trim() || u.user_metadata?.display_name || email.split('@')[0],
+          photoUrl: u.user_metadata?.avatar_url || '',
+          subscriptionTier: 'free',
+          createdAt: u.created_at || new Date().toISOString(),
+          lastLoginAt: new Date().toISOString(),
+          status: 'active',
+        };
+
+        storageService.saveUser(profile);
+        onAuthSuccess(profile);
         return;
       }
 
-      if (tab === 'github') {
-        if (!gitHubUsername.trim()) throw new Error('Please enter your GitHub username or email');
-        await new Promise((r) => setTimeout(r, 400));
-        const ghUser = storageService.loginWithGitHub(gitHubUsername, displayName, gitHubToken);
-        onAuthSuccess(ghUser);
-        return;
-      }
-
-      // Default: Sign In
+      // Default: Sign In via Supabase auth.signInWithPassword
       if (!email.trim() || !email.includes('@')) throw new Error('Please enter your email address');
       if (!password) throw new Error('Please enter your password');
 
-      await new Promise((r) => setTimeout(r, 350));
-      const authed = storageService.loginUser(email, displayName || email.split('@')[0]);
-      onAuthSuccess(authed);
+      const data = await signInWithEmailPassword(email.trim(), password);
+      if (!data?.user) {
+        throw new Error('Invalid login credentials');
+      }
+
+      const u = data.user;
+      const profile: UserProfile = {
+        id: Date.now(),
+        firebaseUid: u.id,
+        email: u.email || email.trim().toLowerCase(),
+        displayName:
+          u.user_metadata?.display_name ||
+          u.user_metadata?.full_name ||
+          displayName.trim() ||
+          email.split('@')[0],
+        photoUrl: u.user_metadata?.avatar_url || '',
+        subscriptionTier: (u.user_metadata?.subscription_tier as SubscriptionTier) || 'free',
+        createdAt: u.created_at || new Date().toISOString(),
+        lastLoginAt: new Date().toISOString(),
+        status: 'active',
+      };
+
+      storageService.saveUser(profile);
+      onAuthSuccess(profile);
     } catch (err: any) {
-      setError(err?.message || 'Authentication failed. Please verify your details.');
+      console.error('[Supabase Auth Error]', err);
+      // Surface Supabase error directly in red to block unauthorized access
+      setError(err?.message || 'Invalid login credentials. Please check your email and password.');
     } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleGitHubAuth = async () => {
+    setError(null);
+    setInfoMessage(null);
+    setLoading(true);
+    try {
+      await signInWithGitHub(`${window.location.origin}`);
+    } catch (err: any) {
+      setError(err?.message || 'Failed to authenticate via GitHub Supabase OAuth.');
       setLoading(false);
     }
   };
@@ -134,7 +173,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
           <div className="lg:col-span-6 space-y-6 text-center lg:text-left">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
               <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-              <span>Sign in required to access workspace</span>
+              <span>Supabase Authentication Required</span>
             </div>
 
             <h1 className="text-3xl sm:text-4xl lg:text-5xl font-extrabold tracking-tight text-white leading-tight">
@@ -225,21 +264,6 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                   >
                     Create Account
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setTab('github');
-                      setError(null);
-                      setInfoMessage(null);
-                    }}
-                    className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${
-                      tab === 'github'
-                        ? 'bg-indigo-600 text-white shadow-sm'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    GitHub
-                  </button>
                 </div>
               ) : (
                 <div className="flex items-center justify-between pb-2 border-b border-slate-800">
@@ -260,13 +284,44 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
 
               {/* Error & Info Alerts */}
               {error && (
-                <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-xs text-rose-300">
-                  {error}
+                <div className="p-3 bg-rose-500/15 border border-rose-500/40 rounded-xl text-xs text-rose-300 flex items-start gap-2.5 animate-in fade-in duration-200">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-rose-400 mt-0.5" />
+                  <span className="leading-relaxed">{error}</span>
                 </div>
               )}
               {infoMessage && (
-                <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-xs text-emerald-300">
-                  {infoMessage}
+                <div className="p-3 bg-emerald-500/15 border border-emerald-500/40 rounded-xl text-xs text-emerald-300 flex items-start gap-2.5 animate-in fade-in duration-200">
+                  <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400 mt-0.5" />
+                  <span className="leading-relaxed">{infoMessage}</span>
+                </div>
+              )}
+
+              {/* GitHub OAuth Button */}
+              {tab !== 'forgot' && (
+                <div>
+                  <button
+                    type="button"
+                    onClick={handleGitHubAuth}
+                    disabled={loading}
+                    className="w-full py-2.5 px-4 bg-slate-950 hover:bg-slate-800 border border-slate-700 hover:border-slate-600 text-white rounded-xl text-xs font-semibold flex items-center justify-center gap-2.5 transition-all shadow-sm disabled:opacity-50 cursor-pointer"
+                  >
+                    <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24">
+                      <path
+                        fillRule="evenodd"
+                        clipRule="evenodd"
+                        d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"
+                      />
+                    </svg>
+                    <span>Continue with GitHub</span>
+                  </button>
+
+                  <div className="flex items-center my-3.5">
+                    <div className="flex-1 border-t border-slate-800" />
+                    <span className="px-3 text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
+                      Or continue with email
+                    </span>
+                    <div className="flex-1 border-t border-slate-800" />
+                  </div>
                 </div>
               )}
 
@@ -378,53 +433,16 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                   </>
                 )}
 
-                {tab === 'github' && (
-                  <div className="space-y-3">
-                    <div>
-                      <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                        GitHub Username / Handle
-                      </label>
-                      <div className="relative">
-                        <GitBranch className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
-                        <input
-                          type="text"
-                          required
-                          value={gitHubUsername}
-                          onChange={(e) => setGitHubUsername(e.target.value)}
-                          placeholder="e.g. humblewriter01"
-                          className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-indigo-500 focus:border-indigo-500"
-                        />
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                        Personal Access Token (Optional)
-                      </label>
-                      <div className="relative">
-                        <Key className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
-                        <input
-                          type="password"
-                          value={gitHubToken}
-                          onChange={(e) => setGitHubToken(e.target.value)}
-                          placeholder="Personal access token for private repos"
-                          className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-indigo-500 focus:border-indigo-500 font-mono"
-                        />
-                      </div>
-                      <p className="text-[10px] text-slate-500 mt-1">
-                        Optional: Enables verifying private repos and 5,000 req/hr rate limits.
-                      </p>
-                    </div>
-                  </div>
-                )}
-
                 <button
                   type="submit"
                   disabled={loading}
                   className="w-full py-3 px-4 bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 text-white font-bold rounded-xl text-xs transition-all shadow-md shadow-indigo-600/30 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
                 >
                   {loading ? (
-                    <span>Processing...</span>
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>Authenticating with Supabase...</span>
+                    </>
                   ) : (
                     <>
                       <span>
@@ -432,9 +450,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                           ? 'Sign In to Workspace'
                           : tab === 'signup'
                           ? 'Create Account & Enter'
-                          : tab === 'forgot'
-                          ? 'Send Reset Link via Supabase'
-                          : 'Connect with GitHub'}
+                          : 'Send Reset Link via Supabase'}
                       </span>
                       <ArrowRight className="w-4 h-4" />
                     </>

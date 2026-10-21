@@ -12,10 +12,12 @@ import { AuthModal } from './components/AuthModal';
 import { AccountModal } from './components/AccountModal';
 import { SignInGate } from './components/SignInGate';
 import { storageService } from './services/storage';
+import { getSession, signOut, getOrInitSupabase } from './services/supabase';
 import { UserProfile, UsageStats, AnalysisRecord, FeedbackRecord, SubscriptionTier } from './types';
 
 export const App: React.FC = () => {
-  const [user, setUser] = useState<UserProfile | null>(() => storageService.getUser());
+  const [isCheckingSession, setIsCheckingSession] = useState<boolean>(true);
+  const [user, setUser] = useState<UserProfile | null>(null);
   const [usage, setUsage] = useState<UsageStats>(() => storageService.getUsage());
   const [analyses, setAnalyses] = useState<AnalysisRecord[]>(() => storageService.getAnalyses());
   const [feedback, setFeedback] = useState<FeedbackRecord[]>(() => storageService.getFeedback());
@@ -52,6 +54,107 @@ export const App: React.FC = () => {
   };
 
   const [isAdminRoute, setIsAdminRoute] = useState(checkIsAdmin);
+
+  // Verify real Supabase session on app load
+  useEffect(() => {
+    let isMounted = true;
+
+    async function verifyInitialSession() {
+      try {
+        const session = await getSession();
+        if (!session || !session.user) {
+          // No active Supabase session: purge any unverified local storage state
+          if (isMounted) {
+            storageService.logoutUser();
+            setUser(null);
+          }
+        } else {
+          // Legitimate Supabase session verified
+          const u = session.user;
+          const cached = storageService.getUser();
+          const verifiedUser: UserProfile = {
+            id: cached?.id || Date.now(),
+            firebaseUid: u.id,
+            email: u.email || cached?.email || '',
+            displayName:
+              u.user_metadata?.display_name ||
+              u.user_metadata?.full_name ||
+              cached?.displayName ||
+              (u.email ? u.email.split('@')[0] : 'Developer'),
+            photoUrl: u.user_metadata?.avatar_url || cached?.photoUrl || '',
+            subscriptionTier:
+              (u.user_metadata?.subscription_tier as SubscriptionTier) ||
+              cached?.subscriptionTier ||
+              'free',
+            createdAt: u.created_at || cached?.createdAt || new Date().toISOString(),
+            lastLoginAt: new Date().toISOString(),
+            status: 'active',
+          };
+
+          if (isMounted) {
+            storageService.saveUser(verifiedUser);
+            setUser(verifiedUser);
+          }
+        }
+      } catch (err) {
+        console.warn('Initial session verification error:', err);
+        if (isMounted) {
+          storageService.logoutUser();
+          setUser(null);
+        }
+      } finally {
+        if (isMounted) {
+          setIsCheckingSession(false);
+        }
+      }
+    }
+
+    verifyInitialSession();
+
+    // Listen to real-time auth changes from Supabase
+    let authUnsubscribe: (() => void) | null = null;
+    getOrInitSupabase().then((client) => {
+      if (!client || !isMounted) return;
+      const { data } = client.auth.onAuthStateChange((event, session) => {
+        if (!isMounted) return;
+        if (event === 'SIGNED_OUT' || !session) {
+          storageService.logoutUser();
+          setUser(null);
+        } else if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+          const u = session.user;
+          const cached = storageService.getUser();
+          const verifiedUser: UserProfile = {
+            id: cached?.id || Date.now(),
+            firebaseUid: u.id,
+            email: u.email || cached?.email || '',
+            displayName:
+              u.user_metadata?.display_name ||
+              u.user_metadata?.full_name ||
+              cached?.displayName ||
+              (u.email ? u.email.split('@')[0] : 'Developer'),
+            photoUrl: u.user_metadata?.avatar_url || cached?.photoUrl || '',
+            subscriptionTier:
+              (u.user_metadata?.subscription_tier as SubscriptionTier) ||
+              cached?.subscriptionTier ||
+              'free',
+            createdAt: u.created_at || cached?.createdAt || new Date().toISOString(),
+            lastLoginAt: new Date().toISOString(),
+            status: 'active',
+          };
+          storageService.saveUser(verifiedUser);
+          setUser(verifiedUser);
+        }
+      });
+      authUnsubscribe = () => data.subscription.unsubscribe();
+    });
+
+    return () => {
+      isMounted = false;
+      if (authUnsubscribe) {
+        authUnsubscribe();
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const handleLocationChange = () => {
@@ -91,7 +194,12 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      await signOut();
+    } catch (e) {
+      console.warn('Supabase sign out error:', e);
+    }
     storageService.logoutUser();
     setUser(null);
     setUsage(storageService.getUsage());
@@ -127,7 +235,25 @@ export const App: React.FC = () => {
     return <AdminPortal onBackToApp={navigateToApp} />;
   }
 
-  // Strict Authentication Gate: User must sign in before accessing any application features
+  // Session verification loading screen on app load
+  if (isCheckingSession) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center text-white">
+        <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-[#667eea] to-[#764ba2] flex items-center justify-center text-white font-black text-lg shadow-lg shadow-indigo-500/30 mb-4 animate-pulse">
+          CP
+        </div>
+        <div className="flex items-center gap-2.5 text-xs text-slate-300 font-medium">
+          <svg className="animate-spin h-4 w-4 text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+          </svg>
+          <span>Verifying session with Supabase...</span>
+        </div>
+      </div>
+    );
+  }
+
+  // Strict Authentication Gate: User must sign in via Supabase before accessing any workspace features
   if (!user) {
     return (
       <SignInGate
@@ -252,7 +378,7 @@ export const App: React.FC = () => {
         </footer>
       </div>
 
-      {/* Auth Modal (Sign In, Sign Up, Forgot Password, GitHub) */}
+      {/* Auth Modal (Sign In, Sign Up, Forgot Password) */}
       <AuthModal
         isOpen={isAuthModalOpen}
         onClose={() => setIsAuthModalOpen(false)}
