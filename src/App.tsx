@@ -13,6 +13,7 @@ import { AccountModal } from './components/AccountModal';
 import { SignInGate } from './components/SignInGate';
 import { storageService } from './services/storage';
 import { getSession, signOut, getOrInitSupabase } from './services/supabase';
+import { formatDisplayName } from './components/UserAvatar';
 import { UserProfile, UsageStats, AnalysisRecord, FeedbackRecord, SubscriptionTier } from './types';
 
 export const App: React.FC = () => {
@@ -76,11 +77,12 @@ export const App: React.FC = () => {
             id: cached?.id || Date.now(),
             firebaseUid: u.id,
             email: u.email || cached?.email || '',
-            displayName:
+            displayName: formatDisplayName(
               u.user_metadata?.display_name ||
               u.user_metadata?.full_name ||
-              cached?.displayName ||
-              (u.email ? u.email.split('@')[0] : 'Developer'),
+              cached?.displayName,
+              u.email
+            ),
             photoUrl: u.user_metadata?.avatar_url || cached?.photoUrl || '',
             subscriptionTier:
               (u.user_metadata?.subscription_tier as SubscriptionTier) ||
@@ -127,11 +129,12 @@ export const App: React.FC = () => {
             id: cached?.id || Date.now(),
             firebaseUid: u.id,
             email: u.email || cached?.email || '',
-            displayName:
+            displayName: formatDisplayName(
               u.user_metadata?.display_name ||
               u.user_metadata?.full_name ||
-              cached?.displayName ||
-              (u.email ? u.email.split('@')[0] : 'Developer'),
+              cached?.displayName,
+              u.email
+            ),
             photoUrl: u.user_metadata?.avatar_url || cached?.photoUrl || '',
             subscriptionTier:
               (u.user_metadata?.subscription_tier as SubscriptionTier) ||
@@ -351,6 +354,7 @@ export const App: React.FC = () => {
               usage={usage}
               onTierChanged={handleTierChange}
               onOpenAuthModal={() => setIsAuthModalOpen(true)}
+              onBackToApp={() => setActiveTab('jira')}
             />
           )}
         </main>

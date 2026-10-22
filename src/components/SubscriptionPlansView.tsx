@@ -15,7 +15,8 @@ import {
   Shield,
   HelpCircle,
   Clock,
-  Sparkles
+  Sparkles,
+  ArrowLeft
 } from 'lucide-react';
 
 interface SubscriptionPlansViewProps {
@@ -23,6 +24,7 @@ interface SubscriptionPlansViewProps {
   usage: UsageStats;
   onTierChanged: (tier: SubscriptionTier) => void;
   onOpenAuthModal: () => void;
+  onBackToApp?: () => void;
 }
 
 export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
@@ -30,6 +32,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
   usage,
   onTierChanged,
   onOpenAuthModal,
+  onBackToApp,
 }) => {
   const plans = Object.values(SUBSCRIPTION_PLANS);
   const [paystackConfig, setPaystackConfig] = useState<any>(null);
@@ -256,6 +259,23 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+      {/* Back to App Navigation */}
+      {onBackToApp && (
+        <div className="flex items-center justify-between pb-4 border-b border-slate-200">
+          <button
+            type="button"
+            onClick={onBackToApp}
+            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-white border border-slate-200 text-slate-700 hover:text-slate-900 hover:bg-slate-50 text-xs font-semibold shadow-xs transition-colors cursor-pointer"
+          >
+            <ArrowLeft className="w-4 h-4 text-slate-500" />
+            <span>Back to Ticket Analyzer</span>
+          </button>
+          <span className="text-xs text-slate-400 font-medium hidden sm:inline">
+            Context Pilot Subscription & Upgrades
+          </span>
+        </div>
+      )}
+
       {/* Title & Billing Toggle Header */}
       <div className="text-center max-w-3xl mx-auto space-y-4">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-bold">

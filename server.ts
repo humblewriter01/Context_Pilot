@@ -1603,7 +1603,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 
   return res.status(503).json({
-    error: 'Supabase server is not configured. Please ensure SUPABASE_URL and SUPABASE_ANON_KEY are set in environment variables.',
+    error: 'Authentication service is currently unavailable. Please ensure SUPABASE_URL is set in environment variables.',
   });
 });
 

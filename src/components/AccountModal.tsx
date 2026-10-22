@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { UserProfile, UsageStats } from '../types';
 import { storageService } from '../services/storage';
+import { UserAvatar, formatDisplayName } from './UserAvatar';
 import {
   X,
   User,
@@ -12,10 +13,7 @@ import {
   CheckCircle2,
   AlertTriangle,
   Save,
-  Key,
-  Calendar,
-  Layers,
-  ArrowRight
+  ArrowLeft
 } from 'lucide-react';
 
 interface AccountModalProps {
@@ -38,8 +36,26 @@ export const AccountModal: React.FC<AccountModalProps> = ({
   onNavigateToPlans,
 }) => {
   const [activeTab, setActiveTab] = useState<'profile' | 'integrations' | 'danger'>('profile');
-  const [displayName, setDisplayName] = useState(user.displayName);
+  const cleanDisplayName = formatDisplayName(user.displayName, user.email);
+  const [displayName, setDisplayName] = useState(cleanDisplayName);
   const [saveSuccess, setSaveSuccess] = useState(false);
+
+  // Sync display name state if user prop changes
+  useEffect(() => {
+    setDisplayName(formatDisplayName(user.displayName, user.email));
+  }, [user.displayName, user.email]);
+
+  // Handle ESC key press to close modal
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, onClose]);
 
   // GitHub token settings
   const savedGh = storageService.getGitHubSettings();
@@ -89,26 +105,41 @@ export const AccountModal: React.FC<AccountModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-150">
-      <div className="w-full max-w-xl bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[90vh]">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-150 cursor-pointer"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="account-modal-title"
+    >
+      <div
+        className="w-full max-w-xl bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[90vh] cursor-default"
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* Modal Header */}
-        <div className="p-6 pb-4 border-b border-slate-200 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <img
-              src={user.photoUrl}
-              alt={user.displayName}
-              className="w-11 h-11 rounded-full border border-slate-300 object-cover shadow-xs"
+        <div className="p-5 sm:p-6 pb-4 border-b border-slate-200 flex items-center justify-between bg-white">
+          <div className="flex items-center gap-3 min-w-0">
+            <UserAvatar
+              photoUrl={user.photoUrl}
+              displayName={cleanDisplayName}
+              email={user.email}
+              size="lg"
             />
-            <div>
-              <h2 className="text-lg font-bold text-slate-900">{user.displayName}</h2>
-              <p className="text-xs text-slate-500">{user.email}</p>
+            <div className="min-w-0">
+              <h2 id="account-modal-title" className="text-lg font-bold text-slate-900 truncate">
+                {cleanDisplayName}
+              </h2>
+              <p className="text-xs text-slate-500 truncate">{user.email}</p>
             </div>
           </div>
 
+          {/* Prominent Close "X" Button */}
           <button
+            type="button"
             onClick={onClose}
-            className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg transition-colors"
-            title="Close"
+            className="p-2 -mr-1 text-slate-400 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition-all cursor-pointer border border-transparent hover:border-slate-200 shrink-0"
+            title="Close (Esc)"
+            aria-label="Close profile modal"
           >
             <X className="w-5 h-5" />
           </button>
@@ -117,8 +148,9 @@ export const AccountModal: React.FC<AccountModalProps> = ({
         {/* Tab Navigation */}
         <div className="flex border-b border-slate-200 px-6 bg-slate-50/70 text-xs font-semibold text-slate-600 gap-6">
           <button
+            type="button"
             onClick={() => setActiveTab('profile')}
-            className={`py-3 border-b-2 transition-all flex items-center gap-1.5 ${
+            className={`py-3 border-b-2 transition-all flex items-center gap-1.5 cursor-pointer ${
               activeTab === 'profile'
                 ? 'border-indigo-600 text-indigo-600 font-bold'
                 : 'border-transparent hover:text-slate-900'
@@ -129,8 +161,9 @@ export const AccountModal: React.FC<AccountModalProps> = ({
           </button>
 
           <button
+            type="button"
             onClick={() => setActiveTab('integrations')}
-            className={`py-3 border-b-2 transition-all flex items-center gap-1.5 ${
+            className={`py-3 border-b-2 transition-all flex items-center gap-1.5 cursor-pointer ${
               activeTab === 'integrations'
                 ? 'border-indigo-600 text-indigo-600 font-bold'
                 : 'border-transparent hover:text-slate-900'
@@ -141,8 +174,9 @@ export const AccountModal: React.FC<AccountModalProps> = ({
           </button>
 
           <button
+            type="button"
             onClick={() => setActiveTab('danger')}
-            className={`py-3 border-b-2 transition-all flex items-center gap-1.5 ${
+            className={`py-3 border-b-2 transition-all flex items-center gap-1.5 cursor-pointer ${
               activeTab === 'danger'
                 ? 'border-rose-600 text-rose-600 font-bold'
                 : 'border-transparent hover:text-rose-600 text-slate-500'
@@ -177,11 +211,12 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                 </div>
 
                 <button
+                  type="button"
                   onClick={() => {
                     onClose();
                     onNavigateToPlans();
                   }}
-                  className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold text-xs transition-colors shrink-0 flex items-center gap-1.5 shadow-2xs"
+                  className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold text-xs transition-colors shrink-0 flex items-center gap-1.5 shadow-2xs cursor-pointer"
                 >
                   <CreditCard className="w-3.5 h-3.5" />
                   <span>Change Plan</span>
@@ -206,8 +241,12 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                     value={displayName}
                     onChange={(e) => setDisplayName(e.target.value)}
                     required
+                    placeholder="e.g. ameenujaafar432"
                     className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs sm:text-sm bg-white focus:outline-indigo-500"
                   />
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    Used across analysis exports and audit log records.
+                  </p>
                 </div>
 
                 <div>
@@ -221,14 +260,14 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                     className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs sm:text-sm bg-slate-50 text-slate-500 cursor-not-allowed font-mono"
                   />
                   <p className="text-[11px] text-slate-400 mt-1">
-                    Your email address is managed through your primary login provider.
+                    Your email address is managed through your primary Supabase login.
                   </p>
                 </div>
 
                 <div className="pt-2 flex justify-end">
                   <button
                     type="submit"
-                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded-xl text-xs transition-colors flex items-center gap-1.5 shadow-xs"
+                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded-xl text-xs transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
                   >
                     <Save className="w-3.5 h-3.5" />
                     <span>Save Changes</span>
@@ -324,7 +363,7 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                   <div className="flex justify-end pt-1">
                     <button
                       type="submit"
-                      className="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-xs font-semibold transition-colors"
+                      className="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-xs font-semibold transition-colors cursor-pointer"
                     >
                       Update GitHub Config
                     </button>
@@ -347,12 +386,13 @@ export const AccountModal: React.FC<AccountModalProps> = ({
 
                 <div className="pt-2">
                   <button
+                    type="button"
                     onClick={() => {
                       setDeleteError(null);
                       setDeleteConfirmationText('');
                       setConfirmDeleteModal(true);
                     }}
-                    className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs transition-colors flex items-center gap-1.5 shadow-xs"
+                    className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
                   >
                     <Trash2 className="w-4 h-4" />
                     <span>Delete Account...</span>
@@ -362,12 +402,33 @@ export const AccountModal: React.FC<AccountModalProps> = ({
             </div>
           )}
         </div>
+
+        {/* Modal Footer with explicit Close button */}
+        <div className="p-4 px-6 border-t border-slate-200 bg-slate-50 flex items-center justify-between">
+          <span className="text-[11px] text-slate-400">Press ESC or click outside to close</span>
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-1.5 bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 rounded-xl text-xs font-semibold shadow-2xs transition-colors cursor-pointer"
+          >
+            Close
+          </button>
+        </div>
       </div>
 
       {/* Confirmation Modal for Account Deletion */}
       {confirmDeleteModal && (
-        <div className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-black/70 animate-in fade-in">
-          <div className="w-full max-w-sm bg-white rounded-2xl shadow-2xl p-6 space-y-4 border border-rose-300">
+        <div
+          className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-black/70 animate-in fade-in cursor-pointer"
+          onClick={(e) => {
+            e.stopPropagation();
+            setConfirmDeleteModal(false);
+          }}
+        >
+          <div
+            className="w-full max-w-sm bg-white rounded-2xl shadow-2xl p-6 space-y-4 border border-rose-300 cursor-default"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="w-12 h-12 rounded-xl bg-rose-100 flex items-center justify-center text-rose-600 mx-auto">
               <AlertTriangle className="w-6 h-6" />
             </div>
@@ -402,14 +463,14 @@ export const AccountModal: React.FC<AccountModalProps> = ({
               <button
                 type="button"
                 onClick={() => setConfirmDeleteModal(false)}
-                className="flex-1 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold transition-colors"
+                className="flex-1 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold transition-colors cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 type="button"
                 onClick={handleConfirmAccountDeletion}
-                className="flex-1 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition-colors shadow-xs"
+                className="flex-1 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition-colors shadow-xs cursor-pointer"
               >
                 Confirm Delete
               </button>

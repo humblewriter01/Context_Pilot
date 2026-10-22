@@ -1,17 +1,11 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-// Reads from Vite client-side environment or window runtime config
-let clientUrl =
-  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_SUPABASE_URL) ||
-  (typeof process !== 'undefined' && process.env?.SUPABASE_URL) ||
-  (typeof window !== 'undefined' && (window as any).__SUPABASE_URL__) ||
-  '';
+// Reads directly from Vite client environment variables
+const envUrl = ((import.meta as any).env?.VITE_SUPABASE_URL as string) || '';
+const envAnonKey = ((import.meta as any).env?.VITE_SUPABASE_ANON_KEY as string) || '';
 
-let clientAnonKey =
-  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_SUPABASE_ANON_KEY) ||
-  (typeof process !== 'undefined' && process.env?.SUPABASE_ANON_KEY) ||
-  (typeof window !== 'undefined' && (window as any).__SUPABASE_ANON_KEY__) ||
-  '';
+let clientUrl = envUrl;
+let clientAnonKey = envAnonKey;
 
 export let isSupabaseConfigured = Boolean(clientUrl && clientAnonKey);
 
@@ -27,12 +21,28 @@ export let supabase: SupabaseClient | null = isSupabaseConfigured
 
 /**
  * Initializes or retrieves the official Supabase client.
- * If Vite environment variables were not baked in at build time,
- * it fetches the public credentials from /api/supabase/config on the server.
+ * If Vite environment variables were not baked into the client bundle at build time,
+ * checks /api/supabase/config to retrieve runtime environment variables provided by the server.
  */
 export async function getOrInitSupabase(): Promise<SupabaseClient | null> {
   if (supabase) return supabase;
 
+  // Check if client env vars are available
+  if (envUrl && envAnonKey) {
+    clientUrl = envUrl;
+    clientAnonKey = envAnonKey;
+    isSupabaseConfigured = true;
+    supabase = createClient(clientUrl, clientAnonKey, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+      },
+    });
+    return supabase;
+  }
+
+  // Fallback: check server environment variables exposed via /api/supabase/config
   try {
     const res = await fetch('/api/supabase/config');
     if (res.ok) {
@@ -52,20 +62,19 @@ export async function getOrInitSupabase(): Promise<SupabaseClient | null> {
       }
     }
   } catch (err) {
-    console.warn('[Supabase Config] Error fetching server credentials:', err);
+    console.warn('[Supabase Init] Notice checking server config:', err);
   }
 
-  return supabase;
+  return null;
 }
 
 /**
- * Enforces real authentication against Supabase via signInWithPassword.
- * Returns the session and user, or throws the exact error.
+ * Strictly authenticates user via Supabase Auth (signInWithPassword).
  */
 export async function signInWithEmailPassword(email: string, password: string) {
   const client = await getOrInitSupabase();
   if (!client) {
-    throw new Error('Supabase is not configured. Please ensure SUPABASE_URL and SUPABASE_ANON_KEY are set.');
+    throw new Error('Authentication is currently unavailable. Please check server configuration.');
   }
 
   const { data, error } = await client.auth.signInWithPassword({
@@ -81,13 +90,12 @@ export async function signInWithEmailPassword(email: string, password: string) {
 }
 
 /**
- * Enforces real user registration against Supabase via signUp.
- * Returns the user/session or throws error.
+ * Strictly registers a new user via Supabase Auth (signUp).
  */
 export async function signUpWithEmailPassword(email: string, password: string, displayName: string) {
   const client = await getOrInitSupabase();
   if (!client) {
-    throw new Error('Supabase is not configured. Please ensure SUPABASE_URL and SUPABASE_ANON_KEY are set.');
+    throw new Error('Authentication is currently unavailable. Please check server configuration.');
   }
 
   const { data, error } = await client.auth.signUp({
@@ -114,7 +122,7 @@ export async function signUpWithEmailPassword(email: string, password: string, d
 export async function signInWithGitHub(redirectTo?: string) {
   const client = await getOrInitSupabase();
   if (!client) {
-    throw new Error('Supabase is not configured. Please ensure SUPABASE_URL and SUPABASE_ANON_KEY are set.');
+    throw new Error('Authentication is currently unavailable. Please check server configuration.');
   }
 
   const dynamicRedirect = redirectTo || window.location.origin;
@@ -133,30 +141,21 @@ export async function signInWithGitHub(redirectTo?: string) {
 }
 
 /**
- * Sends a real password reset link via Supabase with dynamic redirectTo.
+ * Sends a password reset link strictly via Supabase.
  */
 export async function resetPasswordForEmail(email: string, redirectTo?: string) {
-  const dynamicRedirect = redirectTo || `${window.location.origin}/#reset-password`;
   const client = await getOrInitSupabase();
-
-  if (client) {
-    return await client.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
-      redirectTo: dynamicRedirect,
-    });
+  if (!client) {
+    return {
+      data: null,
+      error: new Error('Authentication is currently unavailable. Please check server configuration.'),
+    };
   }
 
-  // Fallback to server-side endpoint if running in backend mode
-  const res = await fetch('/api/auth/reset-password', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: email.trim().toLowerCase(), redirectTo: dynamicRedirect }),
+  const dynamicRedirect = redirectTo || `${window.location.origin}/#reset-password`;
+  return await client.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
+    redirectTo: dynamicRedirect,
   });
-
-  const data = await res.json();
-  if (!res.ok) {
-    return { data: null, error: new Error(data.error || 'Failed to send reset email') };
-  }
-  return { data, error: null };
 }
 
 /**
@@ -165,19 +164,28 @@ export async function resetPasswordForEmail(email: string, redirectTo?: string) 
 export async function signOut() {
   const client = await getOrInitSupabase();
   if (client) {
-    await client.auth.signOut();
+    try {
+      await client.auth.signOut();
+    } catch {
+      // ignore
+    }
   }
 }
 
 /**
- * Checks for an active, valid Supabase session on app load.
+ * Verifies active session strictly via Supabase (getSession).
  */
 export async function getSession() {
   const client = await getOrInitSupabase();
   if (!client) return null;
-  const { data, error } = await client.auth.getSession();
-  if (error || !data.session) return null;
-  return data.session;
+
+  try {
+    const { data, error } = await client.auth.getSession();
+    if (error || !data.session) return null;
+    return data.session;
+  } catch {
+    return null;
+  }
 }
 
 export interface SupabaseUserProfile {

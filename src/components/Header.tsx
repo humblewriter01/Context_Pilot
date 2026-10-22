@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { UserProfile, UsageStats, SubscriptionTier } from '../types';
+import { UserAvatar, formatDisplayName } from './UserAvatar';
 import {
   Menu,
   Zap,
@@ -34,6 +35,27 @@ export const Header: React.FC<HeaderProps> = ({
   isSidebarOpen,
 }) => {
   const [dropdownOpen, setDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Close dropdown on click outside or Esc
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, []);
 
   const tier = user?.subscriptionTier || 'free';
   const tierColor = {
@@ -41,6 +63,8 @@ export const Header: React.FC<HeaderProps> = ({
     pro: 'bg-indigo-50 text-indigo-700 border-indigo-200',
     enterprise: 'bg-purple-50 text-purple-700 border-purple-200',
   }[tier];
+
+  const cleanDisplayName = formatDisplayName(user?.displayName, user?.email);
 
   return (
     <header className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-xs">
@@ -99,21 +123,25 @@ export const Header: React.FC<HeaderProps> = ({
 
             {/* User Profile or Sign In Button */}
             {user ? (
-              <div className="relative">
+              <div className="relative" ref={dropdownRef}>
                 <button
+                  type="button"
                   onClick={() => setDropdownOpen(!dropdownOpen)}
-                  className="flex items-center gap-2 p-1 rounded-lg hover:bg-slate-50 transition-colors focus:outline-none"
+                  className="flex items-center gap-2 p-1.5 rounded-xl hover:bg-slate-100 transition-colors focus:outline-none cursor-pointer"
+                  aria-expanded={dropdownOpen}
+                  aria-haspopup="true"
                 >
-                  <img
-                    src={user.photoUrl}
-                    alt={user.displayName}
-                    className="w-8 h-8 rounded-full border border-slate-300 object-cover"
+                  <UserAvatar
+                    photoUrl={user.photoUrl}
+                    displayName={cleanDisplayName}
+                    email={user.email}
+                    size="sm"
                   />
                   <div className="hidden sm:block text-left text-xs">
-                    <div className="font-bold text-slate-800 leading-tight truncate max-w-[120px]">
-                      {user.displayName}
+                    <div className="font-bold text-slate-800 leading-tight truncate max-w-[130px]">
+                      {cleanDisplayName}
                     </div>
-                    <div className="text-slate-400 truncate max-w-[120px] text-[11px]">{user.email}</div>
+                    <div className="text-slate-400 truncate max-w-[130px] text-[11px]">{user.email}</div>
                   </div>
                   <ChevronDown className="w-3.5 h-3.5 text-slate-400 hidden sm:block" />
                 </button>
@@ -122,27 +150,29 @@ export const Header: React.FC<HeaderProps> = ({
                 {dropdownOpen && (
                   <div className="absolute right-0 mt-2 w-52 bg-white border border-slate-200 rounded-2xl shadow-xl py-1 z-30 animate-in fade-in">
                     <div className="px-3.5 py-2.5 border-b border-slate-100 text-xs">
-                      <div className="font-bold text-slate-900">{user.displayName}</div>
+                      <div className="font-bold text-slate-900 truncate">{cleanDisplayName}</div>
                       <div className="text-slate-400 truncate text-[11px]">{user.email}</div>
                     </div>
 
                     <button
+                      type="button"
                       onClick={() => {
                         setDropdownOpen(false);
                         onOpenAccountModal();
                       }}
-                      className="w-full text-left px-3.5 py-2 text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2"
+                      className="w-full text-left px-3.5 py-2 text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer"
                     >
                       <Settings className="w-3.5 h-3.5 text-slate-400" />
-                      <span>Account Settings</span>
+                      <span>Profile & Subscription</span>
                     </button>
 
                     <button
+                      type="button"
                       onClick={() => {
                         setDropdownOpen(false);
                         onTabChange('subscription');
                       }}
-                      className="w-full text-left px-3.5 py-2 text-xs text-slate-700 hover:bg-slate-50 flex items-center justify-between"
+                      className="w-full text-left px-3.5 py-2 text-xs text-slate-700 hover:bg-slate-50 flex items-center justify-between cursor-pointer"
                     >
                       <div className="flex items-center gap-2">
                         <CreditCard className="w-3.5 h-3.5 text-slate-400" />
@@ -154,13 +184,14 @@ export const Header: React.FC<HeaderProps> = ({
                     <div className="border-t border-slate-100 my-1" />
 
                     <button
+                      type="button"
                       onClick={() => {
                         setDropdownOpen(false);
                         onLogout();
                       }}
-                      className="w-full text-left px-3.5 py-2 text-xs text-rose-600 hover:bg-rose-50 flex items-center gap-2"
+                      className="w-full text-left px-3.5 py-2 text-xs text-rose-600 hover:bg-rose-50 flex items-center gap-2 cursor-pointer font-medium"
                     >
-                      <LogOut className="w-3.5 h-3.5" />
+                      <LogOut className="w-3.5 h-3.5 text-rose-500" />
                       <span>Sign Out</span>
                     </button>
                   </div>
@@ -168,10 +199,12 @@ export const Header: React.FC<HeaderProps> = ({
               </div>
             ) : (
               <button
+                type="button"
                 onClick={onOpenAuthModal}
-                className="px-3.5 py-1.5 bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 text-white font-semibold rounded-lg text-xs shadow-xs transition-opacity"
+                className="px-4 py-2 bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 text-white rounded-xl text-xs font-semibold shadow-xs flex items-center gap-1.5 transition-opacity cursor-pointer"
               >
-                Sign In
+                <User className="w-3.5 h-3.5" />
+                <span>Sign In</span>
               </button>
             )}
           </div>

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { UserProfile, SubscriptionTier } from '../types';
 import { storageService } from '../services/storage';
+import { formatDisplayName } from './UserAvatar';
 import {
   signInWithEmailPassword,
   signUpWithEmailPassword,
@@ -81,7 +82,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
           id: Date.now(),
           firebaseUid: u.id,
           email: u.email || email.trim().toLowerCase(),
-          displayName: displayName.trim() || u.user_metadata?.display_name || email.split('@')[0],
+          displayName: formatDisplayName(displayName.trim() || u.user_metadata?.display_name || u.user_metadata?.full_name, u.email || email),
           photoUrl: u.user_metadata?.avatar_url || '',
           subscriptionTier: 'free',
           createdAt: u.created_at || new Date().toISOString(),
@@ -109,11 +110,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
         id: Date.now(),
         firebaseUid: u.id,
         email: u.email || email.trim().toLowerCase(),
-        displayName:
+        displayName: formatDisplayName(
           u.user_metadata?.display_name ||
           u.user_metadata?.full_name ||
-          displayName.trim() ||
-          email.split('@')[0],
+          displayName.trim(),
+          u.email || email
+        ),
         photoUrl: u.user_metadata?.avatar_url || '',
         subscriptionTier: (u.user_metadata?.subscription_tier as SubscriptionTier) || 'free',
         createdAt: u.created_at || new Date().toISOString(),
@@ -125,7 +127,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
       onAuthSuccess(profile);
       onClose();
     } catch (err: any) {
-      console.error('[Supabase Auth Modal Error]', err);
+      console.warn('[Authentication Notice]', err?.message || err);
       setError(err?.message || 'Invalid login credentials. Please check your credentials.');
     } finally {
       setLoading(false);

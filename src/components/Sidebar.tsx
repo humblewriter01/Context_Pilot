@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { UserProfile, UsageStats } from '../types';
+import { UserAvatar, formatDisplayName } from './UserAvatar';
 import {
   Compass,
   Layers,
@@ -297,15 +298,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <div
                   onClick={onOpenAccountModal}
                   className="flex items-center gap-2.5 truncate cursor-pointer hover:opacity-80 transition-opacity flex-1"
-                  title="Account Settings"
+                  title="Profile & Subscription"
                 >
-                  <img
-                    src={user.photoUrl}
-                    alt={user.displayName}
-                    className="w-8 h-8 rounded-full border border-slate-300 object-cover shrink-0"
+                  <UserAvatar
+                    photoUrl={user.photoUrl}
+                    displayName={formatDisplayName(user.displayName, user.email)}
+                    email={user.email}
+                    size="sm"
                   />
                   <div className="truncate text-left text-xs">
-                    <div className="font-bold text-slate-800 truncate leading-tight">{user.displayName}</div>
+                    <div className="font-bold text-slate-800 truncate leading-tight">
+                      {formatDisplayName(user.displayName, user.email)}
+                    </div>
                     <div className="text-[11px] text-slate-400 truncate">{user.email}</div>
                   </div>
                 </div>

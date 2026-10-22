@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { UserProfile, SubscriptionTier } from '../types';
 import { storageService } from '../services/storage';
+import { formatDisplayName } from './UserAvatar';
 import {
   signInWithEmailPassword,
   signUpWithEmailPassword,
@@ -54,7 +55,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
         if (resetErr) {
           throw new Error(resetErr.message || 'Failed to dispatch password recovery link.');
         }
-        setInfoMessage(`Password reset link dispatched to ${email.trim()} via Supabase. Please check your inbox.`);
+        setInfoMessage(`Password reset link dispatched to ${email.trim()}! Please check your inbox.`);
         return;
       }
 
@@ -82,7 +83,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
           id: Date.now(),
           firebaseUid: u.id,
           email: u.email || email.trim().toLowerCase(),
-          displayName: displayName.trim() || u.user_metadata?.display_name || email.split('@')[0],
+          displayName: formatDisplayName(displayName.trim() || u.user_metadata?.display_name || u.user_metadata?.full_name, u.email || email),
           photoUrl: u.user_metadata?.avatar_url || '',
           subscriptionTier: 'free',
           createdAt: u.created_at || new Date().toISOString(),
@@ -95,7 +96,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
         return;
       }
 
-      // Default: Sign In via Supabase auth.signInWithPassword
+      // Default: Sign In strictly via Supabase auth.signInWithPassword
       if (!email.trim() || !email.includes('@')) throw new Error('Please enter your email address');
       if (!password) throw new Error('Please enter your password');
 
@@ -109,11 +110,12 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
         id: Date.now(),
         firebaseUid: u.id,
         email: u.email || email.trim().toLowerCase(),
-        displayName:
+        displayName: formatDisplayName(
           u.user_metadata?.display_name ||
           u.user_metadata?.full_name ||
-          displayName.trim() ||
-          email.split('@')[0],
+          displayName.trim(),
+          u.email || email
+        ),
         photoUrl: u.user_metadata?.avatar_url || '',
         subscriptionTier: (u.user_metadata?.subscription_tier as SubscriptionTier) || 'free',
         createdAt: u.created_at || new Date().toISOString(),
@@ -124,8 +126,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
       storageService.saveUser(profile);
       onAuthSuccess(profile);
     } catch (err: any) {
-      console.error('[Supabase Auth Error]', err);
-      // Surface Supabase error directly in red to block unauthorized access
+      console.warn('[Authentication Notice]', err?.message || err);
       setError(err?.message || 'Invalid login credentials. Please check your email and password.');
     } finally {
       setLoading(false);
@@ -139,7 +140,8 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
     try {
       await signInWithGitHub(`${window.location.origin}`);
     } catch (err: any) {
-      setError(err?.message || 'Failed to authenticate via GitHub Supabase OAuth.');
+      console.warn('[GitHub Auth Notice]', err?.message || err);
+      setError(err?.message || 'Authentication is currently unavailable. Please check server configuration.');
       setLoading(false);
     }
   };
@@ -241,7 +243,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                       setError(null);
                       setInfoMessage(null);
                     }}
-                    className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${
+                    className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all cursor-pointer ${
                       tab === 'signin'
                         ? 'bg-indigo-600 text-white shadow-sm'
                         : 'text-slate-400 hover:text-white'
@@ -256,7 +258,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                       setError(null);
                       setInfoMessage(null);
                     }}
-                    className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${
+                    className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all cursor-pointer ${
                       tab === 'signup'
                         ? 'bg-indigo-600 text-white shadow-sm'
                         : 'text-slate-400 hover:text-white'
@@ -275,7 +277,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                       setError(null);
                       setInfoMessage(null);
                     }}
-                    className="text-xs text-indigo-400 hover:text-indigo-300"
+                    className="text-xs text-indigo-400 hover:text-indigo-300 cursor-pointer"
                   >
                     Back to Sign In
                   </button>
@@ -402,7 +404,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                               setError(null);
                               setInfoMessage(null);
                             }}
-                            className="text-[11px] text-indigo-400 hover:text-indigo-300 transition-colors"
+                            className="text-[11px] text-indigo-400 hover:text-indigo-300 transition-colors cursor-pointer"
                           >
                             Forgot password?
                           </button>
@@ -421,7 +423,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                         <button
                           type="button"
                           onClick={() => setShowPassword(!showPassword)}
-                          className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 cursor-pointer"
                         >
                           {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                         </button>
