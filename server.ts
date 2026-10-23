@@ -127,23 +127,43 @@ const SERVER_STORE = {
     proLimit: 150,
     maintenanceMode: false,
     adminEmail: process.env.ADMIN_EMAIL || 'admin@contextpilot.com',
-    adminPassword: process.env.ADMIN_PASSWORD || '',
     githubClientId: process.env.GITHUB_CLIENT_ID || '',
     githubClientSecret: process.env.GITHUB_CLIENT_SECRET || '',
   },
 };
 
-// Helper middleware for Admin verification
-function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+// Helper middleware for Admin verification strictly using Supabase JWT and ADMIN_EMAIL
+async function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized. Admin credentials required.' });
+    return res.status(403).json({ error: 'Forbidden. Supabase authentication token required.' });
   }
-  const token = authHeader.split('Bearer ')[1];
-  if (!token || !token.startsWith('cp_adm_')) {
-    return res.status(401).json({ error: 'Invalid or expired admin session token.' });
+
+  const token = authHeader.split('Bearer ')[1]?.trim();
+  if (!token) {
+    return res.status(403).json({ error: 'Forbidden. Supabase authentication token required.' });
   }
-  next();
+
+  if (!supabaseServer) {
+    return res.status(403).json({ error: 'Forbidden. Supabase is not configured on the server.' });
+  }
+
+  try {
+    const { data: { user }, error } = await supabaseServer.auth.getUser(token);
+    if (error || !user || !user.email) {
+      return res.status(403).json({ error: 'Forbidden. Invalid or expired authentication session.' });
+    }
+
+    const adminEmail = (process.env.ADMIN_EMAIL || SERVER_STORE.settings.adminEmail || 'admin@contextpilot.com').trim().toLowerCase();
+    if (user.email.trim().toLowerCase() !== adminEmail) {
+      return res.status(403).json({ error: `Forbidden. User ${user.email} is not authorized as administrator.` });
+    }
+
+    (req as any).adminUser = user;
+    next();
+  } catch (err: any) {
+    return res.status(403).json({ error: 'Forbidden. Unable to verify administrator authorization.' });
+  }
 }
 
 // ==========================================
@@ -573,41 +593,39 @@ app.post('/api/promos/validate', (req, res) => {
 // 2. Professional Admin Authentication & Management
 // ==========================================
 
-// Admin Login
-app.post('/api/admin/login', (req, res) => {
-  const { email, password } = req.body;
-  const targetEmail = SERVER_STORE.settings.adminEmail;
-  const targetPassword = SERVER_STORE.settings.adminPassword;
-
-  if (
-    email &&
-    password &&
-    email.trim().toLowerCase() === targetEmail.toLowerCase() &&
-    password.trim() === targetPassword
-  ) {
-    const token = `cp_adm_${Buffer.from(`${email}_${Date.now()}`).toString('base64')}`;
-    return res.json({
-      success: true,
-      token,
-      admin: {
-        email: targetEmail,
-        name: 'Lead System Administrator',
-        role: 'superadmin',
-      },
-    });
-  }
-
-  return res.status(401).json({
-    error: 'Invalid administrator credentials. Please check your admin email and password.',
+// Admin Session Verification
+app.get('/api/admin/verify', requireAdmin, (req: any, res) => {
+  const user = req.adminUser;
+  res.json({
+    success: true,
+    admin: {
+      email: user.email,
+      name: user.user_metadata?.full_name || user.user_metadata?.display_name || user.email.split('@')[0],
+      role: 'superadmin',
+    },
   });
 });
 
 // Admin System Overview & Analytics
-app.get('/api/admin/overview', requireAdmin, (_req, res) => {
-  const totalUsers = SERVER_STORE.users.length;
-  const proUsers = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'pro').length;
-  const enterpriseUsers = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'enterprise').length;
-  const freeUsers = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'free').length;
+app.get('/api/admin/overview', requireAdmin, async (_req, res) => {
+  let totalUsers = SERVER_STORE.users.length;
+  let proUsers = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'pro').length;
+  let enterpriseUsers = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'enterprise').length;
+  let freeUsers = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'free').length;
+
+  if (supabaseServer) {
+    try {
+      const { data: dbUsers } = await supabaseServer.from('users').select('subscription_tier');
+      if (dbUsers && dbUsers.length > 0) {
+        totalUsers = dbUsers.length;
+        proUsers = dbUsers.filter((u: any) => u.subscription_tier === 'pro').length;
+        enterpriseUsers = dbUsers.filter((u: any) => u.subscription_tier === 'enterprise').length;
+        freeUsers = dbUsers.filter((u: any) => u.subscription_tier === 'free').length;
+      }
+    } catch (e) {
+      console.warn('Overview Supabase users fetch error:', e);
+    }
+  }
 
   const successfulTx = SERVER_STORE.transactions.filter((t) => t.status === 'success');
   const totalRevenueNgn = successfulTx.reduce((acc, t) => acc + (t.currency === 'NGN' ? t.amount : t.amount * 1500), 0);
@@ -730,42 +748,170 @@ app.get('/api/admin/analytics', requireAdmin, (req, res) => {
   });
 });
 
-// Admin Users Management
-app.get('/api/admin/users', requireAdmin, (_req, res) => {
-  res.json(SERVER_STORE.users);
+// Admin Users Management (Directly wired to Supabase public.users table)
+app.get('/api/admin/users', requireAdmin, async (_req, res) => {
+  if (supabaseServer) {
+    try {
+      const { data: dbUsers, error } = await supabaseServer
+        .from('users')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (!error && dbUsers) {
+        // Fetch current month usage for these users
+        const currentMonth = getCurrentMonthYear();
+        const { data: usageData } = await supabaseServer
+          .from('user_usage')
+          .select('user_email, tickets_processed')
+          .eq('month_year', currentMonth);
+
+        const usageMap = new Map(
+          (usageData || []).map((u: any) => [u.user_email?.toLowerCase(), u.tickets_processed])
+        );
+
+        const formatted = dbUsers.map((u: any) => ({
+          id: u.id,
+          email: u.email,
+          displayName: u.display_name || u.email?.split('@')[0] || 'Developer',
+          subscriptionTier: u.subscription_tier || 'free',
+          status: u.status || 'active',
+          createdAt: u.created_at,
+          lastLoginAt: u.last_login_at || u.created_at,
+          ticketsUsedThisMonth: usageMap.get(u.email?.toLowerCase()) || 0,
+        }));
+        return res.json(formatted);
+      }
+    } catch (err) {
+      console.warn('Error querying Supabase public.users:', err);
+    }
+  }
+
+  // Fallback to in-memory store if database is offline
+  return res.json(SERVER_STORE.users);
 });
 
-app.put('/api/admin/users/:id/tier', requireAdmin, (req, res) => {
-  const userId = parseInt(req.params.id as string, 10);
+app.put('/api/admin/users/:id/tier', requireAdmin, async (req, res) => {
+  const userId = req.params.id as string;
   const { tier } = req.body;
   if (!['free', 'pro', 'enterprise'].includes(tier)) {
     return res.status(400).json({ error: 'Invalid subscription tier' });
   }
 
-  const user = SERVER_STORE.users.find((u) => u.id === userId);
+  if (supabaseServer) {
+    try {
+      const { data, error } = await supabaseServer
+        .from('users')
+        .update({ subscription_tier: tier })
+        .or(`id.eq.${userId},email.eq.${userId}`)
+        .select()
+        .maybeSingle();
+
+      if (!error && data) {
+        const memUser = SERVER_STORE.users.find(
+          (u) => u.email.toLowerCase() === data.email.toLowerCase()
+        );
+        if (memUser) memUser.subscriptionTier = tier;
+
+        return res.json({
+          success: true,
+          user: {
+            id: data.id,
+            email: data.email,
+            displayName: data.display_name,
+            subscriptionTier: data.subscription_tier,
+            status: data.status,
+            createdAt: data.created_at,
+          },
+        });
+      }
+    } catch (err) {
+      console.warn('Supabase update tier error:', err);
+    }
+  }
+
+  const numId = parseInt(userId, 10);
+  const user = SERVER_STORE.users.find((u) => u.id === numId || (u as any).id === userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
   user.subscriptionTier = tier;
   res.json({ success: true, user });
 });
 
-app.post('/api/admin/users/:id/reset-quota', requireAdmin, (req, res) => {
-  const userId = parseInt(req.params.id as string, 10);
-  const user = SERVER_STORE.users.find((u) => u.id === userId);
+app.post('/api/admin/users/:id/reset-quota', requireAdmin, async (req, res) => {
+  const userId = req.params.id as string;
+  const currentMonth = getCurrentMonthYear();
+
+  if (supabaseServer) {
+    try {
+      const { data: u } = await supabaseServer
+        .from('users')
+        .select('id, email')
+        .or(`id.eq.${userId},email.eq.${userId}`)
+        .maybeSingle();
+
+      if (u?.email) {
+        await supabaseServer
+          .from('user_usage')
+          .update({ tickets_processed: 0, updated_at: new Date().toISOString() })
+          .eq('user_email', u.email)
+          .eq('month_year', currentMonth);
+
+        return res.json({ success: true, message: `Reset monthly quota for ${u.email} to 0` });
+      }
+    } catch (err) {
+      console.warn('Supabase reset quota error:', err);
+    }
+  }
+
+  const numId = parseInt(userId, 10);
+  const user = SERVER_STORE.users.find((u) => u.id === numId || (u as any).id === userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
   user.ticketsUsedThisMonth = 0;
   res.json({ success: true, user });
 });
 
-app.put('/api/admin/users/:id/status', requireAdmin, (req, res) => {
-  const userId = parseInt(req.params.id as string, 10);
+app.put('/api/admin/users/:id/status', requireAdmin, async (req, res) => {
+  const userId = req.params.id as string;
   const { status } = req.body;
   if (!['active', 'suspended'].includes(status)) {
     return res.status(400).json({ error: 'Invalid status' });
   }
 
-  const user = SERVER_STORE.users.find((u) => u.id === userId);
+  if (supabaseServer) {
+    try {
+      const { data, error } = await supabaseServer
+        .from('users')
+        .update({ status })
+        .or(`id.eq.${userId},email.eq.${userId}`)
+        .select()
+        .maybeSingle();
+
+      if (!error && data) {
+        const memUser = SERVER_STORE.users.find(
+          (u) => u.email.toLowerCase() === data.email.toLowerCase()
+        );
+        if (memUser) memUser.status = status;
+
+        return res.json({
+          success: true,
+          user: {
+            id: data.id,
+            email: data.email,
+            displayName: data.display_name,
+            subscriptionTier: data.subscription_tier,
+            status: data.status,
+            createdAt: data.created_at,
+          },
+        });
+      }
+    } catch (err) {
+      console.warn('Supabase update status error:', err);
+    }
+  }
+
+  const numId = parseInt(userId, 10);
+  const user = SERVER_STORE.users.find((u) => u.id === numId || (u as any).id === userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
   user.status = status;
@@ -773,26 +919,148 @@ app.put('/api/admin/users/:id/status', requireAdmin, (req, res) => {
 });
 
 app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
-  const userId = parseInt(req.params.id as string, 10);
-  const idx = SERVER_STORE.users.findIndex((u) => u.id === userId);
-  const targetUser = idx >= 0 ? SERVER_STORE.users[idx] : null;
+  const userId = req.params.id as string;
 
-  if (idx >= 0) {
-    SERVER_STORE.users.splice(idx, 1);
-  }
-
-  if (supabaseAdmin && targetUser?.email) {
+  if (supabaseServer) {
     try {
-      await supabaseAdmin.from('analysis_history').delete().eq('user_email', targetUser.email);
-      await supabaseAdmin.from('user_usage').delete().eq('user_email', targetUser.email);
-      await supabaseAdmin.from('users').delete().eq('email', targetUser.email);
+      const { data: targetUser } = await supabaseServer
+        .from('users')
+        .select('id, email')
+        .or(`id.eq.${userId},email.eq.${userId}`)
+        .maybeSingle();
+
+      if (targetUser?.email) {
+        await supabaseServer.from('feedback').delete().eq('user_email', targetUser.email);
+        await supabaseServer.from('analysis_history').delete().eq('user_email', targetUser.email);
+        await supabaseServer.from('user_usage').delete().eq('user_email', targetUser.email);
+        await supabaseServer.from('transactions').delete().eq('user_email', targetUser.email);
+        await supabaseServer.from('users').delete().eq('email', targetUser.email);
+      }
     } catch (e) {
       console.warn('Admin user cascade delete warning:', e);
     }
   }
 
+  const numId = parseInt(userId, 10);
+  const idx = SERVER_STORE.users.findIndex((u) => u.id === numId || (u as any).id === userId);
+  if (idx >= 0) {
+    SERVER_STORE.users.splice(idx, 1);
+  }
+
   res.json({ success: true, message: 'User and associated records deleted successfully' });
 });
+
+// Admin User Feedback Management (Queries public.feedback table)
+app.get('/api/admin/feedback', requireAdmin, async (_req, res) => {
+  if (supabaseServer) {
+    try {
+      const { data, error } = await supabaseServer
+        .from('feedback')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (!error && data) {
+        return res.json(data);
+      }
+      if (error) {
+        console.warn('Error querying public.feedback for admin:', error);
+      }
+    } catch (err) {
+      console.warn('Supabase feedback fetch error:', err);
+    }
+  }
+  return res.json([]);
+});
+
+// User Feedback Submission (Persists directly to public.feedback table)
+app.post('/api/feedback', authenticateUser, async (req: express.Request, res: express.Response) => {
+  try {
+    const userEmail = (req as any).userEmail;
+    const { analysis_id, ticket_key, was_accurate, rating, comments, actual_files } = req.body;
+
+    if (!ticket_key || typeof was_accurate !== 'boolean') {
+      return res.status(400).json({ error: 'ticket_key and was_accurate boolean are required.' });
+    }
+
+    if (supabaseServer) {
+      // Ensure user profile exists in public.users to satisfy foreign key
+      await supabaseServer.from('users').upsert(
+        { email: userEmail, last_login_at: new Date().toISOString() },
+        { onConflict: 'email', ignoreDuplicates: true }
+      );
+
+      const payload: any = {
+        user_email: userEmail,
+        ticket_key,
+        was_accurate,
+        comments: comments || null,
+        rating: typeof rating === 'number' ? rating : 5,
+        actual_files: Array.isArray(actual_files) ? actual_files : [],
+        created_at: new Date().toISOString(),
+      };
+
+      if (analysis_id && typeof analysis_id === 'string' && analysis_id.length > 20) {
+        payload.analysis_id = analysis_id;
+      }
+
+      const { data, error } = await supabaseServer
+        .from('feedback')
+        .insert(payload)
+        .select()
+        .single();
+
+      if (error) {
+        console.warn('[Supabase Feedback Insert Error]:', error);
+        return res.status(500).json({ error: error.message || 'Failed to save feedback to database.' });
+      }
+
+      return res.json({ success: true, feedback: data });
+    }
+
+    return res.json({
+      success: true,
+      feedback: {
+        id: String(Date.now()),
+        ticket_key,
+        user_email: userEmail,
+        was_accurate,
+        rating,
+        comments,
+        created_at: new Date().toISOString(),
+      },
+    });
+  } catch (err: any) {
+    console.error('Feedback submission error:', err);
+    return res.status(500).json({ error: err?.message || 'Internal server error while saving feedback.' });
+  }
+});
+
+// User Feedback Retrieval for the Authenticated User (from public.feedback table)
+app.get('/api/feedback', authenticateUser, async (req: express.Request, res: express.Response) => {
+  try {
+    const userEmail = (req as any).userEmail;
+
+    if (supabaseServer) {
+      const { data, error } = await supabaseServer
+        .from('feedback')
+        .select('*')
+        .eq('user_email', userEmail)
+        .order('created_at', { ascending: false });
+
+      if (!error && data) {
+        return res.json(data);
+      }
+      if (error) {
+        console.warn('[Supabase User Feedback Query Warning]:', error);
+      }
+    }
+
+    return res.json([]);
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Failed to fetch feedback' });
+  }
+});
+
 
 // Admin Promo Codes Management
 app.get('/api/admin/promos', requireAdmin, (_req, res) => {
@@ -890,7 +1158,6 @@ app.post('/api/admin/settings', requireAdmin, (req, res) => {
     enterprisePriceUsd,
     freeLimit,
     proLimit,
-    adminPassword,
   } = req.body;
 
   if (paystackPublicKey !== undefined) SERVER_STORE.settings.paystackPublicKey = paystackPublicKey.trim();
@@ -909,9 +1176,6 @@ app.post('/api/admin/settings', requireAdmin, (req, res) => {
   if (enterprisePriceUsd !== undefined) SERVER_STORE.settings.enterprisePriceUsd = Number(enterprisePriceUsd);
   if (freeLimit !== undefined) SERVER_STORE.settings.freeLimit = Number(freeLimit);
   if (proLimit !== undefined) SERVER_STORE.settings.proLimit = Number(proLimit);
-  if (adminPassword && adminPassword.trim().length >= 6) {
-    SERVER_STORE.settings.adminPassword = adminPassword.trim();
-  }
 
   res.json({
     success: true,

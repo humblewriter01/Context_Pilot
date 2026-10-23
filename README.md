@@ -56,7 +56,7 @@ Context Pilot includes a production `render.yaml` blueprint:
    - `GEMINI_API_KEY`: Your Google Gemini API Key
    - `PAYSTACK_SECRET_KEY`: Your Paystack Secret Key (`sk_live_...` or `sk_test_...`)
    - `PAYSTACK_PUBLIC_KEY`: Your Paystack Public Key (`pk_live_...` or `pk_test_...`)
-   - `ADMIN_PASSWORD`: Your custom master admin password
+   - `ADMIN_EMAIL`: Administrator email authorized to access /admin
 
 ### Deploying to Vercel
 Context Pilot includes `vercel.json`:

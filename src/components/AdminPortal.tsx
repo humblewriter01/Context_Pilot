@@ -37,7 +37,11 @@ import {
   Zap,
   Calendar,
   ArrowUpRight,
-  Sparkles
+  Sparkles,
+  MessageSquare,
+  Star,
+  ThumbsUp,
+  ThumbsDown,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -69,7 +73,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
   const [authLoading, setAuthLoading] = useState(false);
 
   // Admin Dashboard State
-  const [activeTab, setActiveTab] = useState<'overview' | 'analytics' | 'pricing' | 'promos' | 'users' | 'transactions' | 'gateway'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'analytics' | 'pricing' | 'promos' | 'users' | 'feedback' | 'transactions' | 'gateway'>('overview');
   const [overview, setOverview] = useState<any>(null);
   const [analytics, setAnalytics] = useState<any>(null);
   const [analyticsDays, setAnalyticsDays] = useState<number>(14);
@@ -77,6 +81,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
   const [signupViewMode, setSignupViewMode] = useState<'daily' | 'cumulative'>('daily');
   const [users, setUsers] = useState<any[]>([]);
   const [transactions, setTransactions] = useState<any[]>([]);
+  const [feedbackList, setFeedbackList] = useState<any[]>([]);
   const [promos, setPromos] = useState<PromoCode[]>([]);
   const [settings, setSettings] = useState<AdminSystemSettings | null>(null);
   const [loadingData, setLoadingData] = useState(false);
@@ -101,7 +106,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
   const [showGhSecret, setShowGhSecret] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
-  const [newAdminPassword, setNewAdminPassword] = useState('');
 
   // Create Promo Code State
   const [promoCode, setPromoCode] = useState('');
@@ -116,16 +120,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
   const [saveSuccess, setSaveSuccess] = useState(false);
 
   const fetchAdminData = async () => {
-    if (!adminService.isAuthenticated()) return;
     setLoadingData(true);
     try {
-      const [ov, us, tx, pr, st, an] = await Promise.all([
+      const [ov, us, tx, pr, st, an, fb] = await Promise.all([
         adminService.getOverview(),
         adminService.getUsers(),
         adminService.getTransactions(),
         adminService.getPromos(),
         adminService.getSettings(),
         adminService.getAnalytics(analyticsDays).catch(() => null),
+        adminService.getFeedback().catch(() => []),
       ]);
       setOverview(ov);
       setUsers(us);
@@ -133,6 +137,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
       setPromos(pr);
       setSettings(st);
       if (an) setAnalytics(an);
+      if (fb) setFeedbackList(fb);
 
       setPaystackPublic(st.paystackPublicKey || '');
       setPaystackSecret(st.paystackSecretKeyMasked || '');
@@ -168,6 +173,31 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
       setAnalyticsLoading(false);
     }
   };
+
+  useEffect(() => {
+    let isMounted = true;
+    async function initAdminAuth() {
+      try {
+        setAuthLoading(true);
+        const adminProfile = await adminService.verifyAdminSession();
+        if (isMounted) {
+          setProfile(adminProfile);
+        }
+      } catch (err: any) {
+        if (isMounted) {
+          if (err?.message?.includes('Forbidden') || err?.message?.includes('403')) {
+            setAuthError(err.message);
+          }
+        }
+      } finally {
+        if (isMounted) {
+          setAuthLoading(false);
+        }
+      }
+    }
+
+    initAdminAuth();
+  }, []);
 
   useEffect(() => {
     if (profile) {
@@ -226,10 +256,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
         githubClientId: githubClientId.trim(),
         githubClientSecret: githubClientSecret.includes('...') ? undefined : githubClientSecret.trim(),
         isLiveMode,
-        adminPassword: newAdminPassword.trim() ? newAdminPassword.trim() : undefined,
       });
       setSaveSuccess(true);
-      setNewAdminPassword('');
       fetchAdminData();
       setTimeout(() => setSaveSuccess(false), 3000);
     } catch (err: any) {
@@ -370,7 +398,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
 
               <div>
                 <label className="block text-xs font-semibold uppercase text-slate-300 mb-1.5">
-                  Admin Master Password
+                  Supabase Account Password
                 </label>
                 <div className="relative">
                   <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -519,6 +547,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
             { id: 'pricing' as const, label: 'Pricing & Limits', icon: DollarSign },
             { id: 'promos' as const, label: 'Promo Codes & Discounts', icon: Tag },
             { id: 'users' as const, label: 'User Directory', icon: Users },
+            { id: 'feedback' as const, label: feedbackList.length > 0 ? `User Feedback (${feedbackList.length})` : 'User Feedback', icon: MessageSquare },
             { id: 'transactions' as const, label: 'Paystack Ledger', icon: CreditCard },
             { id: 'gateway' as const, label: 'Gateway & Security', icon: Key },
           ].map((tab) => {
@@ -1549,7 +1578,104 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
           </div>
         )}
 
-        {/* 6. GATEWAY & SECURITY */}
+        {/* 6. USER ACCURACY FEEDBACK (From Supabase public.feedback) */}
+        {activeTab === 'feedback' && (
+          <div className="p-6 bg-slate-900 border border-slate-800 rounded-2xl space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-bold text-white flex items-center gap-2">
+                  <MessageSquare className="w-5 h-5 text-indigo-400" />
+                  <span>User Prediction Feedback & Model Quality</span>
+                </h2>
+                <p className="text-xs text-slate-400">
+                  Live accuracy ratings, comments, and file prediction evaluations from the Supabase <code className="text-indigo-400 font-mono">public.feedback</code> table.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-400 font-medium">
+                  Total Reviews: <strong className="text-white font-mono">{feedbackList.length}</strong>
+                </span>
+                {feedbackList.length > 0 && (
+                  <span className="text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full font-bold">
+                    {Math.round((feedbackList.filter((f) => f.was_accurate).length / feedbackList.length) * 100)}% Accurate
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-950 text-slate-400 border-b border-slate-800">
+                  <tr>
+                    <th className="p-3">Ticket</th>
+                    <th className="p-3">User</th>
+                    <th className="p-3">Rating</th>
+                    <th className="p-3">Outcome</th>
+                    <th className="p-3">Comments</th>
+                    <th className="p-3">Date</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800">
+                  {feedbackList.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="p-8 text-center text-slate-400">
+                        No user feedback recorded yet in the database. When users rate predictions in the Jira simulator, entries will appear here live.
+                      </td>
+                    </tr>
+                  ) : (
+                    feedbackList.map((item: any) => (
+                      <tr key={item.id} className="hover:bg-slate-800/40">
+                        <td className="p-3 font-mono font-bold text-indigo-300">
+                          {item.ticket_key}
+                        </td>
+                        <td className="p-3 text-slate-300">{item.user_email}</td>
+                        <td className="p-3">
+                          <div className="flex items-center gap-1">
+                            {[1, 2, 3, 4, 5].map((s) => (
+                              <Star
+                                key={s}
+                                className={`w-3.5 h-3.5 ${
+                                  s <= (item.rating || 5)
+                                    ? 'fill-amber-400 text-amber-400'
+                                    : 'text-slate-600'
+                                }`}
+                              />
+                            ))}
+                          </div>
+                        </td>
+                        <td className="p-3">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase inline-flex items-center gap-1 ${
+                              item.was_accurate
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : 'bg-rose-500/20 text-rose-300'
+                            }`}
+                          >
+                            {item.was_accurate ? <ThumbsUp className="w-3 h-3" /> : <ThumbsDown className="w-3 h-3" />}
+                            {item.was_accurate ? 'Accurate' : 'Inaccurate'}
+                          </span>
+                        </td>
+                        <td className="p-3 text-slate-300 max-w-xs truncate">
+                          {item.comments ? (
+                            <span className="italic">"{item.comments}"</span>
+                          ) : (
+                            <span className="text-slate-500">None provided</span>
+                          )}
+                        </td>
+                        <td className="p-3 text-slate-400 text-[11px]">
+                          {new Date(item.created_at || Date.now()).toLocaleDateString()}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* 7. GATEWAY & SECURITY */}
         {activeTab === 'gateway' && (
           <div className="p-6 bg-slate-900 border border-slate-800 rounded-2xl space-y-6">
             <div>
@@ -1558,7 +1684,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                 <span>Paystack Gateway & Security Credentials</span>
               </h2>
               <p className="text-xs text-slate-400">
-                Configure your Paystack API keys, Live Mode switch, and Admin Password.
+                Configure your Paystack API keys and Live Mode switch.
               </p>
             </div>
 
@@ -1672,19 +1798,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                     {window.location.origin}/auth/github/callback
                   </div>
                 </div>
-              </div>
-
-              <div className="pt-2 border-t border-slate-800">
-                <label className="block text-xs font-semibold text-slate-300 mb-1">
-                  Change Master Admin Password (Optional)
-                </label>
-                <input
-                  type="password"
-                  value={newAdminPassword}
-                  onChange={(e) => setNewAdminPassword(e.target.value)}
-                  placeholder="Enter new admin password"
-                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-white focus:outline-indigo-500"
-                />
               </div>
 
               <div className="flex justify-end pt-2">

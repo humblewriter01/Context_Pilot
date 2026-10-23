@@ -20,8 +20,6 @@ services:
         sync: false
       - key: ADMIN_EMAIL
         value: admin@contextpilot.com
-      - key: ADMIN_PASSWORD
-        sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY

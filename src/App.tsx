@@ -12,7 +12,7 @@ import { AuthModal } from './components/AuthModal';
 import { AccountModal } from './components/AccountModal';
 import { SignInGate } from './components/SignInGate';
 import { storageService } from './services/storage';
-import { getSession, signOut, getOrInitSupabase } from './services/supabase';
+import { getSession, signOut, getOrInitSupabase, fetchUserFeedback } from './services/supabase';
 import { formatDisplayName } from './components/UserAvatar';
 import { UserProfile, UsageStats, AnalysisRecord, FeedbackRecord, SubscriptionTier } from './types';
 
@@ -96,6 +96,23 @@ export const App: React.FC = () => {
           if (isMounted) {
             storageService.saveUser(verifiedUser);
             setUser(verifiedUser);
+            fetchUserFeedback().then((remote) => {
+              if (isMounted && remote && remote.length > 0) {
+                const mapped: FeedbackRecord[] = remote.map((r, idx) => ({
+                  id: idx + 1,
+                  userId: 1,
+                  analysisId: Number(r.analysis_id) || 0,
+                  ticketKey: r.ticket_key,
+                  wasAccurate: r.was_accurate,
+                  accuracyRating: r.rating || 5,
+                  missingFiles: [],
+                  incorrectFiles: r.actual_files || [],
+                  userComment: r.comments || '',
+                  createdAt: r.created_at || new Date().toISOString(),
+                }));
+                setFeedback(mapped);
+              }
+            }).catch(() => {});
           }
         }
       } catch (err) {
@@ -182,11 +199,33 @@ export const App: React.FC = () => {
     setIsAdminRoute(false);
   };
 
-  const refreshAllData = () => {
+  const refreshAllData = async () => {
     setUser(storageService.getUser());
     setUsage(storageService.getUsage());
     setAnalyses(storageService.getAnalyses());
-    setFeedback(storageService.getFeedback());
+    const localFb = storageService.getFeedback();
+    try {
+      const remote = await fetchUserFeedback();
+      if (remote && remote.length > 0) {
+        const mapped: FeedbackRecord[] = remote.map((r, idx) => ({
+          id: idx + 1,
+          userId: 1,
+          analysisId: Number(r.analysis_id) || 0,
+          ticketKey: r.ticket_key,
+          wasAccurate: r.was_accurate,
+          accuracyRating: r.rating || 5,
+          missingFiles: [],
+          incorrectFiles: r.actual_files || [],
+          userComment: r.comments || '',
+          createdAt: r.created_at || new Date().toISOString(),
+        }));
+        setFeedback(mapped);
+        return;
+      }
+    } catch (e) {
+      console.warn('Could not fetch remote feedback:', e);
+    }
+    setFeedback(localFb);
   };
 
   const handleTierChange = (tier: SubscriptionTier) => {

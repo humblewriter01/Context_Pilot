@@ -228,3 +228,74 @@ export interface SupabaseFeedbackRecord {
   rating?: number;
   created_at?: string;
 }
+
+/**
+ * Submits user feedback for an analysis directly to the backend /api/feedback,
+ * which persists it into the Supabase public.feedback table.
+ */
+export async function submitUserFeedback(feedback: {
+  analysisId?: string | number;
+  ticketKey: string;
+  wasAccurate: boolean;
+  rating: number;
+  comments?: string;
+  actualFiles?: string[];
+}): Promise<any> {
+  const session = await getSession();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+
+  if (session?.access_token) {
+    headers['Authorization'] = `Bearer ${session.access_token}`;
+  }
+  if (session?.user?.email) {
+    headers['x-user-email'] = session.user.email;
+  }
+
+  const res = await fetch('/api/feedback', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      analysis_id: feedback.analysisId ? String(feedback.analysisId) : undefined,
+      ticket_key: feedback.ticketKey,
+      was_accurate: feedback.wasAccurate,
+      rating: feedback.rating,
+      comments: feedback.comments,
+      actual_files: feedback.actualFiles || [],
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || 'Failed to submit feedback');
+  }
+
+  return await res.json();
+}
+
+/**
+ * Fetches feedback records submitted by the authenticated user from public.feedback.
+ */
+export async function fetchUserFeedback(): Promise<SupabaseFeedbackRecord[]> {
+  const session = await getSession();
+  const headers: Record<string, string> = {};
+
+  if (session?.access_token) {
+    headers['Authorization'] = `Bearer ${session.access_token}`;
+  }
+  if (session?.user?.email) {
+    headers['x-user-email'] = session.user.email;
+  }
+
+  try {
+    const res = await fetch('/api/feedback', { headers });
+    if (!res.ok) {
+      return [];
+    }
+    return await res.json();
+  } catch (e) {
+    console.warn('Failed to fetch user feedback:', e);
+    return [];
+  }
+}

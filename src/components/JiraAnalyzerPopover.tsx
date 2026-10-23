@@ -14,6 +14,7 @@ import {
   Layers
 } from 'lucide-react';
 import { storageService } from '../services/storage';
+import { submitUserFeedback } from '../services/supabase';
 
 interface JiraAnalyzerPopoverProps {
   data: CategorizedFiles & { processingTimeMs?: number; id?: number; ticketKey?: string };
@@ -76,10 +77,11 @@ export const JiraAnalyzerPopover: React.FC<JiraAnalyzerPopoverProps> = ({
     setTimeout(() => setCopiedFile(null), 2000);
   };
 
-  const handleFeedbackSubmit = (e: React.FormEvent) => {
+  const handleFeedbackSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (wasAccurate === null) return;
 
+    // 1. Optimistically store in local storage cache
     storageService.saveFeedback({
       userId: 1,
       analysisId: data.id || Date.now(),
@@ -92,6 +94,20 @@ export const JiraAnalyzerPopover: React.FC<JiraAnalyzerPopoverProps> = ({
     });
 
     setFeedbackSent(true);
+
+    // 2. Persist directly to Supabase public.feedback table
+    try {
+      await submitUserFeedback({
+        analysisId: data.id,
+        ticketKey,
+        wasAccurate,
+        rating,
+        comments: comment,
+      });
+    } catch (err) {
+      console.warn('Could not save feedback to Supabase:', err);
+    }
+
     if (onFeedbackSubmitted) onFeedbackSubmitted();
   };
 

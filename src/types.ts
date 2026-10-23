@@ -159,7 +159,6 @@ export interface AdminSystemSettings {
   enterprisePriceUsd: number;
   freeLimit: number;
   proLimit: number;
-  adminPassword?: string;
   maintenanceMode: boolean;
   geminiModel: string;
   githubClientId?: string;
