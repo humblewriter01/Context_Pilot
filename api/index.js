@@ -93819,6 +93819,39 @@ app.get("/api/supabase/status", (_req, res) => {
     hasServiceKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY)
   });
 });
+app.get("/api/supabase/health", async (_req, res) => {
+  const tables = [
+    "users",
+    "user_usage",
+    "analysis_history",
+    "feedback",
+    "promo_codes",
+    "transactions",
+    "system_settings"
+  ];
+  if (!supabaseAdmin) {
+    return res.status(503).json({
+      configured: false,
+      error: "Supabase service role client is not configured on the server."
+    });
+  }
+  const results = {};
+  for (const table of tables) {
+    try {
+      const { error } = await supabaseAdmin.from(table).select("*", { count: "exact", head: true });
+      results[table] = error ? `error: ${error.message}` : "ok";
+    } catch (err) {
+      results[table] = `exception: ${err?.message || String(err)}`;
+    }
+  }
+  const healthy = Object.values(results).every((value) => value === "ok");
+  return res.status(healthy ? 200 : 500).json({
+    configured: true,
+    healthy,
+    tables: results,
+    hint: healthy ? "All required tables are readable." : "Run supabase/schema.sql in the Supabase SQL editor for the missing tables."
+  });
+});
 app.get("/api/supabase/config", (_req, res) => {
   const url = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || "";
   const anonKey = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || "";
