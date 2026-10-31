@@ -9,8 +9,17 @@ import { fileURLToPath } from 'url';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Resolve the module directory in both ESM (tsx / node) and bundled CJS
+// (Vercel serverless) hosts. Falls back to the working directory when the
+// module URL is unavailable, which is enough for the serverless entry point.
+const __dirname = (() => {
+  try {
+    const metaUrl = typeof import.meta !== 'undefined' ? import.meta.url : '';
+    return metaUrl ? path.dirname(fileURLToPath(metaUrl)) : process.cwd();
+  } catch {
+    return process.cwd();
+  }
+})();
 
 const app = express();
 

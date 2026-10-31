@@ -49,13 +49,16 @@ The repository ships with a serverless-ready layout:
 
 | Path | Purpose |
 | --- | --- |
-| `api/index.ts` | Vercel serverless entry point; exports the Express app from `server.ts`. |
+| `api/index.js` | Prebuilt serverless bundle (generated from `server.ts` by `npm run build:api`). Vercel must see a real file here, so it is committed and refreshed on every build. |
 | `vercel.json` | Rewrites `/api/*` and `/auth/github/callback` to the function and serves the SPA elsewhere. |
 | `dist/` | `vite build` output, served as static assets by Vercel. |
 
 1. Import the repository into [Vercel](https://vercel.com) (framework preset **Vite**).
 2. Add the environment variables listed below.
 3. Deploy. `server.ts` only calls `app.listen()` outside Vercel — cold starts never bind a port.
+
+`npm run build` runs `vite build` **and** `node scripts/build-api.mjs`, which re-bundles
+`server.ts` into `api/index.js`. Never edit `api/index.js` by hand — change `server.ts` and rebuild.
 
 **Required environment variables**
 
