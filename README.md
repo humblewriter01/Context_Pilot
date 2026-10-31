@@ -2,7 +2,7 @@
 
 Context Pilot is an AI-powered code impact and file prediction system for software engineering teams. It analyzes Jira tickets (summaries, descriptions, acceptance criteria) and predicts precisely which frontend components, backend APIs, database models/migrations, configurations, and test suites must be modified.
 
-Powered by **Google Gemini 3.8 Flash** with **Paystack Payment Gateway** and an **Enterprise Admin Portal**.
+Powered by **Google Gemini (`gemini-2.5-flash`)** with **Paystack Payment Gateway** and an **Enterprise Admin Portal**.
 
 ---
 
@@ -20,9 +20,8 @@ Powered by **Google Gemini 3.8 Flash** with **Paystack Payment Gateway** and an 
 
 ### 2. Professional Admin Portal (`/admin`)
 - Accessible at `/admin` or via the topbar and sidebar Admin buttons.
-- Protected by master administrator credentials:
-  - **Default Email**: `admin@contextpilot.com`
-  - **Default Password**: `ContextPilotAdmin2026!`
+- Protected by Supabase Auth: the signed-in user's email must match `ADMIN_EMAIL`.
+  There is no shared admin password — sign in normally, then open `/admin`.
 - **Overview & AI Telemetry**: Live Gemini 3.8 Flash request counts, estimated token usage, system uptime, and transaction volume.
 - **Paystack Payment Gateway Settings**: Form to input Paystack Public Key (`pk_...`) and Secret Key (`sk_...`), toggle Live/Test mode, and set plan prices in NGN.
 - **User Directory**: View registered users and modify their tiers (`Free`, `Pro`, `Enterprise`).
@@ -35,16 +34,49 @@ Powered by **Google Gemini 3.8 Flash** with **Paystack Payment Gateway** and an 
   - `GET /api/paystack/verify/:reference`: Verifies transactions with Paystack and activates Pro / Enterprise plans.
   - `POST /api/paystack/webhook`: Processes instant payment webhook notifications.
 
-### 4. Real Gemini 3.8 Flash Engine
-- Runs on server-side `@google/genai` TypeScript SDK via `POST /api/analyze`.
-- Zero mock data: evaluates real ticket descriptions and returns structured JSON across full-stack categories.
+### 4. Real Gemini Analysis Engine
+- Runs on the server-side `@google/genai` TypeScript SDK via `POST /api/analyze-ticket`.
+- Model is configurable through `GEMINI_MODEL` (default `gemini-2.5-flash`).
+- If the API key is missing or the call fails, a deterministic heuristic engine keeps the endpoint responsive.
 
 ---
 
-## 🚢 Deployment (Render, Vercel & Cloud Run)
+## 🚢 Deployment (Vercel, Render & Cloud Run)
 
-### Current Live Deployment (Cloud Run)
-The application is pre-configured and continuously running on your Google Cloud Run instance.
+### Deploying to Vercel (recommended)
+
+The repository ships with a serverless-ready layout:
+
+| Path | Purpose |
+| --- | --- |
+| `api/index.ts` | Vercel serverless entry point; exports the Express app from `server.ts`. |
+| `vercel.json` | Rewrites `/api/*` and `/auth/github/callback` to the function and serves the SPA elsewhere. |
+| `dist/` | `vite build` output, served as static assets by Vercel. |
+
+1. Import the repository into [Vercel](https://vercel.com) (framework preset **Vite**).
+2. Add the environment variables listed below.
+3. Deploy. `server.ts` only calls `app.listen()` outside Vercel — cold starts never bind a port.
+
+**Required environment variables**
+
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `SUPABASE_URL` | ✅ | Supabase project URL (used by both the API and the browser at runtime). |
+| `SUPABASE_ANON_KEY` | ✅ | Public anon key; also served to the client via `/api/supabase/config`. |
+| `SUPABASE_SERVICE_ROLE_KEY` | ✅ | Enables RLS-bypassing admin operations, quotas and history writes. |
+| `GEMINI_API_KEY` | ✅ | Server-side Gemini access. |
+| `ADMIN_EMAIL` | ✅ | Email allowed into `/admin`. |
+| `PAYSTACK_PUBLIC_KEY` / `PAYSTACK_SECRET_KEY` | optional | Needed for live billing. |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | optional | Needed for the 1-click GitHub OAuth flow. |
+| `GITHUB_TOKEN` | optional | Raises GitHub API rate limits during verification. |
+| `GEMINI_MODEL` | optional | Defaults to `gemini-2.5-flash`. |
+| `USD_NGN_RATE` | optional | Conversion used for fixed NGN promo discounts charged in USD (default `1500`). |
+
+Then run `supabase/schema.sql` in the Supabase SQL editor and add
+`https://<your-domain>/auth/github/callback` as the GitHub OAuth callback URL.
+
+Note: pricing, limits and promo codes are stored in Supabase
+(`system_settings`, `promo_codes`), so admin changes survive serverless cold starts.
 
 ### Deploying to Render.com
 Context Pilot includes a production `render.yaml` blueprint:
@@ -58,12 +90,19 @@ Context Pilot includes a production `render.yaml` blueprint:
    - `PAYSTACK_PUBLIC_KEY`: Your Paystack Public Key (`pk_live_...` or `pk_test_...`)
    - `ADMIN_EMAIL`: Administrator email authorized to access /admin
 
-### Deploying to Vercel
-Context Pilot includes `vercel.json`:
-1. Import repository into [Vercel](https://vercel.com).
-2. Select **Vite** framework preset.
-3. Add Environment Variables (`GEMINI_API_KEY`, `PAYSTACK_SECRET_KEY`, `PAYSTACK_PUBLIC_KEY`).
-4. Click **Deploy**.
+### API surface (after the audit)
+
+| Endpoint | Auth | Purpose |
+| --- | --- | --- |
+| `POST /api/analyze-ticket` | Supabase JWT (optional, used for quota) | Gemini file-impact prediction + quota + history. |
+| `GET /api/history` | Supabase JWT | Server-side analysis history. |
+| `GET /api/user/sync` | Supabase JWT | Authoritative tier, status and monthly usage. |
+| `DELETE /api/history/:id` | Supabase JWT (owner only) | Delete one record (UUID or ticket key). |
+| `POST /api/feedback` / `GET /api/feedback` | Supabase JWT | Accuracy feedback, scoped to the caller. |
+| `POST /api/paystack/initialize` | public | Server-priced checkout (client amounts are ignored). |
+| `GET /api/paystack/verify/:reference` | public | Verifies payment, rejects underpaid upgrades. |
+| `POST /api/paystack/webhook` | HMAC signature | `charge.success` handling. |
+| `/api/admin/*` | Supabase JWT + `ADMIN_EMAIL` | Admin portal API. |
 
 ---
 

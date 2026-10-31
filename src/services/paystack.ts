@@ -50,7 +50,8 @@ export const paystackService = {
     amount: number,
     callbackUrl?: string,
     promoCode?: string,
-    currency: 'NGN' | 'USD' = 'NGN'
+    currency: 'NGN' | 'USD' = 'NGN',
+    billingCycle: 'monthly' | 'annual' = 'monthly'
   ): Promise<{ authorization_url: string; reference: string; finalAmount?: number }> {
     const res = await fetch('/api/paystack/initialize', {
       method: 'POST',
@@ -62,6 +63,7 @@ export const paystackService = {
         callback_url: callbackUrl,
         promo_code: promoCode,
         currency,
+        billing_cycle: billingCycle,
       }),
     });
 

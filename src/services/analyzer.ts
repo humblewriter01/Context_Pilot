@@ -1,7 +1,9 @@
 import { CategorizedFiles } from '../types';
 import { storageService } from './storage';
+import { getAuthHeaders } from './supabase';
 
 export interface AnalysisResponse extends CategorizedFiles {
+  historyId?: string;
   processingTimeMs?: number;
   usage?: {
     ticketsProcessed: number;
@@ -11,8 +13,9 @@ export interface AnalysisResponse extends CategorizedFiles {
 }
 
 /**
- * Analyzes a Jira ticket via the server-side Gemini 3.8 Flash API route (/api/analyze-ticket).
- * Passes user email for server-side Supabase quota enforcement and history logging.
+ * Analyzes a Jira ticket via the server-side Gemini API route (/api/analyze-ticket).
+ * Sends the Supabase session token so the server can verify the caller,
+ * enforce quota, and persist history under the verified identity.
  */
 export async function analyzeTicket(
   ticketText: string,
@@ -21,12 +24,14 @@ export async function analyzeTicket(
   ticketTitle?: string
 ): Promise<AnalysisResponse> {
   const email = userEmail || storageService.getUser()?.email || '';
+  const authHeaders = await getAuthHeaders();
 
   const response = await fetch('/api/analyze-ticket', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...(email ? { 'x-user-email': email } : {}),
+      ...authHeaders,
     },
     body: JSON.stringify({
       ticket_text: ticketText,
@@ -74,6 +79,7 @@ export async function analyzeTicket(
     confidence_score: typeof result.confidence_score === 'number' ? result.confidence_score : 0.85,
     reasoning: result.reasoning || 'Identified impacted files via Gemini 3.8 Flash analysis.',
     total_files,
+    historyId: typeof result.historyId === 'string' ? result.historyId : undefined,
     processingTimeMs: result.processingTimeMs,
     usage: result.usage,
   };

@@ -47,7 +47,10 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
     code: string;
     discountType: 'percentage' | 'fixed';
     discountValue: number;
+    /** Discount in the currency it was validated against. */
     discountAmount: number;
+    currency: 'NGN' | 'USD';
+    applicableTiers: ('pro' | 'enterprise')[];
   } | null>(null);
   const [promoError, setPromoError] = useState<string | null>(null);
   const [validatingPromo, setValidatingPromo] = useState(false);
@@ -104,7 +107,32 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
   const handleCurrencySelect = (curr: 'NGN' | 'USD') => {
     setSelectedCurrency(curr);
     sessionStorage.setItem('cp_selected_currency', curr);
+    // Promo discounts are validated per currency; clear so no stale amount is applied.
+    setAppliedPromo(null);
   };
+
+  const planPrice = (tier: 'pro' | 'enterprise', currency: 'NGN' | 'USD') => {
+    if (currency === 'USD') {
+      return tier === 'pro' ? paystackConfig?.proPriceUsd || 10 : paystackConfig?.enterprisePriceUsd || 50;
+    }
+    return tier === 'pro' ? paystackConfig?.proPriceNgn || 15000 : paystackConfig?.enterprisePriceNgn || 75000;
+  };
+
+  const promoDiscountFor = (amount: number) => {
+    if (!appliedPromo || appliedPromo.currency !== selectedCurrency) return 0;
+    if (appliedPromo.discountType === 'percentage') {
+      return Math.round(amount * appliedPromo.discountValue) / 100;
+    }
+    return Math.min(amount, appliedPromo.discountAmount);
+  };
+
+  const promoAppliesTo = (tier: 'free' | 'pro' | 'enterprise') =>
+    Boolean(
+      appliedPromo &&
+        appliedPromo.currency === selectedCurrency &&
+        tier !== 'free' &&
+        appliedPromo.applicableTiers.includes(tier)
+    );
 
   const handleVerifyReference = async (ref: string) => {
     setPaymentNotice(null);
@@ -138,17 +166,36 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
     setPromoError(null);
 
     try {
-      // Check for Pro tier by default as baseline
-      const baseAmount = paystackConfig?.proPriceNgn || 15000;
-      const res = await adminService.validatePromo(promoInput.trim().toUpperCase(), 'pro', baseAmount);
+      const code = promoInput.trim().toUpperCase();
+      const proAmount = planPrice('pro', selectedCurrency);
 
-      if (res.valid) {
+      let res: any = null;
+      try {
+        res = await adminService.validatePromo(code, 'pro', proAmount, selectedCurrency);
+      } catch (proErr: any) {
+        // Codes restricted to Enterprise are validated against the Enterprise price.
+        const message = String(proErr?.message || '');
+        if (!message.toLowerCase().includes('only valid for')) throw proErr;
+        res = await adminService.validatePromo(
+          code,
+          'enterprise',
+          planPrice('enterprise', selectedCurrency),
+          selectedCurrency
+        );
+      }
+
+      if (res?.valid) {
         setAppliedPromo({
           code: res.code,
           discountType: res.discountType,
           discountValue: res.discountValue,
           discountAmount: res.discountAmount,
+          currency: res.currency === 'USD' ? 'USD' : 'NGN',
+          applicableTiers: Array.isArray(res.applicableTiers) && res.applicableTiers.length > 0
+            ? res.applicableTiers
+            : ['pro', 'enterprise'],
         });
+        setPromoError(null);
         setPromoInput('');
       }
     } catch (err: any) {
@@ -176,35 +223,22 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
     setLoadingTier(plan.tier);
     setPaymentNotice(null);
 
-    let baseAmount = 0;
-    if (selectedCurrency === 'USD') {
-      baseAmount =
-        plan.tier === 'pro'
-          ? paystackConfig?.proPriceUsd || 10
-          : paystackConfig?.enterprisePriceUsd || 50;
-    } else {
-      baseAmount =
-        plan.tier === 'pro'
-          ? paystackConfig?.proPriceNgn || 15000
-          : paystackConfig?.enterprisePriceNgn || 75000;
-    }
+    let baseAmount = plan.tier === 'pro' || plan.tier === 'enterprise'
+      ? planPrice(plan.tier, selectedCurrency)
+      : 0;
 
     // Apply 20% discount for annual billing
     if (billingCycle === 'annual') {
       baseAmount = Math.round(baseAmount * 12 * 0.8);
     }
 
-    // Apply promo code discount if active
-    let promoCodeToPass: string | undefined = undefined;
-    if (appliedPromo) {
-      promoCodeToPass = appliedPromo.code;
-      if (appliedPromo.discountType === 'percentage') {
-        const disc = (baseAmount * appliedPromo.discountValue) / 100;
-        baseAmount = Math.max(1, baseAmount - disc);
-      } else {
-        baseAmount = Math.max(1, baseAmount - appliedPromo.discountAmount);
-      }
-    }
+    // Promo codes only apply to the tiers they were issued for.
+    const promoCodeToPass = promoAppliesTo(plan.tier) ? appliedPromo!.code : undefined;
+
+    // Amount used by the in-page Paystack popup, which charges exactly what we pass.
+    const chargeAmount = promoAppliesTo(plan.tier)
+      ? Math.max(1, Math.round((baseAmount - promoDiscountFor(baseAmount)) * 100) / 100)
+      : baseAmount;
 
     try {
       // Attempt inline popup checkout if public key is active
@@ -212,7 +246,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
         const popupOpened = await paystackService.openInlineCheckout({
           publicKey: paystackConfig.paystackPublicKey,
           email: user.email,
-          amount: baseAmount,
+          amount: chargeAmount,
           currency: selectedCurrency,
           tier: plan.tier,
           promoCode: promoCodeToPass,
@@ -229,14 +263,16 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
         }
       }
 
-      // Standard Paystack authorization redirect flow
+      // Standard Paystack authorization redirect flow.
+      // The base amount is sent undiscounted: the server applies the promo once.
       const initRes = await paystackService.initializeTransaction(
         user.email,
         plan.tier,
         baseAmount,
         window.location.href,
         promoCodeToPass,
-        selectedCurrency
+        selectedCurrency,
+        billingCycle
       );
 
       if (initRes.authorization_url) {
@@ -396,7 +432,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
               Promo code <strong className="font-mono">{appliedPromo.code}</strong> applied (
               {appliedPromo.discountType === 'percentage'
                 ? `${appliedPromo.discountValue}% OFF`
-                : `${selectedCurrency === 'USD' ? '$' : '₦'}${appliedPromo.discountValue} OFF`}
+                : `${selectedCurrency === 'USD' ? '$' : '₦'}${appliedPromo.discountAmount.toLocaleString()} OFF`}
               )!
             </span>
           </div>
@@ -430,14 +466,10 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
             monthlyPrice = Math.round(monthlyPrice * 0.8);
           }
 
-          let discountedPrice = monthlyPrice;
-          if (appliedPromo && plan.tier !== 'free') {
-            if (appliedPromo.discountType === 'percentage') {
-              discountedPrice = Math.round(monthlyPrice * (1 - appliedPromo.discountValue / 100));
-            } else {
-              discountedPrice = Math.max(1, monthlyPrice - appliedPromo.discountAmount);
-            }
-          }
+          const promoActive = promoAppliesTo(plan.tier);
+          const discountedPrice = promoActive
+            ? Math.max(1, Math.round((monthlyPrice - promoDiscountFor(monthlyPrice)) * 100) / 100)
+            : monthlyPrice;
 
           return (
             <div
@@ -475,7 +507,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
                         <span className="text-3xl sm:text-4xl font-extrabold text-slate-900">
                           {currencySymbol}{discountedPrice.toLocaleString()}
                         </span>
-                        {appliedPromo && (
+                        {promoActive && (
                           <span className="text-sm text-slate-400 line-through">
                             {currencySymbol}{monthlyPrice.toLocaleString()}
                           </span>

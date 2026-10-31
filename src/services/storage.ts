@@ -110,15 +110,22 @@ export const storageService = {
     localStorage.setItem(STORAGE_KEYS.LOGGED_OUT, 'true');
   },
 
-  deleteAccount(): void {
+  async deleteAccount(): Promise<void> {
     const current = this.getUser();
+
     if (current?.email) {
-      // Optional async server notice
-      fetch('/api/auth/delete-account', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: current.email })
-      }).catch(() => {});
+      // Server-side cascade delete using the verified Supabase session.
+      try {
+        const { getAuthHeaders } = await import('./supabase');
+        const headers = await getAuthHeaders();
+        await fetch('/api/auth/delete-account', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: JSON.stringify({ email: current.email })
+        });
+      } catch {
+        // Offline / signed-out: local purge below is still applied.
+      }
     }
 
     localStorage.removeItem(STORAGE_KEYS.USER);
@@ -177,6 +184,25 @@ export const storageService = {
     const currentMonth = getCurrentMonthYear();
     localStorage.setItem(`${STORAGE_KEYS.USAGE}_${currentMonth}`, '0');
     return this.getUsage();
+  },
+
+  /** Replaces the cached history with server-sourced records (no usage increment). */
+  setAnalyses(list: AnalysisRecord[]): AnalysisRecord[] {
+    try {
+      localStorage.setItem(STORAGE_KEYS.ANALYSES, JSON.stringify(list));
+    } catch (e) {
+      console.warn('Failed to cache analyses', e);
+    }
+    return list;
+  },
+
+  /** Syncs the monthly counter with the authoritative server value. */
+  setUsageCount(count: number, monthYear: string = getCurrentMonthYear()): void {
+    try {
+      localStorage.setItem(`${STORAGE_KEYS.USAGE}_${monthYear}`, String(Math.max(0, count)));
+    } catch (e) {
+      console.warn('Failed to cache usage', e);
+    }
   },
 
   getAnalyses(): AnalysisRecord[] {
