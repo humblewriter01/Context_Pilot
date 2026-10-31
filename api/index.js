@@ -93835,19 +93835,32 @@ app.get("/api/supabase/health", async (_req, res) => {
       error: "Supabase service role client is not configured on the server."
     });
   }
+  let probe = "";
+  try {
+    const probeRes = await fetch(`${supabaseUrl.replace(/\/$/, "")}/rest/v1/`, {
+      headers: {
+        apikey: supabaseServiceRoleKey || supabaseAnonKey,
+        Authorization: `Bearer ${supabaseServiceRoleKey || supabaseAnonKey}`
+      }
+    });
+    probe = `HTTP ${probeRes.status} ${probeRes.statusText}`;
+  } catch (err) {
+    probe = `network error: ${err?.name || "Error"} ${err?.message || ""} ${err?.cause?.code || err?.cause?.message || ""}`.trim();
+  }
   const results = {};
   for (const table of tables) {
     try {
       const { error } = await supabaseAdmin.from(table).select("*", { count: "exact", head: true });
-      results[table] = error ? `error: ${error.message}` : "ok";
+      results[table] = error ? `error: ${error.message || "(no message)"} [code=${error.code || "-"} details=${error.details || "-"} hint=${error.hint || "-"}]` : "ok";
     } catch (err) {
-      results[table] = `exception: ${err?.message || String(err)}`;
+      results[table] = `exception: ${err?.name || "Error"}: ${err?.message || String(err)} ${err?.cause?.code || ""}`.trim();
     }
   }
   const healthy = Object.values(results).every((value) => value === "ok");
   return res.status(healthy ? 200 : 500).json({
     configured: true,
     healthy,
+    restProbe: probe,
     tables: results,
     hint: healthy ? "All required tables are readable." : "Run supabase/schema.sql in the Supabase SQL editor for the missing tables."
   });
