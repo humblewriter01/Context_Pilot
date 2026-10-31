@@ -2459,6 +2459,7 @@ app.get('/api/supabase/health', async (_req, res) => {
 
   // Low-level probe so network/key problems are distinguishable from schema gaps.
   let probe = '';
+  let tableProbe = '';
   try {
     const probeRes = await fetch(`${supabaseUrl.replace(/\/$/, '')}/rest/v1/`, {
       headers: {
@@ -2471,6 +2472,18 @@ app.get('/api/supabase/health', async (_req, res) => {
     probe = `network error: ${err?.name || 'Error'} ${err?.message || ''} ${
       (err as any)?.cause?.code || (err as any)?.cause?.message || ''
     }`.trim();
+  }
+
+  // Direct PostgREST read (bypasses supabase-js) to isolate client-side issues.
+  try {
+    const key = supabaseServiceRoleKey || supabaseAnonKey;
+    const rawRes = await fetch(`${supabaseUrl.replace(/\/$/, '')}/rest/v1/system_settings?select=id&limit=1`, {
+      headers: { apikey: key, Authorization: `Bearer ${key}` },
+    });
+    const body = await rawRes.text();
+    tableProbe = `HTTP ${rawRes.status} ${body.slice(0, 160)}`;
+  } catch (err: any) {
+    tableProbe = `network error: ${err?.name || 'Error'} ${err?.message || ''}`.trim();
   }
 
   const results: Record<string, string> = {};
@@ -2492,6 +2505,7 @@ app.get('/api/supabase/health', async (_req, res) => {
     configured: true,
     healthy,
     restProbe: probe,
+    tableProbe,
     tables: results,
     hint: healthy
       ? 'All required tables are readable.'
