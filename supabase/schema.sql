@@ -154,6 +154,30 @@ create policy "Users can delete own analyses"
   on public.analysis_history for delete
   using (auth.jwt() ->> 'email' = user_email);
 
+-- ===================================================================
+-- EXPLICIT PRIVILEGES (required on top of RLS)
+-- service_role bypasses RLS but still needs table privileges; anon needs
+-- to read pricing settings for the marketing/pricing screens.
+-- ===================================================================
+
+grant usage on schema public to anon, authenticated, service_role;
+
+grant all privileges on all tables in schema public to service_role;
+grant all privileges on all sequences in schema public to service_role;
+
+grant select, insert, update on public.users to authenticated;
+grant select, insert, update, delete on public.user_usage to authenticated;
+grant select, insert, delete on public.analysis_history to authenticated;
+grant select, insert, delete on public.feedback to authenticated;
+grant select on public.transactions to authenticated;
+grant select on public.system_settings to authenticated;
+
+grant select on public.system_settings to anon;
+grant select on public.promo_codes to anon, authenticated;
+
+alter default privileges in schema public grant all on tables to service_role;
+alter default privileges in schema public grant all on sequences to service_role;
+
 -- Explicitly grant DELETE permission to authenticated users
 grant delete on public.analysis_history to authenticated;
 

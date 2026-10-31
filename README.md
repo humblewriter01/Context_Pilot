@@ -78,6 +78,14 @@ The repository ships with a serverless-ready layout:
 Then run `supabase/schema.sql` in the Supabase SQL editor and add
 `https://<your-domain>/auth/github/callback` as the GitHub OAuth callback URL.
 
+**Post-deploy verification**
+
+| Check | Expected |
+| --- | --- |
+| `GET /api/health` | `status: healthy` and every entry under `integrations` that you configured is `true`. |
+| `GET /api/supabase/health` | `healthy: true`. If it reports `HTTP 403 … 42501`, the tables exist but lack grants — run `supabase/grants.sql`. If it reports a missing table, re-run `supabase/schema.sql`. |
+| Open the site | Redirects to the Supabase sign-in screen; `/admin` requires the `ADMIN_EMAIL` account. |
+
 Note: pricing, limits and promo codes are stored in Supabase
 (`system_settings`, `promo_codes`), so admin changes survive serverless cold starts.
 

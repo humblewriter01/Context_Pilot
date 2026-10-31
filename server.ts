@@ -2438,7 +2438,8 @@ app.get('/api/supabase/status', (_req, res) => {
 });
 
 // Supabase schema/database reachability check (used to validate a fresh deployment).
-// Reports which public tables the service role can actually read.
+// Uses direct PostgREST reads so missing tables and missing GRANTs are reported
+// separately (supabase-js surfaces permission errors without a message).
 app.get('/api/supabase/health', async (_req, res) => {
   const tables = [
     'users',
@@ -2457,59 +2458,44 @@ app.get('/api/supabase/health', async (_req, res) => {
     });
   }
 
-  // Low-level probe so network/key problems are distinguishable from schema gaps.
-  let probe = '';
-  let tableProbe = '';
-  try {
-    const probeRes = await fetch(`${supabaseUrl.replace(/\/$/, '')}/rest/v1/`, {
-      headers: {
-        apikey: supabaseServiceRoleKey || supabaseAnonKey,
-        Authorization: `Bearer ${supabaseServiceRoleKey || supabaseAnonKey}`,
-      },
-    });
-    probe = `HTTP ${probeRes.status} ${probeRes.statusText}`;
-  } catch (err: any) {
-    probe = `network error: ${err?.name || 'Error'} ${err?.message || ''} ${
-      (err as any)?.cause?.code || (err as any)?.cause?.message || ''
-    }`.trim();
-  }
-
-  // Direct PostgREST read (bypasses supabase-js) to isolate client-side issues.
-  try {
-    const key = supabaseServiceRoleKey || supabaseAnonKey;
-    const rawRes = await fetch(`${supabaseUrl.replace(/\/$/, '')}/rest/v1/system_settings?select=id&limit=1`, {
-      headers: { apikey: key, Authorization: `Bearer ${key}` },
-    });
-    const body = await rawRes.text();
-    tableProbe = `HTTP ${rawRes.status} ${body.slice(0, 160)}`;
-  } catch (err: any) {
-    tableProbe = `network error: ${err?.name || 'Error'} ${err?.message || ''}`.trim();
-  }
+  const baseUrl = supabaseUrl.replace(/\/$/, '');
+  const key = supabaseServiceRoleKey || supabaseAnonKey;
 
   const results: Record<string, string> = {};
   for (const table of tables) {
     try {
-      const { error } = await supabaseAdmin.from(table).select('*', { count: 'exact', head: true });
-      results[table] = error
-        ? `error: ${error.message || '(no message)'} [code=${error.code || '-'} details=${error.details || '-'} hint=${error.hint || '-'}]`
-        : 'ok';
+      const response = await fetch(`${baseUrl}/rest/v1/${table}?select=*&limit=1`, {
+        headers: { apikey: key, Authorization: `Bearer ${key}` },
+      });
+      if (response.ok) {
+        results[table] = 'ok';
+        continue;
+      }
+      const body = await response.text();
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        // non-JSON error body
+      }
+      results[table] = `HTTP ${response.status} ${parsed?.code || ''} ${parsed?.message || body.slice(0, 120)}`.trim();
     } catch (err: any) {
-      results[table] = `exception: ${err?.name || 'Error'}: ${err?.message || String(err)} ${
-        (err as any)?.cause?.code || ''
-      }`.trim();
+      results[table] = `network error: ${err?.name || 'Error'} ${err?.message || ''}`.trim();
     }
   }
 
   const healthy = Object.values(results).every((value) => value === 'ok');
+  const permissionDenied = Object.values(results).some((value) => value.includes('42501'));
+
   return res.status(healthy ? 200 : 500).json({
     configured: true,
     healthy,
-    restProbe: probe,
-    tableProbe,
     tables: results,
     hint: healthy
-      ? 'All required tables are readable.'
-      : 'Run supabase/schema.sql in the Supabase SQL editor for the missing tables.',
+      ? 'All required tables are readable with the service role key.'
+      : permissionDenied
+      ? 'Tables exist but the service_role role lacks privileges. Run supabase/grants.sql in the Supabase SQL editor.'
+      : 'Run supabase/schema.sql in the Supabase SQL editor to create the missing tables.',
   });
 });
 
