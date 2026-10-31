@@ -2404,6 +2404,17 @@ app.get('/api/health', (_req, res) => {
     status: 'healthy',
     service: 'Context Pilot API',
     timestamp: new Date().toISOString(),
+    environment: process.env.VERCEL ? 'vercel' : process.env.NODE_ENV || 'development',
+    integrations: {
+      supabase: Boolean(supabaseUrl && (supabaseServiceRoleKey || supabaseAnonKey)),
+      supabaseServiceRole: Boolean(supabaseServiceRoleKey),
+      supabaseUrlConfigured: Boolean(supabaseUrl),
+      gemini: Boolean((process.env.GEMINI_API_KEY || '').trim()),
+      geminiModel: GEMINI_MODEL,
+      paystack: Boolean(process.env.PAYSTACK_SECRET_KEY),
+      githubOAuth: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
+      adminEmailConfigured: Boolean(process.env.ADMIN_EMAIL),
+    },
   });
 });
 
