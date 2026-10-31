@@ -18,7 +18,7 @@ import {
 } from 'lucide-react';
 import { JiraAnalyzerPopover } from './JiraAnalyzerPopover';
 import { storageService } from '../services/storage';
-import { supabase } from '../services/supabase';
+import { getAuthHeaders } from '../services/supabase';
 
 interface HistoryFeedbackViewProps {
   analyses: AnalysisRecord[];
@@ -54,30 +54,11 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
       a.reasoning.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  // Helper to obtain auth headers for backend DELETE endpoints
-  const getAuthHeaders = async (): Promise<Record<string, string>> => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json'
-    };
-
-    const user = storageService.getUser();
-    if (user?.email) {
-      headers['x-user-email'] = user.email;
-    }
-
-    if (supabase) {
-      try {
-        const { data: { session } } = await supabase.auth.getSession();
-        if (session?.access_token) {
-          headers['Authorization'] = `Bearer ${session.access_token}`;
-        }
-      } catch (e) {
-        console.warn('Could not read session token', e);
-      }
-    }
-
-    return headers;
-  };
+  // Helper to obtain verified auth headers for backend DELETE endpoints
+  const buildAuthHeaders = async (): Promise<Record<string, string>> => ({
+    'Content-Type': 'application/json',
+    ...(await getAuthHeaders()),
+  });
 
   // Execute deletion after user confirms in the modal
   const handleConfirmDelete = async () => {
@@ -85,7 +66,7 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
     setIsDeleting(true);
 
     try {
-      const headers = await getAuthHeaders();
+      const headers = await buildAuthHeaders();
 
       if (deleteTarget.type === 'single') {
         const targetId = deleteTarget.record.id;
@@ -103,10 +84,13 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
 
         // 2. Dispatch DELETE request to backend
         try {
-          await fetch(`/api/history/${encodeURIComponent(targetId)}`, {
+          const res = await fetch(`/api/history/${encodeURIComponent(targetId)}`, {
             method: 'DELETE',
             headers
           });
+          if (!res.ok) {
+            console.warn('Backend delete failed with status', res.status);
+          }
         } catch (apiErr) {
           console.warn('Backend delete notification error:', apiErr);
         }
@@ -120,10 +104,13 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
 
         // 2. Dispatch DELETE request to backend
         try {
-          await fetch('/api/history', {
+          const res = await fetch('/api/history', {
             method: 'DELETE',
             headers
           });
+          if (!res.ok) {
+            console.warn('Backend clear-history failed with status', res.status);
+          }
         } catch (apiErr) {
           console.warn('Backend clear history error:', apiErr);
         }

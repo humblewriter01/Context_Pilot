@@ -68,6 +68,7 @@ export const AccountModal: React.FC<AccountModalProps> = ({
   const [confirmDeleteModal, setConfirmDeleteModal] = useState(false);
   const [deleteConfirmationText, setDeleteConfirmationText] = useState('');
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   if (!isOpen) return null;
 
@@ -92,16 +93,21 @@ export const AccountModal: React.FC<AccountModalProps> = ({
     setTimeout(() => setGhSaved(false), 2500);
   };
 
-  const handleConfirmAccountDeletion = () => {
+  const handleConfirmAccountDeletion = async () => {
     if (deleteConfirmationText.trim().toUpperCase() !== 'DELETE') {
       setDeleteError('Please type DELETE to confirm account deletion.');
       return;
     }
 
-    storageService.deleteAccount();
-    setConfirmDeleteModal(false);
-    onAccountDeleted();
-    onClose();
+    setIsDeleting(true);
+    try {
+      await storageService.deleteAccount();
+      setConfirmDeleteModal(false);
+      onAccountDeleted();
+      onClose();
+    } finally {
+      setIsDeleting(false);
+    }
   };
 
   return (
@@ -463,16 +469,18 @@ export const AccountModal: React.FC<AccountModalProps> = ({
               <button
                 type="button"
                 onClick={() => setConfirmDeleteModal(false)}
-                className="flex-1 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold transition-colors cursor-pointer"
+                disabled={isDeleting}
+                className="flex-1 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 Cancel
               </button>
               <button
                 type="button"
                 onClick={handleConfirmAccountDeletion}
-                className="flex-1 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition-colors shadow-xs cursor-pointer"
+                disabled={isDeleting}
+                className="flex-1 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition-colors shadow-xs cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                Confirm Delete
+                {isDeleting ? 'Deleting…' : 'Confirm Delete'}
               </button>
             </div>
           </div>

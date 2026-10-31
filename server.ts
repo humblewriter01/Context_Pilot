@@ -1,7 +1,6 @@
 import express from 'express';
 import fs from 'fs';
 import crypto from 'crypto';
-import { createServer as createViteServer, build as buildVite } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
@@ -10,8 +9,17 @@ import { fileURLToPath } from 'url';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Resolve the module directory in both ESM (tsx / node) and bundled CJS
+// (Vercel serverless) hosts. Falls back to the working directory when the
+// module URL is unavailable, which is enough for the serverless entry point.
+const __dirname = (() => {
+  try {
+    const metaUrl = typeof import.meta !== 'undefined' ? import.meta.url : '';
+    return metaUrl ? path.dirname(fileURLToPath(metaUrl)) : process.cwd();
+  } catch {
+    return process.cwd();
+  }
+})();
 
 const app = express();
 
@@ -58,15 +66,27 @@ if (supabaseAdmin) {
   }
 }
 
-// Initialize Google Gen AI client with server-side API key if available
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
-});
+// Supported production Gemini model (override with GEMINI_MODEL if needed).
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+// Lazily create the Google Gen AI client so importing this module never throws
+// when GEMINI_API_KEY is absent (e.g. during builds or cold starts).
+let aiClient: GoogleGenAI | null = null;
+function getAiClient(): GoogleGenAI | null {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey) return null;
+  if (!aiClient) {
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'context-pilot',
+        },
+      },
+    });
+  }
+  return aiClient;
+}
 
 interface StoredUser {
   id: number;
@@ -132,6 +152,303 @@ const SERVER_STORE = {
   },
 };
 
+// ==========================================
+// Shared helpers: persistence, auth, escaping
+// ==========================================
+
+// Configurable conversion rate used when a fixed NGN promo discount is applied to a USD charge.
+const USD_NGN_RATE = Number(process.env.USD_NGN_RATE) || 1500;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+type ServerSettings = typeof SERVER_STORE.settings;
+
+function escapeHtml(value: unknown): string {
+  const map: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  return String(value ?? '').replace(/[&<>"']/g, (ch) => map[ch]);
+}
+
+/** Serializes a value for safe inlining inside a <script> block. */
+function toInlineJson(value: unknown): string {
+  return JSON.stringify(value ?? null)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+// ---------------------------------------------------------
+// Pricing / limits settings persisted in public.system_settings
+// ---------------------------------------------------------
+let settingsHydratedAt = 0;
+let settingsHydration: Promise<void> | null = null;
+const SETTINGS_TTL_MS = 15_000;
+
+function mapSettingsRow(row: any, base: ServerSettings): ServerSettings {
+  return {
+    ...base,
+    currency: row.currency === 'USD' ? 'USD' : 'NGN',
+    proPriceNgn: Number(row.pro_price_ngn ?? base.proPriceNgn),
+    proPriceUsd: Number(row.pro_price_usd ?? base.proPriceUsd),
+    enterprisePriceNgn: Number(row.enterprise_price_ngn ?? base.enterprisePriceNgn),
+    enterprisePriceUsd: Number(row.enterprise_price_usd ?? base.enterprisePriceUsd),
+    freeLimit: Number(row.free_limit ?? base.freeLimit),
+    proLimit: Number(row.pro_limit ?? base.proLimit),
+    isLiveMode: Boolean(row.is_live_mode ?? base.isLiveMode),
+  };
+}
+
+/**
+ * Loads DB-backed pricing settings into the in-memory cache.
+ * Safe no-op when Supabase is not configured or the table is missing.
+ */
+async function hydrateSettings(force = false): Promise<void> {
+  if (!supabaseAdmin) return;
+  if (!force && settingsHydratedAt && Date.now() - settingsHydratedAt < SETTINGS_TTL_MS) return;
+  if (settingsHydration) return settingsHydration;
+
+  settingsHydration = (async () => {
+    try {
+      const { data, error } = await supabaseAdmin!
+        .from('system_settings')
+        .select('*')
+        .eq('id', 1)
+        .maybeSingle();
+      if (!error && data) {
+        SERVER_STORE.settings = mapSettingsRow(data, SERVER_STORE.settings);
+      } else if (error) {
+        console.warn('[Settings Hydration Warning]:', error.message);
+      }
+      settingsHydratedAt = Date.now();
+    } catch (err) {
+      console.warn('[Settings Hydration Error]:', err);
+    } finally {
+      settingsHydration = null;
+    }
+  })();
+
+  return settingsHydration;
+}
+
+/** Persists the current pricing settings to Supabase (no-op without a service role). */
+async function persistSettings(): Promise<void> {
+  if (!supabaseAdmin) return;
+  const s = SERVER_STORE.settings;
+  try {
+    const { error } = await supabaseAdmin.from('system_settings').upsert(
+      {
+        id: 1,
+        currency: s.currency,
+        pro_price_ngn: Math.round(s.proPriceNgn),
+        pro_price_usd: s.proPriceUsd,
+        enterprise_price_ngn: Math.round(s.enterprisePriceNgn),
+        enterprise_price_usd: s.enterprisePriceUsd,
+        free_limit: s.freeLimit,
+        pro_limit: s.proLimit,
+        is_live_mode: s.isLiveMode,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'id' }
+    );
+    if (error) console.warn('[Settings Persist Warning]:', error.message);
+    settingsHydratedAt = Date.now();
+  } catch (err) {
+    console.warn('[Settings Persist Error]:', err);
+  }
+}
+
+// ---------------------------------------------------------
+// Promo codes persisted in public.promo_codes
+// ---------------------------------------------------------
+function mapPromoRow(row: any): StoredPromoCode {
+  const tiers: ('pro' | 'enterprise')[] = Array.isArray(row.applicable_tiers)
+    ? row.applicable_tiers.filter((t: any) => t === 'pro' || t === 'enterprise')
+    : ['pro', 'enterprise'];
+
+  return {
+    id: String(row.id ?? row.code),
+    code: String(row.code || '').trim().toUpperCase(),
+    discountType: row.discount_type === 'fixed' ? 'fixed' : 'percentage',
+    discountValue: Number(row.discount_value ?? 0),
+    applicableTiers: tiers.length > 0 ? tiers : ['pro', 'enterprise'],
+    maxUses: typeof row.max_uses === 'number' ? row.max_uses : -1,
+    usedCount: Number(row.times_used ?? 0),
+    isActive: Boolean(row.is_active),
+    expiresAt: row.expires_at || undefined,
+    createdAt: row.created_at || new Date().toISOString(),
+  };
+}
+
+async function listPromos(): Promise<StoredPromoCode[]> {
+  if (supabaseAdmin) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('promo_codes')
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (!error && data) {
+        const promos = data.map(mapPromoRow);
+        SERVER_STORE.promos = promos;
+        return promos;
+      }
+      if (error) console.warn('[Promo Fetch Warning]:', error.message);
+    } catch (err) {
+      console.warn('[Promo Fetch Error]:', err);
+    }
+  }
+  return [...SERVER_STORE.promos];
+}
+
+async function findPromoByCode(code: string): Promise<StoredPromoCode | null> {
+  const normalized = (code || '').trim().toUpperCase();
+  if (!normalized) return null;
+
+  if (supabaseAdmin) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('promo_codes')
+        .select('*')
+        .eq('code', normalized)
+        .maybeSingle();
+      if (!error && data) return mapPromoRow(data);
+      if (error) console.warn('[Promo Lookup Warning]:', error.message);
+    } catch (err) {
+      console.warn('[Promo Lookup Error]:', err);
+    }
+  }
+  return SERVER_STORE.promos.find((p) => p.code.toUpperCase() === normalized) || null;
+}
+
+/** Increments a promo redemption count in memory and in Supabase. */
+async function incrementPromoUsage(promo: StoredPromoCode): Promise<void> {
+  const nextCount = (promo.usedCount || 0) + 1;
+  promo.usedCount = nextCount;
+  const mem = SERVER_STORE.promos.find((p) => p.id === promo.id);
+  if (mem) mem.usedCount = nextCount;
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from('promo_codes').update({ times_used: nextCount }).eq('id', promo.id);
+    } catch (err) {
+      console.warn('[Promo Usage Update Warning]:', err);
+    }
+  }
+}
+
+/** Computes the discount for an amount. Fixed discounts are defined in NGN. */
+function computePromoDiscount(promo: StoredPromoCode, amount: number, currency: 'NGN' | 'USD'): number {
+  if (!Number.isFinite(amount) || amount <= 0) return 0;
+  if (promo.discountType === 'percentage') {
+    return Math.round(amount * promo.discountValue) / 100;
+  }
+  const fixed = currency === 'USD' ? promo.discountValue / USD_NGN_RATE : promo.discountValue;
+  return Math.min(amount, Math.round(fixed * 100) / 100);
+}
+
+function isPromoRedeemable(promo: StoredPromoCode): string | null {
+  if (!promo.isActive) return 'This promo code is currently disabled.';
+  if (promo.expiresAt && new Date(promo.expiresAt).getTime() < Date.now()) {
+    return 'This promo code has expired.';
+  }
+  if (promo.maxUses !== -1 && promo.usedCount >= promo.maxUses) {
+    return 'This promo code has reached its maximum redemptions.';
+  }
+  return null;
+}
+
+// ---------------------------------------------------------
+// Supabase user lookup helpers (safe, parameterised identifiers)
+// ---------------------------------------------------------
+function identifierColumn(identifier: string): { column: string; value: string } {
+  const raw = decodeURIComponent(String(identifier || '')).trim();
+  if (EMAIL_RE.test(raw)) return { column: 'email', value: raw.toLowerCase() };
+  if (UUID_RE.test(raw)) return { column: 'id', value: raw };
+  return { column: 'auth_id', value: raw };
+}
+
+async function findUserByIdentifier(identifier: string): Promise<any | null> {
+  if (!supabaseServer) return null;
+  const { column, value } = identifierColumn(identifier);
+  if (!value) return null;
+  try {
+    const { data, error } = await supabaseServer
+      .from('users')
+      .select('*')
+      .eq(column, value)
+      .maybeSingle();
+    if (error) {
+      console.warn('[User Lookup Warning]:', error.message);
+      return null;
+    }
+    return data || null;
+  } catch (err) {
+    console.warn('[User Lookup Error]:', err);
+    return null;
+  }
+}
+
+async function updateUserByIdentifier(identifier: string, patch: Record<string, unknown>): Promise<any | null> {
+  if (!supabaseServer) return null;
+  const { column, value } = identifierColumn(identifier);
+  if (!value) return null;
+  try {
+    const { data, error } = await supabaseServer
+      .from('users')
+      .update(patch)
+      .eq(column, value)
+      .select()
+      .maybeSingle();
+    if (error) {
+      console.warn('[User Update Warning]:', error.message);
+      return null;
+    }
+    return data || null;
+  } catch (err) {
+    console.warn('[User Update Error]:', err);
+    return null;
+  }
+}
+
+/**
+ * Guarantees a public.users row exists for the signed-in identity so that
+ * quota checks and history inserts never fail on foreign keys.
+ */
+async function ensureUserProfile(email: string, authUserId?: string): Promise<void> {
+  if (!supabaseAdmin || !email) return;
+  try {
+    const row: Record<string, unknown> = { email: email.trim().toLowerCase() };
+    if (authUserId) row.auth_id = authUserId;
+    const { error } = await supabaseAdmin.from('users').upsert(row, { onConflict: 'email' });
+    if (error) console.warn('[User Profile Upsert Warning]:', error.message);
+  } catch (err) {
+    console.warn('[User Profile Upsert Error]:', err);
+  }
+}
+
+// ---------------------------------------------------------
+// Bearer token resolution (Supabase JWT verification)
+// ---------------------------------------------------------
+type AuthLookup = { status: 'none' | 'invalid' | 'valid'; user?: { id: string; email: string } };
+
+async function resolveBearerUser(req: express.Request): Promise<AuthLookup> {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return { status: 'none' };
+
+  const token = header.slice('Bearer '.length).trim();
+  if (!token || token === 'undefined' || token === 'null') return { status: 'none' };
+  if (!supabaseServer) return { status: 'invalid' };
+
+  try {
+    const { data, error } = await supabaseServer.auth.getUser(token);
+    const email = data?.user?.email;
+    if (error || !data?.user || !email) return { status: 'invalid' };
+    return { status: 'valid', user: { id: data.user.id, email: email.trim().toLowerCase() } };
+  } catch {
+    return { status: 'invalid' };
+  }
+}
+
 // Helper middleware for Admin verification strictly using Supabase JWT and ADMIN_EMAIL
 async function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
   const authHeader = req.headers.authorization;
@@ -171,7 +488,8 @@ async function requireAdmin(req: express.Request, res: express.Response, next: e
 // ==========================================
 
 // Get public Paystack config for client
-app.get('/api/paystack/config', (_req, res) => {
+app.get('/api/paystack/config', async (_req, res) => {
+  await hydrateSettings();
   const activeKey = SERVER_STORE.settings.paystackPublicKey || process.env.PAYSTACK_PUBLIC_KEY || '';
   res.json({
     publicKey: activeKey,
@@ -187,14 +505,31 @@ app.get('/api/paystack/config', (_req, res) => {
   });
 });
 
+// Monthly plan price from server settings for a given tier/currency
+function planPriceFor(tier: 'free' | 'pro' | 'enterprise', currency: 'NGN' | 'USD'): number {
+  const s = SERVER_STORE.settings;
+  if (tier === 'enterprise') return currency === 'USD' ? s.enterprisePriceUsd : s.enterprisePriceNgn;
+  if (tier === 'pro') return currency === 'USD' ? s.proPriceUsd : s.proPriceNgn;
+  return 0;
+}
+
 // Initialize Paystack transaction with promo code support
 app.post('/api/paystack/initialize', async (req, res) => {
   try {
-    const { email, amount, tier, callback_url, promo_code, currency: clientCurrency } = req.body;
+    const {
+      email,
+      amount: clientAmount,
+      tier,
+      callback_url,
+      promo_code,
+      currency: clientCurrency,
+      billing_cycle,
+    } = req.body;
+    await hydrateSettings();
     const secretKey = SERVER_STORE.settings.paystackSecretKey || process.env.PAYSTACK_SECRET_KEY;
 
-    if (!email || !amount || !tier) {
-      return res.status(400).json({ error: 'Missing required fields: email, amount, tier' });
+    if (!email || !tier || !['pro', 'enterprise'].includes(tier)) {
+      return res.status(400).json({ error: 'Missing required fields: email and a paid tier (pro or enterprise)' });
     }
 
     if (!secretKey) {
@@ -209,20 +544,31 @@ app.post('/api/paystack/initialize', async (req, res) => {
       ? clientCurrency
       : SERVER_STORE.settings.currency;
 
-    // Verify promo code discount if provided
-    let finalAmount = Number(amount);
-    if (promo_code) {
-      const promo = SERVER_STORE.promos.find(
-        (p) => p.code.toUpperCase() === promo_code.trim().toUpperCase() && p.isActive
+    // Server-authoritative pricing: the client amount is never trusted.
+    const billingCycle: 'monthly' | 'annual' = billing_cycle === 'annual' ? 'annual' : 'monthly';
+    let finalAmount = planPriceFor(tier, selectedCurrency as 'NGN' | 'USD');
+    if (billingCycle === 'annual') {
+      finalAmount = Math.round(finalAmount * 12 * 0.8);
+    }
+
+    if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
+      return res.status(500).json({ error: 'Plan pricing is not configured for this currency.' });
+    }
+
+    // Log any client/server price mismatch for observability.
+    const parsedClientAmount = Number(clientAmount);
+    if (Number.isFinite(parsedClientAmount) && Math.abs(parsedClientAmount - finalAmount) > 1) {
+      console.warn(
+        `[Pricing] Client amount ${parsedClientAmount} differs from server amount ${finalAmount} (${tier}/${selectedCurrency}/${billingCycle}).`
       );
-      if (promo && promo.applicableTiers.includes(tier)) {
-        if (promo.discountType === 'percentage') {
-          const discount = (finalAmount * promo.discountValue) / 100;
-          finalAmount = Math.max(1, finalAmount - discount);
-        } else {
-          finalAmount = Math.max(1, finalAmount - promo.discountValue);
-        }
-        promo.usedCount++;
+    }
+
+    let appliedPromo: StoredPromoCode | null = null;
+    if (promo_code) {
+      const promo = await findPromoByCode(String(promo_code));
+      if (promo && !isPromoRedeemable(promo) && promo.applicableTiers.includes(tier)) {
+        finalAmount = Math.max(1, Number((finalAmount - computePromoDiscount(promo, finalAmount, selectedCurrency as 'NGN' | 'USD')).toFixed(2)));
+        appliedPromo = promo;
       }
     }
 
@@ -240,9 +586,10 @@ app.post('/api/paystack/initialize', async (req, res) => {
         tier,
         app: 'Context Pilot',
         customer_email: email,
-        promo_code: promo_code || null,
+        promo_code: appliedPromo ? appliedPromo.code : null,
         final_amount: finalAmount,
         currency: selectedCurrency,
+        billing_cycle: billingCycle,
       },
     };
 
@@ -264,7 +611,11 @@ app.post('/api/paystack/initialize', async (req, res) => {
       });
     }
 
-    SERVER_STORE.transactions.unshift({
+    if (appliedPromo) {
+      await incrementPromoUsage(appliedPromo);
+    }
+
+    const pendingTx: StoredTransaction = {
       id: reference,
       reference,
       amount: finalAmount,
@@ -273,8 +624,33 @@ app.post('/api/paystack/initialize', async (req, res) => {
       tier,
       status: 'pending',
       createdAt: new Date().toISOString(),
-      promoCode: promo_code || undefined,
-    });
+      promoCode: appliedPromo ? appliedPromo.code : undefined,
+    };
+    SERVER_STORE.transactions.unshift(pendingTx);
+
+    // Persist the pending transaction so the admin ledger survives serverless cold starts.
+    if (supabaseAdmin) {
+      try {
+        await supabaseAdmin.from('users').upsert(
+          { email, last_login_at: new Date().toISOString() },
+          { onConflict: 'email', ignoreDuplicates: true }
+        );
+        await supabaseAdmin.from('transactions').upsert(
+          {
+            reference,
+            user_email: email,
+            tier,
+            amount: finalAmount,
+            currency: selectedCurrency,
+            promo_code: appliedPromo ? appliedPromo.code : null,
+            status: 'pending',
+          },
+          { onConflict: 'reference' }
+        );
+      } catch (persistErr) {
+        console.warn('[Pending Transaction Persist Warning]:', persistErr);
+      }
+    }
 
     return res.json({
       success: true,
@@ -339,7 +715,21 @@ app.get('/api/paystack/verify/:reference', async (req, res) => {
       SERVER_STORE.transactions.unshift(updatedTx);
     }
 
-    if (isSuccess && customerEmail) {
+    // Guard against tampered metadata/underpayment before granting a tier upgrade.
+    await hydrateSettings();
+    const paidCurrency = (txData.currency === 'USD' ? 'USD' : 'NGN') as 'NGN' | 'USD';
+    const expectedAmount = planPriceFor(tier, paidCurrency);
+    const paidAmount = Number(txData.amount || 0) / 100;
+    const hadPromo = Boolean(txData.metadata?.promo_code);
+    const isUnderpaid = !hadPromo && expectedAmount > 0 && paidAmount < expectedAmount * 0.5;
+
+    if (isSuccess && isUnderpaid) {
+      console.warn(
+        `[Paystack Verify] Underpaid transaction ${reference}: paid ${paidAmount} ${paidCurrency} for ${tier} (expected ~${expectedAmount}).`
+      );
+    }
+
+    if (isSuccess && customerEmail && !isUnderpaid) {
       const user = SERVER_STORE.users.find((u) => u.email.toLowerCase() === customerEmail.toLowerCase());
       if (user) {
         user.subscriptionTier = tier;
@@ -538,30 +928,22 @@ app.post('/api/paystack/webhook', async (req: any, res) => {
 });
 
 // Validate Promo Code (Client Checkout)
-app.post('/api/promos/validate', (req, res) => {
-  const { code, tier, amount } = req.body;
-  if (!code || !tier || typeof amount !== 'number') {
-    return res.status(400).json({ error: 'Missing code, tier, or amount' });
+app.post('/api/promos/validate', async (req, res) => {
+  const { code, tier, amount, currency } = req.body;
+  if (!code || !tier || typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'Missing code, tier, or a valid amount' });
   }
 
-  const promo = SERVER_STORE.promos.find(
-    (p) => p.code.toUpperCase() === code.trim().toUpperCase()
-  );
+  const selectedCurrency: 'NGN' | 'USD' = currency === 'USD' ? 'USD' : currency === 'NGN' ? 'NGN' : SERVER_STORE.settings.currency;
 
+  const promo = await findPromoByCode(String(code));
   if (!promo) {
     return res.status(404).json({ error: 'Promo code does not exist.' });
   }
 
-  if (!promo.isActive) {
-    return res.status(400).json({ error: 'This promo code is currently disabled.' });
-  }
-
-  if (promo.expiresAt && new Date(promo.expiresAt).getTime() < Date.now()) {
-    return res.status(400).json({ error: 'This promo code has expired.' });
-  }
-
-  if (promo.maxUses !== -1 && promo.usedCount >= promo.maxUses) {
-    return res.status(400).json({ error: 'This promo code has reached its maximum redemptions.' });
+  const notRedeemable = isPromoRedeemable(promo);
+  if (notRedeemable) {
+    return res.status(400).json({ error: notRedeemable });
   }
 
   if (!promo.applicableTiers.includes(tier)) {
@@ -570,18 +952,14 @@ app.post('/api/promos/validate', (req, res) => {
     });
   }
 
-  let discountAmount = 0;
-  if (promo.discountType === 'percentage') {
-    discountAmount = (amount * promo.discountValue) / 100;
-  } else {
-    discountAmount = promo.discountValue;
-  }
-
-  const finalAmount = Math.max(0, amount - discountAmount);
+  const discountAmount = computePromoDiscount(promo, amount, selectedCurrency);
+  const finalAmount = Math.max(0, Math.round((amount - discountAmount) * 100) / 100);
 
   return res.json({
     valid: true,
     code: promo.code,
+    applicableTiers: promo.applicableTiers,
+    currency: selectedCurrency,
     discountType: promo.discountType,
     discountValue: promo.discountValue,
     discountAmount,
@@ -799,14 +1177,9 @@ app.put('/api/admin/users/:id/tier', requireAdmin, async (req, res) => {
 
   if (supabaseServer) {
     try {
-      const { data, error } = await supabaseServer
-        .from('users')
-        .update({ subscription_tier: tier })
-        .or(`id.eq.${userId},email.eq.${userId}`)
-        .select()
-        .maybeSingle();
+      const data = await updateUserByIdentifier(userId, { subscription_tier: tier });
 
-      if (!error && data) {
+      if (data) {
         const memUser = SERVER_STORE.users.find(
           (u) => u.email.toLowerCase() === data.email.toLowerCase()
         );
@@ -843,11 +1216,7 @@ app.post('/api/admin/users/:id/reset-quota', requireAdmin, async (req, res) => {
 
   if (supabaseServer) {
     try {
-      const { data: u } = await supabaseServer
-        .from('users')
-        .select('id, email')
-        .or(`id.eq.${userId},email.eq.${userId}`)
-        .maybeSingle();
+      const u = await findUserByIdentifier(userId);
 
       if (u?.email) {
         await supabaseServer
@@ -880,14 +1249,9 @@ app.put('/api/admin/users/:id/status', requireAdmin, async (req, res) => {
 
   if (supabaseServer) {
     try {
-      const { data, error } = await supabaseServer
-        .from('users')
-        .update({ status })
-        .or(`id.eq.${userId},email.eq.${userId}`)
-        .select()
-        .maybeSingle();
+      const data = await updateUserByIdentifier(userId, { status });
 
-      if (!error && data) {
+      if (data) {
         const memUser = SERVER_STORE.users.find(
           (u) => u.email.toLowerCase() === data.email.toLowerCase()
         );
@@ -923,11 +1287,7 @@ app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
 
   if (supabaseServer) {
     try {
-      const { data: targetUser } = await supabaseServer
-        .from('users')
-        .select('id, email')
-        .or(`id.eq.${userId},email.eq.${userId}`)
-        .maybeSingle();
+      const targetUser = await findUserByIdentifier(userId);
 
       if (targetUser?.email) {
         await supabaseServer.from('feedback').delete().eq('user_email', targetUser.email);
@@ -984,10 +1344,7 @@ app.post('/api/feedback', authenticateUser, async (req: express.Request, res: ex
 
     if (supabaseServer) {
       // Ensure user profile exists in public.users to satisfy foreign key
-      await supabaseServer.from('users').upsert(
-        { email: userEmail, last_login_at: new Date().toISOString() },
-        { onConflict: 'email', ignoreDuplicates: true }
-      );
+      await ensureUserProfile(userEmail, (req as any).authUserId);
 
       const payload: any = {
         user_email: userEmail,
@@ -1062,62 +1419,153 @@ app.get('/api/feedback', authenticateUser, async (req: express.Request, res: exp
 });
 
 
-// Admin Promo Codes Management
-app.get('/api/admin/promos', requireAdmin, (_req, res) => {
-  res.json(SERVER_STORE.promos);
+// Admin Promo Codes Management (Supabase-backed, in-memory fallback)
+app.get('/api/admin/promos', requireAdmin, async (_req, res) => {
+  res.json(await listPromos());
 });
 
-app.post('/api/admin/promos', requireAdmin, (req, res) => {
+app.post('/api/admin/promos', requireAdmin, async (req, res) => {
   const { code, discountType, discountValue, applicableTiers, maxUses, expiresAt } = req.body;
-  if (!code || !discountType || typeof discountValue !== 'number') {
+  if (!code || !discountType || typeof discountValue !== 'number' || !Number.isFinite(discountValue)) {
     return res.status(400).json({ error: 'Missing required promo code fields' });
   }
+  if (discountValue <= 0) {
+    return res.status(400).json({ error: 'Discount value must be greater than zero.' });
+  }
+  if (discountType === 'percentage' && discountValue > 95) {
+    return res.status(400).json({ error: 'Percentage discount cannot exceed 95%.' });
+  }
 
-  const normalizedCode = code.trim().toUpperCase();
-  if (SERVER_STORE.promos.some((p) => p.code === normalizedCode)) {
+  const normalizedCode = String(code).trim().toUpperCase();
+  const existing = await findPromoByCode(normalizedCode);
+  if (existing) {
     return res.status(400).json({ error: `Promo code ${normalizedCode} already exists.` });
   }
+
+  const tiers: ('pro' | 'enterprise')[] = Array.isArray(applicableTiers)
+    ? applicableTiers.filter((t: any) => t === 'pro' || t === 'enterprise')
+    : ['pro', 'enterprise'];
 
   const newPromo: StoredPromoCode = {
     id: `prm_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
     code: normalizedCode,
     discountType: discountType === 'fixed' ? 'fixed' : 'percentage',
     discountValue: Number(discountValue),
-    applicableTiers: Array.isArray(applicableTiers) && applicableTiers.length > 0 ? applicableTiers : ['pro', 'enterprise'],
-    maxUses: typeof maxUses === 'number' ? maxUses : -1,
+    applicableTiers: tiers.length > 0 ? tiers : ['pro', 'enterprise'],
+    maxUses: typeof maxUses === 'number' && Number.isFinite(maxUses) ? maxUses : -1,
     usedCount: 0,
     isActive: true,
     expiresAt: expiresAt || undefined,
     createdAt: new Date().toISOString(),
   };
 
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from('promo_codes').insert({
+        id: newPromo.id,
+        code: newPromo.code,
+        discount_type: newPromo.discountType,
+        discount_value: newPromo.discountValue,
+        applicable_tiers: newPromo.applicableTiers,
+        max_uses: newPromo.maxUses,
+        times_used: 0,
+        is_active: true,
+        expires_at: newPromo.expiresAt || null,
+      });
+      if (error) {
+        console.warn('[Promo Insert Warning]:', error.message);
+      }
+    } catch (err) {
+      console.warn('[Promo Insert Error]:', err);
+    }
+  }
+
   SERVER_STORE.promos.unshift(newPromo);
   res.json({ success: true, promo: newPromo });
 });
 
-app.patch('/api/admin/promos/:id/toggle', requireAdmin, (req, res) => {
-  const promo = SERVER_STORE.promos.find((p) => p.id === (req.params.id as string));
+app.patch('/api/admin/promos/:id/toggle', requireAdmin, async (req, res) => {
+  const promoId = decodeURIComponent(req.params.id as string);
+  const promos = await listPromos();
+  const promo = promos.find((p) => p.id === promoId || p.code === promoId.toUpperCase());
   if (!promo) return res.status(404).json({ error: 'Promo code not found' });
 
-  promo.isActive = !promo.isActive;
+  const nextState = !promo.isActive;
+  promo.isActive = nextState;
+
+  const mem = SERVER_STORE.promos.find((p) => p.id === promo.id);
+  if (mem) mem.isActive = nextState;
+
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin
+        .from('promo_codes')
+        .update({ is_active: nextState })
+        .eq('id', promo.id);
+      if (error) console.warn('[Promo Toggle Warning]:', error.message);
+    } catch (err) {
+      console.warn('[Promo Toggle Error]:', err);
+    }
+  }
+
   res.json({ success: true, promo });
 });
 
-app.delete('/api/admin/promos/:id', requireAdmin, (req, res) => {
-  const idx = SERVER_STORE.promos.findIndex((p) => p.id === (req.params.id as string));
-  if (idx < 0) return res.status(404).json({ error: 'Promo code not found' });
+app.delete('/api/admin/promos/:id', requireAdmin, async (req, res) => {
+  const promoId = decodeURIComponent(req.params.id as string);
+  const promos = await listPromos();
+  const promo = promos.find((p) => p.id === promoId || p.code === promoId.toUpperCase());
+  if (!promo) return res.status(404).json({ error: 'Promo code not found' });
 
-  SERVER_STORE.promos.splice(idx, 1);
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from('promo_codes').delete().eq('id', promo.id);
+      if (error) console.warn('[Promo Delete Warning]:', error.message);
+    } catch (err) {
+      console.warn('[Promo Delete Error]:', err);
+    }
+  }
+
+  SERVER_STORE.promos = SERVER_STORE.promos.filter((p) => p.id !== promo.id);
   res.json({ success: true, message: 'Promo code deleted' });
 });
 
 // Admin Transactions Ledger
-app.get('/api/admin/transactions', requireAdmin, (_req, res) => {
+app.get('/api/admin/transactions', requireAdmin, async (_req, res) => {
+  if (supabaseAdmin) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('transactions')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(500);
+      if (!error && data) {
+        const formatted: StoredTransaction[] = data.map((t: any) => ({
+          id: t.reference,
+          reference: t.reference,
+          amount: Number(t.amount ?? 0),
+          currency: t.currency || 'NGN',
+          email: t.user_email,
+          tier: t.tier,
+          status: t.status,
+          channel: t.channel || undefined,
+          paidAt: t.paid_at || undefined,
+          createdAt: t.created_at || new Date().toISOString(),
+          promoCode: t.promo_code || undefined,
+        }));
+        return res.json(formatted);
+      }
+      if (error) console.warn('[Transactions Fetch Warning]:', error.message);
+    } catch (err) {
+      console.warn('[Transactions Fetch Error]:', err);
+    }
+  }
   res.json(SERVER_STORE.transactions);
 });
 
 // Admin Settings
-app.get('/api/admin/settings', requireAdmin, (_req, res) => {
+app.get('/api/admin/settings', requireAdmin, async (_req, res) => {
+  await hydrateSettings(true);
   const sec = SERVER_STORE.settings.paystackSecretKey || process.env.PAYSTACK_SECRET_KEY || '';
   const maskedSecret = sec ? `${sec.substring(0, 7)}...${sec.substring(sec.length - 4)}` : '';
   const ghSec = SERVER_STORE.settings.githubClientSecret || process.env.GITHUB_CLIENT_SECRET || '';
@@ -1140,11 +1588,12 @@ app.get('/api/admin/settings', requireAdmin, (_req, res) => {
     proLimit: SERVER_STORE.settings.proLimit,
     maintenanceMode: SERVER_STORE.settings.maintenanceMode,
     adminEmail: SERVER_STORE.settings.adminEmail,
-    geminiModel: 'gemini-3.8-flash',
+    geminiModel: GEMINI_MODEL,
+    settingsPersisted: Boolean(supabaseAdmin && supabaseServiceRoleKey),
   });
 });
 
-app.post('/api/admin/settings', requireAdmin, (req, res) => {
+app.post('/api/admin/settings', requireAdmin, async (req, res) => {
   const {
     paystackPublicKey,
     paystackSecretKey,
@@ -1177,22 +1626,50 @@ app.post('/api/admin/settings', requireAdmin, (req, res) => {
   if (freeLimit !== undefined) SERVER_STORE.settings.freeLimit = Number(freeLimit);
   if (proLimit !== undefined) SERVER_STORE.settings.proLimit = Number(proLimit);
 
+  if (currency !== undefined && currency !== 'NGN' && currency !== 'USD') {
+    SERVER_STORE.settings.currency = 'NGN';
+  }
+
+  await persistSettings();
+
   res.json({
     success: true,
-    message: 'System settings updated successfully',
+    message: supabaseAdmin
+      ? 'System settings updated and saved to Supabase.'
+      : 'System settings updated in memory only (Supabase service role key not configured).',
+    persisted: Boolean(supabaseAdmin),
   });
 });
 
-// User Account Self-Deletion Endpoint
-app.post('/api/auth/delete-account', (req, res) => {
-  const { email } = req.body;
-  if (email) {
-    const idx = SERVER_STORE.users.findIndex((u) => u.email.toLowerCase() === email.toLowerCase());
-    if (idx >= 0) {
-      SERVER_STORE.users.splice(idx, 1);
+// User Account Self-Deletion Endpoint (requires a verified Supabase session)
+app.post('/api/auth/delete-account', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+  const authUserId = (req as any).authUserId as string;
+
+  try {
+    if (supabaseAdmin) {
+      // Delete dependent records first to satisfy foreign keys.
+      await supabaseAdmin.from('feedback').delete().eq('user_email', userEmail);
+      await supabaseAdmin.from('analysis_history').delete().eq('user_email', userEmail);
+      await supabaseAdmin.from('user_usage').delete().eq('user_email', userEmail);
+      await supabaseAdmin.from('transactions').delete().eq('user_email', userEmail);
+      await supabaseAdmin.from('users').delete().eq('email', userEmail);
     }
+
+    // Remove the Supabase Auth identity when a service role key is configured.
+    if (supabaseAdmin && supabaseServiceRoleKey && authUserId) {
+      const { error } = await supabaseAdmin.auth.admin.deleteUser(authUserId);
+      if (error) console.warn('[Delete Account Auth Warning]:', error.message);
+    }
+
+    const idx = SERVER_STORE.users.findIndex((u) => u.email.toLowerCase() === userEmail);
+    if (idx >= 0) SERVER_STORE.users.splice(idx, 1);
+
+    return res.json({ success: true, message: 'Account and associated data deleted.' });
+  } catch (err: any) {
+    console.error('Account deletion error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to delete account.' });
   }
-  res.json({ success: true });
 });
 
 // ==========================================
@@ -1200,7 +1677,8 @@ app.post('/api/auth/delete-account', (req, res) => {
 // ==========================================
 
 // Get GitHub OAuth authorization URL
-app.get('/api/auth/github/url', (req, res) => {
+app.get('/api/auth/github/url', async (req, res) => {
+  await hydrateSettings();
   const clientId = SERVER_STORE.settings.githubClientId || process.env.GITHUB_CLIENT_ID || '';
   const clientSecret = SERVER_STORE.settings.githubClientSecret || process.env.GITHUB_CLIENT_SECRET || '';
 
@@ -1230,17 +1708,20 @@ app.get(['/auth/github/callback', '/auth/github/callback/'], async (req, res) =>
   const { code, error, error_description } = req.query;
 
   if (error) {
+    const safeError = escapeHtml(error);
+    const safeDescription = escapeHtml(error_description || error);
+
     return res.send(`
       <html>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; background: #0f172a; color: #f87171; margin: 0;">
           <div style="background: #1e293b; padding: 28px; border-radius: 12px; max-width: 420px; text-align: center; border: 1px solid #334155; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
             <h3 style="margin-top: 0; color: #f87171;">GitHub Authorization Denied</h3>
-            <p style="font-size: 13px; color: #94a3b8; line-height: 1.5;">${error_description || error}</p>
+            <p style="font-size: 13px; color: #94a3b8; line-height: 1.5;">${safeDescription}</p>
             <button onclick="window.close()" style="background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; margin-top: 14px;">Close Window</button>
           </div>
           <script>
             if (window.opener) {
-              window.opener.postMessage({ type: 'GITHUB_OAUTH_ERROR', error: '${error}' }, '*');
+              window.opener.postMessage({ type: 'GITHUB_OAUTH_ERROR', error: ${toInlineJson(String(error))} }, '*');
             }
           </script>
         </body>
@@ -1248,6 +1729,7 @@ app.get(['/auth/github/callback', '/auth/github/callback/'], async (req, res) =>
     `);
   }
 
+  await hydrateSettings();
   const clientId = SERVER_STORE.settings.githubClientId || process.env.GITHUB_CLIENT_ID || '';
   const clientSecret = SERVER_STORE.settings.githubClientSecret || process.env.GITHUB_CLIENT_SECRET || '';
 
@@ -1298,7 +1780,7 @@ app.get(['/auth/github/callback', '/auth/github/callback/'], async (req, res) =>
 
     const ghUserData = userRes.ok ? await userRes.json() : null;
 
-    const payload = JSON.stringify({
+    const payload = toInlineJson({
       type: 'GITHUB_OAUTH_SUCCESS',
       token: accessToken,
       user: {
@@ -1334,12 +1816,13 @@ app.get(['/auth/github/callback', '/auth/github/callback/'], async (req, res) =>
       </html>
     `);
   } catch (err: any) {
+    const safeMessage = escapeHtml(err?.message || 'Failed to exchange authorization code.');
     res.status(500).send(`
       <html>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; background: #0f172a; color: #f87171; margin: 0;">
           <div style="background: #1e293b; padding: 28px; border-radius: 12px; max-width: 440px; text-align: center; border: 1px solid #334155;">
             <h3 style="margin-top: 0;">Authentication Error</h3>
-            <p style="font-size: 13px; color: #94a3b8; line-height: 1.5;">${err?.message || 'Failed to exchange authorization code.'}</p>
+            <p style="font-size: 13px; color: #94a3b8; line-height: 1.5;">${safeMessage}</p>
             <button onclick="window.close()" style="background: #475569; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; margin-top: 14px;">Close</button>
           </div>
         </body>
@@ -1435,8 +1918,16 @@ async function handleTicketAnalysis(req: express.Request, res: express.Response)
     return res.status(400).json({ error: 'Missing or insufficient ticket_text for analysis' });
   }
 
+  await hydrateSettings();
+
   const key = ticket_key || 'TICKET-LIVE';
-  const email = (user_email || (req.headers['x-user-email'] as string) || '').toLowerCase().trim();
+
+  // Prefer the verified Supabase identity over any client-supplied email.
+  const auth = await resolveBearerUser(req);
+  if (auth.status === 'invalid') {
+    return res.status(401).json({ error: 'Invalid or expired authentication session. Please sign in again.' });
+  }
+  const email = (auth.user?.email || user_email || (req.headers['x-user-email'] as string) || '').toLowerCase().trim();
   const currentMonth = getCurrentMonthYear();
 
   let userTier: 'free' | 'pro' | 'enterprise' = 'free';
@@ -1445,6 +1936,8 @@ async function handleTicketAnalysis(req: express.Request, res: express.Response)
 
   // 1. Quota Enforcement: Check user status and monthly limit before running AI
   if (email) {
+    await ensureUserProfile(email, auth.user?.id);
+
     if (supabaseAdmin) {
       try {
         // Fetch user profile from Supabase
@@ -1525,8 +2018,9 @@ async function handleTicketAnalysis(req: express.Request, res: express.Response)
 
   // 2. Run AI Analysis
   let analysisResult: any = null;
+  const ai = getAiClient();
 
-  if (process.env.GEMINI_API_KEY) {
+  if (ai) {
     try {
       const prompt = `Act as a senior software architect and tech lead. Analyze this Jira ticket carefully and predict all codebase files, components, and endpoints that will need to be added or modified.
 
@@ -1544,7 +2038,7 @@ Categorize files into:
 Be realistic, precise, and practical for production codebases.`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: GEMINI_MODEL,
         contents: prompt,
         config: {
           systemInstruction:
@@ -1634,7 +2128,7 @@ Be realistic, precise, and practical for production codebases.`;
         );
 
         // Record in analysis_history table
-        await supabaseAdmin.from('analysis_history').insert({
+        const { data: historyRow, error: historyErr } = await supabaseAdmin.from('analysis_history').insert({
           user_email: email,
           ticket_key: key,
           ticket_title: ticket_title || key,
@@ -1648,7 +2142,13 @@ Be realistic, precise, and practical for production codebases.`;
           confidence_score: analysisResult.confidence_score,
           total_files: analysisResult.total_files,
           processing_time_ms: processingTimeMs,
-        });
+        }).select('id').single();
+
+        if (historyErr) {
+          console.warn('[Analysis History Persist Warning]:', historyErr.message);
+        } else if (historyRow?.id) {
+          analysisResult.historyId = historyRow.id;
+        }
       } catch (persistErr) {
         console.warn('[Supabase Quota Update Warning]:', persistErr);
       }
@@ -1678,36 +2178,126 @@ app.post('/api/analyze', handleTicketAnalysis);
 // ==========================================
 async function authenticateUser(req: express.Request, res: express.Response, next: express.NextFunction) {
   try {
-    const authHeader = req.headers.authorization;
-    const emailHeader = (req.headers['x-user-email'] as string)?.trim()?.toLowerCase();
-    let userEmail = '';
+    const auth = await resolveBearerUser(req);
 
-    // 1. Verify via Supabase JWT if present
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.split('Bearer ')[1]?.trim();
-      if (supabaseAdmin && token && token !== 'undefined' && token !== 'null') {
-        const { data, error } = await supabaseAdmin.auth.getUser(token);
-        if (!error && data?.user?.email) {
-          userEmail = data.user.email.toLowerCase().trim();
-        }
-      }
+    if (auth.status === 'invalid') {
+      return res.status(401).json({ error: 'Invalid or expired authentication session. Please sign in again.' });
     }
 
-    // 2. Fallback to client user email header if session token was not exchanged
-    if (!userEmail && emailHeader) {
-      userEmail = emailHeader;
+    if (auth.status !== 'valid' || !auth.user) {
+      return res.status(401).json({ error: 'Authentication required. Please sign in to continue.' });
     }
 
-    if (!userEmail) {
-      return res.status(401).json({ error: 'Authentication required. Please sign in to manage history.' });
-    }
-
-    (req as any).userEmail = userEmail;
+    (req as any).userEmail = auth.user.email;
+    (req as any).authUserId = auth.user.id;
     next();
   } catch (err: any) {
     return res.status(401).json({ error: 'Authentication failed: ' + (err?.message || 'Invalid token') });
   }
 }
+
+// ==========================================
+// Authenticated History & Account Sync Endpoints
+// ==========================================
+
+// GET /api/history - List the signed-in user's analysis history from Supabase
+app.get('/api/history', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+
+  if (!supabaseAdmin) {
+    return res.json([]);
+  }
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('analysis_history')
+      .select('*')
+      .eq('user_email', userEmail)
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    if (error) {
+      console.warn('[History Fetch Warning]:', error.message);
+      return res.json([]);
+    }
+
+    return res.json(data || []);
+  } catch (err: any) {
+    console.error('History fetch error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to load history.' });
+  }
+});
+
+// GET /api/user/sync - Authoritative tier + quota snapshot for the signed-in user
+app.get('/api/user/sync', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+  const authUserId = (req as any).authUserId as string | undefined;
+  const currentMonth = getCurrentMonthYear();
+
+  await hydrateSettings();
+  await ensureUserProfile(userEmail, authUserId);
+
+  let tier: 'free' | 'pro' | 'enterprise' = 'free';
+  let status: 'active' | 'suspended' = 'active';
+  let displayName = userEmail.split('@')[0];
+  let photoUrl: string | undefined;
+  let ticketsProcessed = 0;
+  let monthlyLimit = SERVER_STORE.settings.freeLimit || 10;
+
+  if (supabaseAdmin) {
+    try {
+      const { data: profile } = await supabaseAdmin
+        .from('users')
+        .select('display_name, photo_url, subscription_tier, status')
+        .eq('email', userEmail)
+        .maybeSingle();
+
+      if (profile) {
+        tier = (profile.subscription_tier as 'free' | 'pro' | 'enterprise') || 'free';
+        status = (profile.status as 'active' | 'suspended') || 'active';
+        displayName = profile.display_name || displayName;
+        photoUrl = profile.photo_url || undefined;
+      }
+
+      monthlyLimit =
+        tier === 'enterprise'
+          ? -1
+          : tier === 'pro'
+          ? (SERVER_STORE.settings.proLimit || 150)
+          : (SERVER_STORE.settings.freeLimit || 10);
+
+      const { data: usageRow } = await supabaseAdmin
+        .from('user_usage')
+        .select('tickets_processed, monthly_limit')
+        .eq('user_email', userEmail)
+        .eq('month_year', currentMonth)
+        .maybeSingle();
+
+      if (usageRow) {
+        ticketsProcessed = Number(usageRow.tickets_processed ?? 0);
+        if (typeof usageRow.monthly_limit === 'number' && usageRow.monthly_limit !== 0) {
+          monthlyLimit = usageRow.monthly_limit;
+        }
+      }
+    } catch (err) {
+      console.warn('[User Sync Warning]:', err);
+    }
+  }
+
+  return res.json({
+    email: userEmail,
+    displayName,
+    photoUrl,
+    subscriptionTier: tier,
+    status,
+    usage: {
+      monthYear: currentMonth,
+      ticketsProcessed,
+      monthlyLimit,
+      remainingTickets: monthlyLimit === -1 ? -1 : Math.max(0, monthlyLimit - ticketsProcessed),
+    },
+  });
+});
 
 // ==========================================
 // Audit History Deletion Endpoints
@@ -1750,12 +2340,14 @@ app.delete('/api/history/:id', authenticateUser, async (req: express.Request, re
           return res.status(500).json({ error: deleteErr.message || 'Failed to delete record from Supabase.' });
         }
       } else {
-        // Fallback delete if recordId was passed as ticketKey or numeric ID
+        // Fallback delete by ticket key when the client did not have a database UUID.
+        const decodedId = decodeURIComponent(recordId);
+        const idColumn = UUID_RE.test(decodedId) ? 'id' : 'ticket_key';
         await supabaseAdmin
           .from('analysis_history')
           .delete()
           .eq('user_email', userEmail)
-          .or(`id.eq.${recordId},ticket_key.eq.${recordId}`);
+          .eq(idColumn, decodedId);
       }
     }
 
@@ -1821,6 +2413,17 @@ app.get('/api/health', (_req, res) => {
     status: 'healthy',
     service: 'Context Pilot API',
     timestamp: new Date().toISOString(),
+    environment: process.env.VERCEL ? 'vercel' : process.env.NODE_ENV || 'development',
+    integrations: {
+      supabase: Boolean(supabaseUrl && (supabaseServiceRoleKey || supabaseAnonKey)),
+      supabaseServiceRole: Boolean(supabaseServiceRoleKey),
+      supabaseUrlConfigured: Boolean(supabaseUrl),
+      gemini: Boolean((process.env.GEMINI_API_KEY || '').trim()),
+      geminiModel: GEMINI_MODEL,
+      paystack: Boolean(process.env.PAYSTACK_SECRET_KEY),
+      githubOAuth: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
+      adminEmailConfigured: Boolean(process.env.ADMIN_EMAIL),
+    },
   });
 });
 
@@ -1831,6 +2434,68 @@ app.get('/api/supabase/status', (_req, res) => {
     hasUrl: Boolean(process.env.SUPABASE_URL),
     hasAnonKey: Boolean(process.env.SUPABASE_ANON_KEY),
     hasServiceKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+  });
+});
+
+// Supabase schema/database reachability check (used to validate a fresh deployment).
+// Uses direct PostgREST reads so missing tables and missing GRANTs are reported
+// separately (supabase-js surfaces permission errors without a message).
+app.get('/api/supabase/health', async (_req, res) => {
+  const tables = [
+    'users',
+    'user_usage',
+    'analysis_history',
+    'feedback',
+    'promo_codes',
+    'transactions',
+    'system_settings',
+  ];
+
+  if (!supabaseAdmin) {
+    return res.status(503).json({
+      configured: false,
+      error: 'Supabase service role client is not configured on the server.',
+    });
+  }
+
+  const baseUrl = supabaseUrl.replace(/\/$/, '');
+  const key = supabaseServiceRoleKey || supabaseAnonKey;
+
+  const results: Record<string, string> = {};
+  for (const table of tables) {
+    try {
+      const response = await fetch(`${baseUrl}/rest/v1/${table}?select=*&limit=1`, {
+        headers: { apikey: key, Authorization: `Bearer ${key}` },
+      });
+      if (response.ok) {
+        results[table] = 'ok';
+        continue;
+      }
+      const body = await response.text();
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        // non-JSON error body
+      }
+      results[table] = `HTTP ${response.status} ${parsed?.code || ''} ${parsed?.message || body.slice(0, 120)}`.trim();
+    } catch (err: any) {
+      results[table] = `network error: ${err?.name || 'Error'} ${err?.message || ''}`.trim();
+    }
+  }
+
+  const healthy = Object.values(results).every((value) => value === 'ok');
+  const permissionDenied = Object.values(results).some((value) => value.includes('42501'));
+
+  return res.status(healthy ? 200 : 500).json({
+    configured: true,
+    healthy,
+    tables: results,
+    hint: healthy
+      ? 'All required tables are readable with the service role key.'
+      : permissionDenied
+      ? 'Tables exist but the service_role role lacks privileges. Run supabase/grants.sql in the Supabase SQL editor.'
+      : 'Run supabase/schema.sql in the Supabase SQL editor to create the missing tables.',
   });
 });
 
@@ -1871,17 +2536,39 @@ app.post('/api/auth/reset-password', async (req, res) => {
   });
 });
 
+// API 404 guard so unknown API routes never fall through to the SPA shell.
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'API endpoint not found.' });
+});
+
+// Central error handler (keeps stack traces out of API responses).
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error('[Unhandled API Error]:', err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: 'Unexpected server error. Please try again.' });
+});
+
 const isProd = process.env.NODE_ENV === 'production';
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const isServerless = Boolean(process.env.VERCEL);
 
 async function startServer() {
+  if (isServerless) {
+    // On Vercel the platform invokes the exported handler; static assets come
+    // from the build output, so no dev middleware or listener is needed.
+    return;
+  }
+
   if (!isProd) {
+    // Imported lazily so serverless bundles never pull in Vite.
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true, host: '0.0.0.0' },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
+    const { build: buildVite } = await import('vite');
     const distPath = path.resolve(__dirname, 'dist');
     const indexHtmlPath = path.resolve(distPath, 'index.html');
 
@@ -1910,4 +2597,8 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Failed to start Context Pilot server:', err);
+});
+
+export default app;

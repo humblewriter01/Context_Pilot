@@ -241,11 +241,11 @@ export const adminService = {
     return await res.json();
   },
 
-  async validatePromo(code: string, tier: 'pro' | 'enterprise', amount: number) {
+  async validatePromo(code: string, tier: 'pro' | 'enterprise', amount: number, currency: 'NGN' | 'USD' = 'NGN') {
     const res = await fetch('/api/promos/validate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, tier, amount }),
+      body: JSON.stringify({ code, tier, amount, currency }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Invalid promo code');

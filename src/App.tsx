@@ -12,7 +12,17 @@ import { AuthModal } from './components/AuthModal';
 import { AccountModal } from './components/AccountModal';
 import { SignInGate } from './components/SignInGate';
 import { storageService } from './services/storage';
-import { getSession, signOut, getOrInitSupabase, fetchUserFeedback } from './services/supabase';
+import {
+  getSession,
+  signOut,
+  getOrInitSupabase,
+  fetchUserFeedback,
+  fetchUserSync,
+  fetchAnalysisHistory,
+  type UserSyncSnapshot,
+  type RemoteAnalysisRecord,
+} from './services/supabase';
+import ResetPasswordModal from './components/ResetPasswordModal';
 import { formatDisplayName } from './components/UserAvatar';
 import { UserProfile, UsageStats, AnalysisRecord, FeedbackRecord, SubscriptionTier } from './types';
 
@@ -46,6 +56,74 @@ export const App: React.FC = () => {
   // Modals
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
+
+  // Password recovery (Supabase link -> update password)
+  const [isRecoveryMode, setIsRecoveryMode] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    const hash = window.location.hash.toLowerCase();
+    return hash.includes('type=recovery') || hash.startsWith('#reset-password');
+  });
+
+  const clearRecoveryUrl = () => {
+    if (typeof window !== 'undefined') {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+    setIsRecoveryMode(false);
+  };
+
+  /**
+   * Maps a Supabase analysis_history row into the local AnalysisRecord shape.
+   */
+  const mapRemoteAnalysis = (row: RemoteAnalysisRecord, tier: SubscriptionTier): AnalysisRecord => ({
+    id: row.id,
+    userId: 1,
+    ticketKey: row.ticket_key,
+    ticketTitle: row.ticket_title || row.ticket_key,
+    ticketText: '',
+    frontend_files: row.frontend_files || [],
+    backend_files: row.backend_files || [],
+    database_files: row.database_files || [],
+    config_files: row.config_files || [],
+    test_files: row.test_files || [],
+    confidence_score: Number(row.confidence_score) || 0.85,
+    reasoning: row.reasoning || '',
+    total_files: Number(row.total_files) || 0,
+    processingTimeMs: Number(row.processing_time_ms) || 0,
+    createdAt: row.created_at || new Date().toISOString(),
+    userTier: tier,
+  });
+
+  /**
+   * Pulls the authoritative tier, quota and history from the server and merges
+   * them into local state so a new device or a cold serverless start stays in sync.
+   */
+  const hydrateFromServer = async (): Promise<void> => {
+    const snapshot: UserSyncSnapshot | null = await fetchUserSync();
+    if (!snapshot) return;
+
+    const cached = storageService.getUser();
+    if (cached) {
+      const syncedUser: UserProfile = {
+        ...cached,
+        displayName: formatDisplayName(snapshot.displayName || cached.displayName, snapshot.email),
+        photoUrl: snapshot.photoUrl || cached.photoUrl,
+        subscriptionTier: snapshot.subscriptionTier,
+        status: snapshot.status,
+      };
+      storageService.saveUser(syncedUser);
+      setUser(syncedUser);
+    }
+
+    storageService.setUsageCount(snapshot.usage.ticketsProcessed, snapshot.usage.monthYear);
+    setUsage(storageService.getUsage());
+
+    const remoteRows = await fetchAnalysisHistory();
+    if (remoteRows.length > 0) {
+      const mapped = remoteRows.map((row) => mapRemoteAnalysis(row, snapshot.subscriptionTier));
+      storageService.setAnalyses(mapped);
+      setAnalyses(mapped);
+    }
+  };
 
   // URL route handling for /admin
   const checkIsAdmin = () => {
@@ -96,12 +174,15 @@ export const App: React.FC = () => {
           if (isMounted) {
             storageService.saveUser(verifiedUser);
             setUser(verifiedUser);
+            setUsage(storageService.getUsage());
+            setAnalyses(storageService.getAnalyses());
+            hydrateFromServer().catch((e) => console.warn('Server hydration failed:', e));
             fetchUserFeedback().then((remote) => {
               if (isMounted && remote && remote.length > 0) {
                 const mapped: FeedbackRecord[] = remote.map((r, idx) => ({
                   id: idx + 1,
                   userId: 1,
-                  analysisId: Number(r.analysis_id) || 0,
+                  analysisId: r.analysis_id || 0,
                   ticketKey: r.ticket_key,
                   wasAccurate: r.was_accurate,
                   accuracyRating: r.rating || 5,
@@ -136,6 +217,10 @@ export const App: React.FC = () => {
       if (!client || !isMounted) return;
       const { data } = client.auth.onAuthStateChange((event, session) => {
         if (!isMounted) return;
+        if (event === 'PASSWORD_RECOVERY') {
+          setIsRecoveryMode(true);
+          return;
+        }
         if (event === 'SIGNED_OUT' || !session) {
           storageService.logoutUser();
           setUser(null);
@@ -163,6 +248,7 @@ export const App: React.FC = () => {
           };
           storageService.saveUser(verifiedUser);
           setUser(verifiedUser);
+          hydrateFromServer().catch(() => {});
         }
       });
       authUnsubscribe = () => data.subscription.unsubscribe();
@@ -210,7 +296,7 @@ export const App: React.FC = () => {
         const mapped: FeedbackRecord[] = remote.map((r, idx) => ({
           id: idx + 1,
           userId: 1,
-          analysisId: Number(r.analysis_id) || 0,
+          analysisId: r.analysis_id || 0,
           ticketKey: r.ticket_key,
           wasAccurate: r.was_accurate,
           accuracyRating: r.rating || 5,
@@ -292,6 +378,20 @@ export const App: React.FC = () => {
           <span>Verifying session with Supabase...</span>
         </div>
       </div>
+    );
+  }
+
+  // Password recovery takes precedence over the auth gate (the recovery link
+  // establishes a temporary session, so the app would otherwise skip sign-in).
+  if (isRecoveryMode) {
+    return (
+      <ResetPasswordModal
+        onCompleted={() => {
+          clearRecoveryUrl();
+          hydrateFromServer().catch(() => {});
+        }}
+        onDismiss={clearRecoveryUrl}
+      />
     );
   }
 

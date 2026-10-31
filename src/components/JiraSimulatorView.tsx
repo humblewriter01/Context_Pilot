@@ -39,7 +39,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
 
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<
-    (CategorizedFiles & { processingTimeMs?: number; id?: number }) | null
+    (CategorizedFiles & { processingTimeMs?: number; id?: number | string }) | null
   >(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [quotaExceeded, setQuotaExceeded] = useState(false);
@@ -75,7 +75,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
       const processingTime = Date.now() - startTime;
 
       const record: AnalysisRecord = {
-        id: Date.now(),
+        id: result.historyId || Date.now(),
         userId: 1,
         ticketKey: ticketKey || 'TICKET-01',
         ticketTitle: ticketTitle || 'Untitled Ticket',

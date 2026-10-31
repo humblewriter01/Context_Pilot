@@ -17,7 +17,7 @@ import { storageService } from '../services/storage';
 import { submitUserFeedback } from '../services/supabase';
 
 interface JiraAnalyzerPopoverProps {
-  data: CategorizedFiles & { processingTimeMs?: number; id?: number; ticketKey?: string };
+  data: CategorizedFiles & { processingTimeMs?: number; id?: number | string; ticketKey?: string };
   ticketKey: string;
   onClose: () => void;
   onVerifyOnGitHub?: (files: string[]) => void;
@@ -84,7 +84,7 @@ export const JiraAnalyzerPopover: React.FC<JiraAnalyzerPopoverProps> = ({
     // 1. Optimistically store in local storage cache
     storageService.saveFeedback({
       userId: 1,
-      analysisId: data.id || Date.now(),
+      analysisId: data.id ?? Date.now(),
       ticketKey: ticketKey,
       wasAccurate,
       accuracyRating: rating,

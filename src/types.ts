@@ -49,7 +49,7 @@ export interface CategorizedFiles {
 }
 
 export interface AnalysisRecord extends CategorizedFiles {
-  id: number;
+  id: number | string;
   userId: number;
   ticketKey: string;
   ticketTitle: string;
@@ -62,7 +62,7 @@ export interface AnalysisRecord extends CategorizedFiles {
 export interface FeedbackRecord {
   id: number;
   userId: number;
-  analysisId: number;
+  analysisId: number | string;
   ticketKey: string;
   wasAccurate: boolean;
   accuracyRating: number; // 1 to 5

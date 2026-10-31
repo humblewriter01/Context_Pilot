@@ -159,6 +159,21 @@ export async function resetPasswordForEmail(email: string, redirectTo?: string) 
 }
 
 /**
+ * Completes a password-recovery flow by setting a new password on the
+ * authenticated recovery session.
+ */
+export async function updatePassword(newPassword: string) {
+  const client = await getOrInitSupabase();
+  if (!client) {
+    throw new Error('Authentication is currently unavailable. Please check server configuration.');
+  }
+
+  const { data, error } = await client.auth.updateUser({ password: newPassword });
+  if (error) throw error;
+  return data;
+}
+
+/**
  * Signs the user out strictly via Supabase.
  */
 export async function signOut() {
@@ -229,6 +244,88 @@ export interface SupabaseFeedbackRecord {
   created_at?: string;
 }
 
+export interface UserSyncSnapshot {
+  email: string;
+  displayName: string;
+  photoUrl?: string;
+  subscriptionTier: 'free' | 'pro' | 'enterprise';
+  status: 'active' | 'suspended';
+  usage: {
+    monthYear: string;
+    ticketsProcessed: number;
+    monthlyLimit: number;
+    remainingTickets: number;
+  };
+}
+
+export interface RemoteAnalysisRecord {
+  id: string;
+  ticket_key: string;
+  ticket_title: string;
+  reasoning: string;
+  frontend_files: string[];
+  backend_files: string[];
+  database_files: string[];
+  config_files: string[];
+  test_files: string[];
+  apis?: string[];
+  confidence_score: number;
+  total_files: number;
+  processing_time_ms?: number;
+  created_at: string;
+}
+
+/**
+ * Builds Authorization headers for authenticated backend calls from the active
+ * Supabase session. Returns an empty object when no session exists.
+ */
+export async function getAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {};
+  try {
+    const session = await getSession();
+    if (session?.access_token) {
+      headers['Authorization'] = `Bearer ${session.access_token}`;
+    }
+    if (session?.user?.email) {
+      headers['x-user-email'] = session.user.email;
+    }
+  } catch {
+    // Anonymous call
+  }
+  return headers;
+}
+
+/**
+ * Loads the authoritative tier and monthly quota from the server (Supabase-backed).
+ */
+export async function fetchUserSync(): Promise<UserSyncSnapshot | null> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch('/api/user/sync', { headers });
+    if (!res.ok) return null;
+    return (await res.json()) as UserSyncSnapshot;
+  } catch (e) {
+    console.warn('Failed to sync user profile with server:', e);
+    return null;
+  }
+}
+
+/**
+ * Loads the signed-in user's persisted analysis history from Supabase.
+ */
+export async function fetchAnalysisHistory(): Promise<RemoteAnalysisRecord[]> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch('/api/history', { headers });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data) ? (data as RemoteAnalysisRecord[]) : [];
+  } catch (e) {
+    console.warn('Failed to fetch analysis history:', e);
+    return [];
+  }
+}
+
 /**
  * Submits user feedback for an analysis directly to the backend /api/feedback,
  * which persists it into the Supabase public.feedback table.
@@ -241,17 +338,10 @@ export async function submitUserFeedback(feedback: {
   comments?: string;
   actualFiles?: string[];
 }): Promise<any> {
-  const session = await getSession();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    ...(await getAuthHeaders()),
   };
-
-  if (session?.access_token) {
-    headers['Authorization'] = `Bearer ${session.access_token}`;
-  }
-  if (session?.user?.email) {
-    headers['x-user-email'] = session.user.email;
-  }
 
   const res = await fetch('/api/feedback', {
     method: 'POST',
@@ -278,15 +368,7 @@ export async function submitUserFeedback(feedback: {
  * Fetches feedback records submitted by the authenticated user from public.feedback.
  */
 export async function fetchUserFeedback(): Promise<SupabaseFeedbackRecord[]> {
-  const session = await getSession();
-  const headers: Record<string, string> = {};
-
-  if (session?.access_token) {
-    headers['Authorization'] = `Bearer ${session.access_token}`;
-  }
-  if (session?.user?.email) {
-    headers['x-user-email'] = session.user.email;
-  }
+  const headers = await getAuthHeaders();
 
   try {
     const res = await fetch('/api/feedback', { headers });

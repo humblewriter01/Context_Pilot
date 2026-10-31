@@ -39,11 +39,18 @@ export const githubService = {
 
     // Verify each file against real GitHub REST API
     for (const filePath of filePaths) {
-      const cleanPath = filePath.trim();
+      const cleanPath = filePath.trim().replace(/^\/+/, '').replace(/\/+$/, '');
       if (!cleanPath) continue;
 
+      // Encode each path segment so spaces, "#" and unicode characters are safe.
+      const encodedPath = cleanPath
+        .split('/')
+        .filter((segment) => segment.length > 0)
+        .map((segment) => encodeURIComponent(segment))
+        .join('/');
+
       try {
-        const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${cleanPath}?ref=${encodeURIComponent(branch)}`;
+        const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedPath}?ref=${encodeURIComponent(branch)}`;
         const res = await fetch(url, { headers });
 
         if (res.ok) {
@@ -51,7 +58,7 @@ export const githubService = {
           verifiedFiles.push({
             path: cleanPath,
             exists: true,
-            url: data.html_url || `https://github.com/${cleanRepo}/blob/${branch}/${cleanPath}`,
+            url: data.html_url || `https://github.com/${cleanRepo}/blob/${encodeURIComponent(branch)}/${encodedPath}`,
             size: data.size,
             last_modified: new Date().toISOString(),
           });
