@@ -50,7 +50,7 @@ The repository ships with a serverless-ready layout:
 | Path | Purpose |
 | --- | --- |
 | `api/index.js` | Prebuilt serverless bundle (generated from `server.ts` by `npm run build:api`). Vercel must see a real file here, so it is committed and refreshed on every build. |
-| `vercel.json` | Rewrites `/api/*` and `/auth/github/callback` to the function and serves the SPA elsewhere. |
+| `vercel.json` | Rewrites `/api/*` to the function and serves the SPA elsewhere. The OAuth callback is `/api/auth/github/callback`. |
 | `dist/` | `vite build` output, served as static assets by Vercel. |
 
 1. Import the repository into [Vercel](https://vercel.com) (framework preset **Vite**).
@@ -64,19 +64,18 @@ The repository ships with a serverless-ready layout:
 
 | Variable | Required | Notes |
 | --- | --- | --- |
-| `SUPABASE_URL` | ✅ | Supabase project URL (used by both the API and the browser at runtime). |
-| `SUPABASE_ANON_KEY` | ✅ | Public anon key; also served to the client via `/api/supabase/config`. |
-| `SUPABASE_SERVICE_ROLE_KEY` | ✅ | Enables RLS-bypassing admin operations, quotas and history writes. |
+| `SUPABASE_URL` | ✅ | Server-only Supabase project URL. |
+| `SUPABASE_SERVICE_ROLE_KEY` | ✅ | Server-only privileged database operations; never expose this in the frontend. |
+| `VITE_SUPABASE_URL` | ✅ | Public Supabase project URL baked into the Vite frontend at build time. |
+| `VITE_SUPABASE_ANON_KEY` | ✅ | Public anon key baked into the Vite frontend at build time. |
 | `GEMINI_API_KEY` | ✅ | Server-side Gemini access. |
 | `ADMIN_EMAIL` | ✅ | Email allowed into `/admin`. |
 | `PAYSTACK_PUBLIC_KEY` / `PAYSTACK_SECRET_KEY` | optional | Needed for live billing. |
-| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | optional | Needed for the 1-click GitHub OAuth flow. |
-| `GITHUB_TOKEN` | optional | Raises GitHub API rate limits during verification. |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | ✅ for GitHub verification | Server-side OAuth credentials. Configure the GitHub OAuth App callback as `https://<your-domain>/api/auth/github/callback`. |
 | `GEMINI_MODEL` | optional | Defaults to `gemini-2.5-flash`. |
 | `USD_NGN_RATE` | optional | Conversion used for fixed NGN promo discounts charged in USD (default `1500`). |
 
-Then run `supabase/schema.sql` in the Supabase SQL editor and add
-`https://<your-domain>/auth/github/callback` as the GitHub OAuth callback URL.
+Then run `supabase/schema.sql` in the Supabase SQL editor. GitHub verification uses OAuth only; set the OAuth App callback URL to `https://<your-domain>/api/auth/github/callback`. The verifier keeps the OAuth token in the current browser tab session and removes legacy manually-entered tokens.
 
 **Post-deploy verification**
 

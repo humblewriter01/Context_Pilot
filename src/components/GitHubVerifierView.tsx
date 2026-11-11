@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { GitHubVerificationResult, CategorizedFiles } from '../types';
 import { githubService } from '../services/github';
 import { storageService } from '../services/storage';
@@ -19,21 +19,23 @@ import {
   Check
 } from 'lucide-react';
 
+const GITHUB_OAUTH_STATE_KEY = 'context_pilot_github_oauth_state';
+
 interface GitHubVerifierViewProps {
   initialFiles?: string[];
 }
 
 export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialFiles }) => {
   const savedSettings = storageService.getGitHubSettings();
-  const [repoName, setRepoName] = useState(savedSettings.repo || 'humblewriter01/Context_Pilot');
+  const [repoName, setRepoName] = useState(savedSettings.repo);
   const [branch, setBranch] = useState('main');
-  const [token, setToken] = useState(savedSettings.token || '');
+  const [oauthAccessToken, setOAuthAccessToken] = useState(savedSettings.oauthAccessToken);
   const [username, setUsername] = useState(savedSettings.username || '');
   const [avatarUrl, setAvatarUrl] = useState(savedSettings.avatarUrl || '');
 
   const [connectingOAuth, setConnectingOAuth] = useState(false);
+  const oauthPopup = useRef<Window | null>(null);
   const [oauthHelperOpen, setOauthHelperOpen] = useState(false);
-  const [oauthInfo, setOauthInfo] = useState<{ url?: string; redirectUri?: string; isConfigured?: boolean } | null>(null);
 
   const [filesInput, setFilesInput] = useState<string>(() => {
     if (initialFiles && initialFiles.length > 0) {
@@ -75,28 +77,27 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
 
   useEffect(() => {
     const handleOAuthMessage = (event: MessageEvent) => {
-      // Validate origin
-      const origin = event.origin;
-      if (!origin.endsWith('.run.app') && !origin.includes('localhost') && origin !== window.location.origin) {
-        return;
-      }
+      if (event.origin !== window.location.origin) return;
+      if (oauthPopup.current && event.source !== oauthPopup.current) return;
+      if (event.data?.state !== sessionStorage.getItem(GITHUB_OAUTH_STATE_KEY)) return;
 
+      sessionStorage.removeItem(GITHUB_OAUTH_STATE_KEY);
       if (event.data?.type === 'GITHUB_OAUTH_SUCCESS') {
-        const { token: receivedToken, user: ghUser } = event.data;
-        if (receivedToken) {
-          setToken(receivedToken);
-          setUsername(ghUser?.login || '');
-          setAvatarUrl(ghUser?.avatar_url || '');
-          storageService.saveGitHubSettings(receivedToken, repoName, ghUser?.login, ghUser?.avatar_url);
-          setConnectingOAuth(false);
-          setOauthHelperOpen(false);
-          setSuccessNotice(`Connected to GitHub as @${ghUser?.login || 'user'}! Your repositories are now ready for verification.`);
-          setTimeout(() => setSuccessNotice(null), 4000);
-        }
+        const { accessToken, user: ghUser } = event.data;
+        if (!accessToken) return;
+        setOAuthAccessToken(accessToken);
+        setUsername(ghUser?.login || '');
+        setAvatarUrl(ghUser?.avatar_url || '');
+        storageService.saveGitHubOAuthSession(accessToken, repoName, ghUser?.login, ghUser?.avatar_url);
+        setConnectingOAuth(false);
+        setOauthHelperOpen(false);
+        setSuccessNotice(`Connected to GitHub as @${ghUser?.login || 'user'}! Your repositories are ready for verification.`);
+        setTimeout(() => setSuccessNotice(null), 4000);
       } else if (event.data?.type === 'GITHUB_OAUTH_ERROR') {
         setConnectingOAuth(false);
         setErrorMsg(`GitHub authorization failed: ${event.data.error}`);
       }
+      oauthPopup.current = null;
     };
 
     window.addEventListener('message', handleOAuthMessage);
@@ -109,7 +110,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     try {
       const res = await fetch(`/api/auth/github/url?origin=${encodeURIComponent(window.location.origin)}`);
       const data = await res.json();
-      setOauthInfo(data);
+      if (!res.ok) throw new Error(data.error || 'Could not initialize GitHub OAuth.');
 
       if (!data.isConfigured) {
         setOauthHelperOpen(true);
@@ -117,6 +118,8 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
         return;
       }
 
+      if (!data.state) throw new Error('GitHub OAuth did not return a state value.');
+      sessionStorage.setItem(GITHUB_OAUTH_STATE_KEY, data.state);
       const popup = window.open(
         data.url,
         'github_oauth_popup',
@@ -124,8 +127,11 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
       );
 
       if (!popup) {
+        sessionStorage.removeItem(GITHUB_OAUTH_STATE_KEY);
         setErrorMsg('Pop-up was blocked. Please allow popups for this site to connect GitHub.');
         setConnectingOAuth(false);
+      } else {
+        oauthPopup.current = popup;
       }
     } catch (err: any) {
       console.error(err);
@@ -135,7 +141,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
   };
 
   const handleDisconnectGitHub = () => {
-    setToken('');
+    setOAuthAccessToken('');
     setUsername('');
     setAvatarUrl('');
     storageService.clearGitHubAuth();
@@ -167,6 +173,11 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
   const handleVerify = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
+    if (!oauthAccessToken) {
+      setErrorMsg('Connect with GitHub before verifying repository files.');
+      return;
+    }
+
     if (!repoName.trim()) {
       setErrorMsg('Please specify a repository name (e.g. owner/repo)');
       return;
@@ -183,11 +194,11 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     }
 
     setLoading(true);
-    storageService.saveGitHubSettings(token, repoName);
+    storageService.saveGitHubRepo(repoName);
 
     try {
-      const res = await githubService.verifyFiles(repoName, fileList, branch, token);
-      const struct = await githubService.analyzeRepoStructure(repoName, branch, token);
+      const res = await githubService.verifyFiles(repoName, fileList, oauthAccessToken, branch);
+      const struct = await githubService.analyzeRepoStructure(repoName, oauthAccessToken, branch);
       setResult(res);
       setStructure(struct);
     } catch (err: any) {
@@ -250,7 +261,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
             </div>
 
             <p className="text-xs text-slate-600 leading-relaxed">
-              To let users connect their GitHub account with one click without creating manual tokens, create a free <strong>GitHub OAuth App</strong>:
+              To let users connect their GitHub account with one click using OAuth, create a free <strong>GitHub OAuth App</strong>:
             </p>
 
             <ol className="text-xs text-slate-700 space-y-2 list-decimal pl-4">
@@ -269,17 +280,17 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
               <li>
                 Set <strong>Authorization callback URL</strong>:
                 <div className="mt-1 p-2 bg-slate-100 rounded text-slate-900 font-mono text-[11px] select-all break-all border border-slate-200">
-                  {window.location.origin}/auth/github/callback
+                  {window.location.origin}/api/auth/github/callback
                 </div>
               </li>
               <li>
-                Add the generated <strong>Client ID</strong> and <strong>Client Secret</strong> into your <code className="bg-slate-100 px-1 rounded text-indigo-700">.env</code> or directly in <code className="bg-slate-100 px-1 rounded text-indigo-700">/admin</code> → <strong>Payment & Security</strong> tab.
+                Add <strong>GITHUB_CLIENT_ID</strong> and <strong>GITHUB_CLIENT_SECRET</strong> as server-side environment variables in Vercel.
               </li>
             </ol>
 
             <div className="pt-2 flex items-center justify-between border-t border-slate-100">
               <span className="text-[11px] text-slate-500">
-                You can also continue using manual Personal Access Tokens.
+                This verifier uses GitHub OAuth only.
               </span>
               <button
                 onClick={() => setOauthHelperOpen(false)}
@@ -300,7 +311,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
               <FolderGit2 className="w-4 h-4 text-indigo-600" />
               Target Repository
             </h2>
-            {username && (
+            {oauthAccessToken && username && (
               <span className="text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200 px-2 py-0.5 rounded-full font-semibold flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
                 OAuth Active
@@ -309,7 +320,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
           </div>
 
           {/* 1-Click Connect Banner or Connected Account Header */}
-          {username ? (
+          {oauthAccessToken && username ? (
             <div className="p-3 bg-gradient-to-br from-slate-50 to-indigo-50/40 border border-indigo-100 rounded-xl flex items-center justify-between">
               <div className="flex items-center gap-2.5">
                 {avatarUrl ? (
@@ -372,13 +383,6 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
             </div>
           )}
 
-          <div className="relative flex items-center justify-center my-1">
-            <div className="border-t border-slate-200 w-full"></div>
-            <span className="bg-white px-2 text-[10px] uppercase font-bold text-slate-400 absolute tracking-wider">
-              {username ? 'Repository Settings' : 'or enter token manually'}
-            </span>
-          </div>
-
           <form onSubmit={handleVerify} className="space-y-4">
             <div>
               <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">
@@ -386,7 +390,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
               </label>
               <input
                 type="text"
-                placeholder="e.g. humblewriter01/Context_Pilot"
+                placeholder="owner/repository"
                 value={repoName}
                 onChange={(e) => setRepoName(e.target.value)}
                 required
@@ -394,46 +398,15 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
               />
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">Branch</label>
-                <input
-                  type="text"
-                  placeholder="main"
-                  value={branch}
-                  onChange={(e) => setBranch(e.target.value)}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-indigo-500 font-mono"
-                />
-              </div>
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="block text-xs font-semibold text-slate-700 uppercase">
-                    GitHub Token <span className="text-slate-400 font-normal">(optional)</span>
-                  </label>
-                  {token && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setToken('');
-                        storageService.saveGitHubSettings('', repoName);
-                      }}
-                      className="text-[10px] text-rose-500 hover:text-rose-700 font-medium"
-                    >
-                      Clear
-                    </button>
-                  )}
-                </div>
-                <input
-                  type="password"
-                  placeholder="Enter personal access token (optional)"
-                  value={token}
-                  onChange={(e) => setToken(e.target.value)}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-indigo-500 font-mono"
-                />
-                <p className="text-[10px] text-slate-500 mt-1 flex items-center gap-1">
-                  <span className="text-emerald-600 font-semibold">🔒 100% Client-side.</span> Never saved to our database. Read-only recommended.
-                </p>
-              </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">Branch</label>
+              <input
+                type="text"
+                placeholder="main"
+                value={branch}
+                onChange={(e) => setBranch(e.target.value)}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-indigo-500 font-mono"
+              />
             </div>
 
             <div>
@@ -453,7 +426,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 rows={9}
                 value={filesInput}
                 onChange={(e) => setFilesInput(e.target.value)}
-                placeholder="Enter repository relative file paths (one per line)...&#10;src/components/MyComponent.tsx&#10;api/routes.ts"
+                placeholder="Enter repository relative file paths (one per line)...&#10;src/components/Component.tsx&#10;api/routes/handler.ts"
                 className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-mono focus:outline-indigo-500 text-slate-800 leading-relaxed whitespace-nowrap overflow-x-auto"
                 wrap="off"
                 spellCheck={false}
@@ -462,7 +435,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
 
             <button
               type="submit"
-              disabled={loading || !repoName.trim()}
+              disabled={loading || !repoName.trim() || !oauthAccessToken}
               className="w-full py-2.5 px-4 bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 text-white font-semibold rounded-lg text-sm shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50"
             >
               {loading ? (

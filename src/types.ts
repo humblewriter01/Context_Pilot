@@ -161,7 +161,5 @@ export interface AdminSystemSettings {
   proLimit: number;
   maintenanceMode: boolean;
   geminiModel: string;
-  githubClientId?: string;
-  hasGithubClientSecret?: boolean;
-  githubClientSecretMasked?: string;
+  githubOAuthConfigured?: boolean;
 }

@@ -4,8 +4,8 @@ export const githubService = {
   async verifyFiles(
     repoName: string,
     filePaths: string[],
-    branch: string = 'main',
-    token?: string
+    oauthAccessToken: string,
+    branch: string = 'main'
   ): Promise<GitHubVerificationResult> {
     const verifiedFiles: GitHubFileVerification[] = [];
     const missingFiles: GitHubFileVerification[] = [];
@@ -13,9 +13,8 @@ export const githubService = {
     const headers: Record<string, string> = {
       Accept: 'application/vnd.github.v3+json',
     };
-    if (token && token.trim().length > 0) {
-      headers['Authorization'] = `token ${token.trim()}`;
-    }
+    if (!oauthAccessToken.trim()) throw new Error('Connect your GitHub account with OAuth before verifying repositories.');
+    headers['Authorization'] = `Bearer ${oauthAccessToken.trim()}`;
 
     let rateLimitRemaining: number | undefined = undefined;
 
@@ -108,7 +107,7 @@ export const githubService = {
     };
   },
 
-  async analyzeRepoStructure(repoName: string, branch: string = 'main', token?: string) {
+  async analyzeRepoStructure(repoName: string, oauthAccessToken: string, branch: string = 'main') {
     const cleanRepo = repoName.trim();
     const [owner, repo] = cleanRepo.split('/');
     if (!owner || !repo) {
@@ -123,9 +122,8 @@ export const githubService = {
     const headers: Record<string, string> = {
       Accept: 'application/vnd.github.v3+json',
     };
-    if (token && token.trim().length > 0) {
-      headers['Authorization'] = `token ${token.trim()}`;
-    }
+    if (!oauthAccessToken.trim()) throw new Error('Connect your GitHub account with OAuth before verifying repositories.');
+    headers['Authorization'] = `Bearer ${oauthAccessToken.trim()}`;
 
     const commonFiles = [
       'package.json',

@@ -19,6 +19,7 @@ var __dirname = (() => {
   }
 })();
 var app = express();
+app.set("trust proxy", true);
 app.use(
   express.json({
     verify: (req, _res, buf) => {
@@ -34,19 +35,16 @@ function getCurrentMonthYear() {
 }
 var supabaseUrl = process.env.SUPABASE_URL || "";
 var supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-var supabaseAnonKey = process.env.SUPABASE_ANON_KEY || "";
 var supabaseAdmin = supabaseUrl && supabaseServiceRoleKey ? createClient(supabaseUrl, supabaseServiceRoleKey, {
   auth: {
     autoRefreshToken: false,
     persistSession: false
   }
-}) : supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
+}) : null;
 var supabaseServer = supabaseAdmin;
 if (supabaseAdmin) {
   if (supabaseServiceRoleKey) {
     console.log("\u2705 Supabase Admin Client initialized with SERVICE_ROLE_KEY (RLS bypassed).");
-  } else {
-    console.log("\u2139\uFE0F Supabase Client initialized with ANON_KEY (RLS active).");
   }
 }
 var GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
@@ -86,9 +84,7 @@ var SERVER_STORE = {
     freeLimit: 10,
     proLimit: 150,
     maintenanceMode: false,
-    adminEmail: process.env.ADMIN_EMAIL || "admin@contextpilot.com",
-    githubClientId: process.env.GITHUB_CLIENT_ID || "",
-    githubClientSecret: process.env.GITHUB_CLIENT_SECRET || ""
+    adminEmail: process.env.ADMIN_EMAIL || ""
   }
 };
 var USD_NGN_RATE = Number(process.env.USD_NGN_RATE) || 1500;
@@ -320,7 +316,10 @@ async function requireAdmin(req, res, next) {
     if (error || !user || !user.email) {
       return res.status(403).json({ error: "Forbidden. Invalid or expired authentication session." });
     }
-    const adminEmail = (process.env.ADMIN_EMAIL || SERVER_STORE.settings.adminEmail || "admin@contextpilot.com").trim().toLowerCase();
+    const adminEmail = (process.env.ADMIN_EMAIL || SERVER_STORE.settings.adminEmail || "").trim().toLowerCase();
+    if (!adminEmail) {
+      return res.status(503).json({ error: "Administrator access is not configured on the server." });
+    }
     if (user.email.trim().toLowerCase() !== adminEmail) {
       return res.status(403).json({ error: `Forbidden. User ${user.email} is not authorized as administrator.` });
     }
@@ -1197,15 +1196,11 @@ app.get("/api/admin/settings", requireAdmin, async (_req, res) => {
   await hydrateSettings(true);
   const sec = SERVER_STORE.settings.paystackSecretKey || process.env.PAYSTACK_SECRET_KEY || "";
   const maskedSecret = sec ? `${sec.substring(0, 7)}...${sec.substring(sec.length - 4)}` : "";
-  const ghSec = SERVER_STORE.settings.githubClientSecret || process.env.GITHUB_CLIENT_SECRET || "";
-  const maskedGhSec = ghSec ? `${ghSec.substring(0, 5)}...${ghSec.substring(ghSec.length - 4)}` : "";
   res.json({
     paystackPublicKey: SERVER_STORE.settings.paystackPublicKey || process.env.PAYSTACK_PUBLIC_KEY || "",
     hasPaystackSecretKey: Boolean(sec),
     paystackSecretKeyMasked: maskedSecret,
-    githubClientId: SERVER_STORE.settings.githubClientId || process.env.GITHUB_CLIENT_ID || "",
-    hasGithubClientSecret: Boolean(ghSec),
-    githubClientSecretMasked: maskedGhSec,
+    githubOAuthConfigured: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
     isLiveMode: SERVER_STORE.settings.isLiveMode,
     currency: SERVER_STORE.settings.currency,
     proPriceNgn: SERVER_STORE.settings.proPriceNgn,
@@ -1224,8 +1219,6 @@ app.post("/api/admin/settings", requireAdmin, async (req, res) => {
   const {
     paystackPublicKey,
     paystackSecretKey,
-    githubClientId,
-    githubClientSecret,
     isLiveMode,
     currency,
     proPriceNgn,
@@ -1238,10 +1231,6 @@ app.post("/api/admin/settings", requireAdmin, async (req, res) => {
   if (paystackPublicKey !== void 0) SERVER_STORE.settings.paystackPublicKey = paystackPublicKey.trim();
   if (paystackSecretKey && !paystackSecretKey.includes("...")) {
     SERVER_STORE.settings.paystackSecretKey = paystackSecretKey.trim();
-  }
-  if (githubClientId !== void 0) SERVER_STORE.settings.githubClientId = githubClientId.trim();
-  if (githubClientSecret && !githubClientSecret.includes("...")) {
-    SERVER_STORE.settings.githubClientSecret = githubClientSecret.trim();
   }
   if (isLiveMode !== void 0) SERVER_STORE.settings.isLiveMode = Boolean(isLiveMode);
   if (currency !== void 0) SERVER_STORE.settings.currency = currency;
@@ -1284,139 +1273,151 @@ app.post("/api/auth/delete-account", authenticateUser, async (req, res) => {
     return res.status(500).json({ error: err?.message || "Failed to delete account." });
   }
 });
+function signGitHubOAuthState(origin, clientSecret) {
+  const payload = Buffer.from(JSON.stringify({
+    origin,
+    nonce: crypto.randomBytes(24).toString("base64url"),
+    issuedAt: Date.now()
+  })).toString("base64url");
+  const signature = crypto.createHmac("sha256", clientSecret).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+function verifyGitHubOAuthState(state, clientSecret) {
+  if (typeof state !== "string") return null;
+  const [payload, signature, ...extra] = state.split(".");
+  if (!payload || !signature || extra.length) return null;
+  const expected = crypto.createHmac("sha256", clientSecret).update(payload).digest("base64url");
+  const providedBytes = Buffer.from(signature);
+  const expectedBytes = Buffer.from(expected);
+  if (providedBytes.length !== expectedBytes.length || !crypto.timingSafeEqual(providedBytes, expectedBytes)) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    const parsedOrigin = new URL(parsed.origin);
+    const age = Date.now() - Number(parsed.issuedAt);
+    if (parsedOrigin.origin !== parsed.origin || !parsed.nonce || !Number.isFinite(age) || age < -6e4 || age > 10 * 6e4) return null;
+    return { origin: parsedOrigin.origin, nonce: parsed.nonce, issuedAt: Number(parsed.issuedAt) };
+  } catch {
+    return null;
+  }
+}
+function sendGitHubOAuthPopup(res, status, title, message, targetOrigin, payload) {
+  res.status(status).set({
+    "Cache-Control": "no-store, max-age=0",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff"
+  }).type("html").send(`
+    <!doctype html>
+    <html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title></head>
+    <body style="font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0f172a;color:#f8fafc;margin:0">
+      <main style="background:#1e293b;padding:28px;border-radius:12px;max-width:440px;text-align:center;border:1px solid #334155">
+        <h3>${escapeHtml(title)}</h3><p style="font-size:13px;color:#cbd5e1;line-height:1.5">${escapeHtml(message)}</p>
+        <button onclick="window.close()" style="background:#334155;color:white;border:0;padding:10px 20px;border-radius:8px;cursor:pointer">Close window</button>
+      </main>
+      ${targetOrigin && payload ? `<script>try{if(window.opener){window.opener.postMessage(${toInlineJson(payload)},${toInlineJson(targetOrigin)});setTimeout(()=>window.close(),400)}}catch{window.close()}</script>` : ""}
+    </body></html>
+  `);
+}
 app.get("/api/auth/github/url", async (req, res) => {
   await hydrateSettings();
-  const clientId = SERVER_STORE.settings.githubClientId || process.env.GITHUB_CLIENT_ID || "";
-  const clientSecret = SERVER_STORE.settings.githubClientSecret || process.env.GITHUB_CLIENT_SECRET || "";
-  const origin = req.query.origin || process.env.APP_URL || "http://localhost:3000";
-  const cleanOrigin = origin.replace(/\/$/, "");
-  const redirectUri = `${cleanOrigin}/auth/github/callback`;
+  const clientId = process.env.GITHUB_CLIENT_ID || "";
+  const clientSecret = process.env.GITHUB_CLIENT_SECRET || "";
+  if (!clientId || !clientSecret) {
+    return res.json({ isConfigured: false, error: "GitHub OAuth credentials are not configured on the server." });
+  }
+  const requestedOrigin = typeof req.query.origin === "string" ? req.query.origin : process.env.APP_URL || `${req.protocol}://${req.get("host")}`;
+  let origin;
+  try {
+    const parsed = new URL(requestedOrigin);
+    if (!["https:", "http:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error("Invalid origin");
+    origin = parsed.origin;
+    if (parsed.pathname !== "/" || parsed.search || parsed.hash) throw new Error("Expected an origin, not a URL path");
+  } catch {
+    return res.status(400).json({ error: "A valid app origin is required to start GitHub OAuth." });
+  }
+  const redirectUri = `${origin}/api/auth/github/callback`;
+  const state = signGitHubOAuthState(origin, clientSecret);
   const params = new URLSearchParams({
     client_id: clientId,
     redirect_uri: redirectUri,
     scope: "read:user,repo",
-    state: `gh_${Date.now()}`
+    state
   });
-  const authUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
-  res.json({
-    url: authUrl,
+  res.set("Cache-Control", "no-store").json({
+    url: `https://github.com/login/oauth/authorize?${params.toString()}`,
     redirectUri,
-    isConfigured: Boolean(clientId && clientSecret),
-    clientId: clientId ? `${clientId.substring(0, 6)}...` : ""
+    state,
+    isConfigured: true
   });
 });
-app.get(["/auth/github/callback", "/auth/github/callback/"], async (req, res) => {
+app.get("/api/auth/github/callback", async (req, res) => {
+  await hydrateSettings();
+  const clientId = process.env.GITHUB_CLIENT_ID || "";
+  const clientSecret = process.env.GITHUB_CLIENT_SECRET || "";
+  if (!clientId || !clientSecret) {
+    return sendGitHubOAuthPopup(res, 503, "GitHub OAuth unavailable", "The server is missing its GitHub OAuth credentials.");
+  }
+  const oauthState = verifyGitHubOAuthState(req.query.state, clientSecret);
+  if (!oauthState) {
+    return sendGitHubOAuthPopup(res, 400, "Invalid OAuth state", "This GitHub authorization link is invalid or expired. Close this window and try again.");
+  }
   const { code, error, error_description } = req.query;
   if (error) {
-    const safeError = escapeHtml(error);
-    const safeDescription = escapeHtml(error_description || error);
-    return res.send(`
-      <html>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; background: #0f172a; color: #f87171; margin: 0;">
-          <div style="background: #1e293b; padding: 28px; border-radius: 12px; max-width: 420px; text-align: center; border: 1px solid #334155; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
-            <h3 style="margin-top: 0; color: #f87171;">GitHub Authorization Denied</h3>
-            <p style="font-size: 13px; color: #94a3b8; line-height: 1.5;">${safeDescription}</p>
-            <button onclick="window.close()" style="background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; margin-top: 14px;">Close Window</button>
-          </div>
-          <script>
-            if (window.opener) {
-              window.opener.postMessage({ type: 'GITHUB_OAUTH_ERROR', error: ${toInlineJson(String(error))} }, '*');
-            }
-          </script>
-        </body>
-      </html>
-    `);
+    const safeError = typeof error_description === "string" ? error_description : String(error);
+    return sendGitHubOAuthPopup(
+      res,
+      400,
+      "GitHub authorization denied",
+      safeError,
+      oauthState.origin,
+      { type: "GITHUB_OAUTH_ERROR", error: safeError, state: req.query.state }
+    );
   }
-  await hydrateSettings();
-  const clientId = SERVER_STORE.settings.githubClientId || process.env.GITHUB_CLIENT_ID || "";
-  const clientSecret = SERVER_STORE.settings.githubClientSecret || process.env.GITHUB_CLIENT_SECRET || "";
-  if (!code || !clientId || !clientSecret) {
-    return res.send(`
-      <html>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; background: #0f172a; color: #f87171; margin: 0;">
-          <div style="background: #1e293b; padding: 28px; border-radius: 12px; max-width: 440px; text-align: center; border: 1px solid #334155;">
-            <h3 style="margin-top: 0; color: #f87171;">GitHub OAuth Credentials Required</h3>
-            <p style="font-size: 13px; color: #94a3b8; line-height: 1.5;">
-              GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are not configured on the server. Please configure them in .env or the /admin dashboard.
-            </p>
-            <button onclick="window.close()" style="background: #475569; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; margin-top: 14px;">Close</button>
-          </div>
-        </body>
-      </html>
-    `);
+  if (typeof code !== "string" || !code) {
+    return sendGitHubOAuthPopup(res, 400, "Missing authorization code", "GitHub did not return an authorization code.", oauthState.origin, {
+      type: "GITHUB_OAUTH_ERROR",
+      error: "Missing authorization code.",
+      state: req.query.state
+    });
   }
   try {
+    const redirectUri = `${oauthState.origin}/api/auth/github/callback`;
     const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
       method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        client_id: clientId,
-        client_secret: clientSecret,
-        code
-      })
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri })
     });
     const tokenData = await tokenRes.json();
     const accessToken = tokenData.access_token;
-    if (!accessToken) {
-      throw new Error(tokenData.error_description || tokenData.error || "Failed to exchange authorization code for access token.");
+    if (!tokenRes.ok || typeof accessToken !== "string" || !accessToken) {
+      throw new Error(tokenData.error_description || tokenData.error || "Failed to exchange authorization code for an access token.");
     }
     const userRes = await fetch("https://api.github.com/user", {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: "application/vnd.github.v3+json"
-      }
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/vnd.github+json" }
     });
-    const ghUserData = userRes.ok ? await userRes.json() : null;
-    const payload = toInlineJson({
+    if (!userRes.ok) throw new Error("GitHub did not return the authorized user profile.");
+    const ghUserData = await userRes.json();
+    const payload = {
       type: "GITHUB_OAUTH_SUCCESS",
-      token: accessToken,
+      state: req.query.state,
+      accessToken,
       user: {
         login: ghUserData?.login || "",
         name: ghUserData?.name || ghUserData?.login || "GitHub User",
         email: ghUserData?.email || `${ghUserData?.login || "user"}@users.noreply.github.com`,
         avatar_url: ghUserData?.avatar_url || ""
       }
-    });
-    res.send(`
-      <html>
-        <head><title>GitHub Connected</title></head>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; background: #0f172a; color: #10b981; margin: 0;">
-          <div style="background: #1e293b; padding: 32px; border-radius: 14px; text-align: center; max-width: 420px; border: 1px solid #334155; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
-            <div style="font-size: 40px; margin-bottom: 8px;">\u{1F389}</div>
-            <h3 style="margin: 0; color: #f8fafc; font-size: 18px;">GitHub Connected Successfully!</h3>
-            <p style="font-size: 13px; color: #94a3b8; margin: 12px 0 0 0;">Linking your repositories and closing this window...</p>
-          </div>
-          <script>
-            try {
-              if (window.opener) {
-                window.opener.postMessage(${payload}, '*');
-                setTimeout(() => window.close(), 500);
-              } else {
-                window.location.href = '/';
-              }
-            } catch(e) {
-              window.close();
-            }
-          </script>
-        </body>
-      </html>
-    `);
+    };
+    return sendGitHubOAuthPopup(res, 200, "GitHub connected", "Your GitHub account is connected. This window will close shortly.", oauthState.origin, payload);
   } catch (err) {
-    const safeMessage = escapeHtml(err?.message || "Failed to exchange authorization code.");
-    res.status(500).send(`
-      <html>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; background: #0f172a; color: #f87171; margin: 0;">
-          <div style="background: #1e293b; padding: 28px; border-radius: 12px; max-width: 440px; text-align: center; border: 1px solid #334155;">
-            <h3 style="margin-top: 0;">Authentication Error</h3>
-            <p style="font-size: 13px; color: #94a3b8; line-height: 1.5;">${safeMessage}</p>
-            <button onclick="window.close()" style="background: #475569; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; margin-top: 14px;">Close</button>
-          </div>
-        </body>
-      </html>
-    `);
+    console.error("[GitHub OAuth] Code exchange failed:", err?.message || err);
+    return sendGitHubOAuthPopup(
+      res,
+      502,
+      "GitHub authorization failed",
+      "Could not complete GitHub authorization. Close this window and try again.",
+      oauthState.origin,
+      { type: "GITHUB_OAUTH_ERROR", error: "Could not complete GitHub authorization.", state: req.query.state }
+    );
   }
 });
 function heuristicAnalyzeTicket(ticketText, ticketKey) {
@@ -1829,7 +1830,7 @@ app.get("/api/health", (_req, res) => {
     timestamp: (/* @__PURE__ */ new Date()).toISOString(),
     environment: process.env.VERCEL ? "vercel" : process.env.NODE_ENV || "development",
     integrations: {
-      supabase: Boolean(supabaseUrl && (supabaseServiceRoleKey || supabaseAnonKey)),
+      supabase: Boolean(supabaseUrl && supabaseServiceRoleKey),
       supabaseServiceRole: Boolean(supabaseServiceRoleKey),
       supabaseUrlConfigured: Boolean(supabaseUrl),
       gemini: Boolean((process.env.GEMINI_API_KEY || "").trim()),
@@ -1844,7 +1845,6 @@ app.get("/api/supabase/status", (_req, res) => {
   res.json({
     configured: Boolean(supabaseServer),
     hasUrl: Boolean(process.env.SUPABASE_URL),
-    hasAnonKey: Boolean(process.env.SUPABASE_ANON_KEY),
     hasServiceKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY)
   });
 });
@@ -1865,7 +1865,7 @@ app.get("/api/supabase/health", async (_req, res) => {
     });
   }
   const baseUrl = supabaseUrl.replace(/\/$/, "");
-  const key = supabaseServiceRoleKey || supabaseAnonKey;
+  const key = supabaseServiceRoleKey;
   const results = {};
   for (const table of tables) {
     try {
@@ -1896,24 +1896,15 @@ app.get("/api/supabase/health", async (_req, res) => {
     hint: healthy ? "All required tables are readable with the service role key." : permissionDenied ? "Tables exist but the service_role role lacks privileges. Run supabase/grants.sql in the Supabase SQL editor." : "Run supabase/schema.sql in the Supabase SQL editor to create the missing tables."
   });
 });
-app.get("/api/supabase/config", (_req, res) => {
-  const url = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || "";
-  const anonKey = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || "";
-  res.json({
-    url,
-    anonKey,
-    configured: Boolean(url && anonKey)
-  });
-});
 app.post("/api/auth/reset-password", async (req, res) => {
-  const { email, redirectTo } = req.body;
+  const { email } = req.body;
   if (!email || !email.includes("@")) {
     return res.status(400).json({ error: "Valid email is required" });
   }
   if (supabaseServer) {
     try {
       const { error } = await supabaseServer.auth.resetPasswordForEmail(email, {
-        redirectTo: redirectTo || `${req.headers.origin || "http://localhost:3000"}/#reset-password`
+        redirectTo: process.env.APP_URL ? `${process.env.APP_URL.replace(/\/$/, "")}/#reset-password` : `${req.protocol}://${req.get("host")}/#reset-password`
       });
       if (error) {
         return res.status(400).json({ error: error.message });
