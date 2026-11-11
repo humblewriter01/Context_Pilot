@@ -101,9 +101,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
   // Gateway & Integration Settings
   const [paystackPublic, setPaystackPublic] = useState('');
   const [paystackSecret, setPaystackSecret] = useState('');
-  const [githubClientId, setGithubClientId] = useState('');
-  const [githubClientSecret, setGithubClientSecret] = useState('');
-  const [showGhSecret, setShowGhSecret] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
 
@@ -141,8 +138,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
 
       setPaystackPublic(st.paystackPublicKey || '');
       setPaystackSecret(st.paystackSecretKeyMasked || '');
-      setGithubClientId(st.githubClientId || '');
-      setGithubClientSecret(st.githubClientSecretMasked || '');
       setIsLiveMode(st.isLiveMode);
       setCurrency(st.currency || 'NGN');
       setProPriceNgn(st.proPriceNgn || 15000);
@@ -253,8 +248,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
       await adminService.updateSettings({
         paystackPublicKey: paystackPublic.trim(),
         paystackSecretKey: paystackSecret.includes('...') ? undefined : paystackSecret.trim(),
-        githubClientId: githubClientId.trim(),
-        githubClientSecret: githubClientSecret.includes('...') ? undefined : githubClientSecret.trim(),
         isLiveMode,
       });
       setSaveSuccess(true);
@@ -391,7 +384,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                     onChange={(e) => setEmail(e.target.value)}
                     required
                     className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm text-white focus:outline-indigo-500"
-                    placeholder="admin@contextpilot.com"
+                    placeholder="Administrator email"
                   />
                 </div>
               </div>
@@ -1745,58 +1738,23 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                 </label>
               </div>
 
-              {/* GitHub OAuth App Credentials */}
-              <div className="pt-4 border-t border-slate-800 space-y-4">
+              <div className="pt-4 border-t border-slate-800 space-y-3">
                 <div>
                   <h3 className="text-xs font-bold text-white flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-indigo-500"></span>
-                    GitHub OAuth 1-Click Connection (Optional)
+                    <span className={`w-2 h-2 rounded-full ${settings?.githubOAuthConfigured ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
+                    GitHub OAuth
                   </h3>
-                  <p className="text-[11px] text-slate-400 mt-0.5">
-                    Allows users to connect their GitHub account with one click without creating manual personal access tokens.
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    {settings?.githubOAuthConfigured
+                      ? 'OAuth credentials are configured as server-side Vercel environment variables.'
+                      : 'Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in the Vercel project environment.'}
+                  </p>
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    Configure this exact callback URL in the GitHub OAuth App:
                   </p>
                 </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-300 mb-1">
-                    GitHub OAuth Client ID
-                  </label>
-                  <input
-                    type="text"
-                    value={githubClientId}
-                    onChange={(e) => setGithubClientId(e.target.value)}
-                    placeholder="e.g. Ov23li..."
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-white focus:outline-indigo-500"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-300 mb-1">
-                    GitHub OAuth Client Secret
-                  </label>
-                  <div className="relative">
-                    <input
-                      type={showGhSecret ? 'text' : 'password'}
-                      value={githubClientSecret}
-                      onChange={(e) => setGithubClientSecret(e.target.value)}
-                      placeholder="e.g. 40-character secret"
-                      className="w-full pl-3 pr-10 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-white focus:outline-indigo-500"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowGhSecret(!showGhSecret)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
-                    >
-                      {showGhSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-[11px] text-slate-400 space-y-1">
-                  <div className="font-semibold text-slate-300">GitHub OAuth Authorization Callback URL:</div>
-                  <div className="font-mono text-indigo-300 bg-slate-950 p-1.5 rounded select-all break-all">
-                    {window.location.origin}/auth/github/callback
-                  </div>
+                <div className="font-mono text-indigo-300 bg-slate-950 p-2 rounded select-all break-all text-[11px]">
+                  {window.location.origin}/api/auth/github/callback
                 </div>
               </div>
 

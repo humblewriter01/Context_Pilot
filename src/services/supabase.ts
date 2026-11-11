@@ -1,15 +1,12 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-// Reads directly from Vite client environment variables
-const envUrl = ((import.meta as any).env?.VITE_SUPABASE_URL as string) || '';
-const envAnonKey = ((import.meta as any).env?.VITE_SUPABASE_ANON_KEY as string) || '';
+// Browser Supabase configuration must come from Vite's public build-time variables.
+const clientUrl = import.meta.env.VITE_SUPABASE_URL || '';
+const clientAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
 
-let clientUrl = envUrl;
-let clientAnonKey = envAnonKey;
+export const isSupabaseConfigured = Boolean(clientUrl && clientAnonKey);
 
-export let isSupabaseConfigured = Boolean(clientUrl && clientAnonKey);
-
-export let supabase: SupabaseClient | null = isSupabaseConfigured
+export const supabase: SupabaseClient | null = isSupabaseConfigured
   ? createClient(clientUrl, clientAnonKey, {
       auth: {
         persistSession: true,
@@ -19,53 +16,8 @@ export let supabase: SupabaseClient | null = isSupabaseConfigured
     })
   : null;
 
-/**
- * Initializes or retrieves the official Supabase client.
- * If Vite environment variables were not baked into the client bundle at build time,
- * checks /api/supabase/config to retrieve runtime environment variables provided by the server.
- */
 export async function getOrInitSupabase(): Promise<SupabaseClient | null> {
-  if (supabase) return supabase;
-
-  // Check if client env vars are available
-  if (envUrl && envAnonKey) {
-    clientUrl = envUrl;
-    clientAnonKey = envAnonKey;
-    isSupabaseConfigured = true;
-    supabase = createClient(clientUrl, clientAnonKey, {
-      auth: {
-        persistSession: true,
-        autoRefreshToken: true,
-        detectSessionInUrl: true,
-      },
-    });
-    return supabase;
-  }
-
-  // Fallback: check server environment variables exposed via /api/supabase/config
-  try {
-    const res = await fetch('/api/supabase/config');
-    if (res.ok) {
-      const data = await res.json();
-      if (data.url && data.anonKey) {
-        clientUrl = data.url;
-        clientAnonKey = data.anonKey;
-        isSupabaseConfigured = true;
-        supabase = createClient(clientUrl, clientAnonKey, {
-          auth: {
-            persistSession: true,
-            autoRefreshToken: true,
-            detectSessionInUrl: true,
-          },
-        });
-        return supabase;
-      }
-    }
-  } catch (err) {
-    console.warn('[Supabase Init] Notice checking server config:', err);
-  }
-
-  return null;
+  return supabase;
 }
 
 /**

@@ -19,11 +19,7 @@
       "destination": "/api/index"
     },
     {
-      "source": "/auth/github/callback",
-      "destination": "/api/index"
-    },
-    {
-      "source": "/((?!api/|auth/|assets/).*)",
+      "source": "/((?!api/|assets/).*)",
       "destination": "/index.html"
     }
   ]

@@ -264,7 +264,7 @@ export const adminService = {
     return await res.json();
   },
 
-  async updateSettings(settings: Partial<AdminSystemSettings & { paystackSecretKey?: string; githubClientSecret?: string }>) {
+  async updateSettings(settings: Partial<AdminSystemSettings & { paystackSecretKey?: string }>) {
     const token = await this.getToken();
     const res = await fetch('/api/admin/settings', {
       method: 'POST',
