@@ -221,9 +221,9 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
                             {item.ticketKey}
                           </span>
                         </td>
-                        <td className="py-3.5 px-4 min-w-[180px] max-w-xs sm:max-w-sm md:max-w-md font-medium text-slate-800" title={item.ticketTitle || 'Ticket Analysis'}>
+                        <td className="py-3.5 px-4 min-w-[180px] max-w-xs sm:max-w-sm md:max-w-md font-medium text-slate-800" title={item.ticketTitle || '—'}>
                           <span className="line-clamp-2 leading-relaxed">
-                            {item.ticketTitle || 'Ticket Analysis'}
+                            {item.ticketTitle || '—'}
                           </span>
                         </td>
                         <td className="py-3.5 px-4 font-semibold text-slate-700 whitespace-nowrap">
@@ -231,7 +231,7 @@ export const HistoryFeedbackView: React.FC<HistoryFeedbackViewProps> = ({
                         </td>
                         <td className="py-3.5 px-4 whitespace-nowrap">
                           <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold text-[11px]">
-                            {Math.round((item.confidence_score || 0.85) * 100)}%
+                            {item.confidence_score ? `${Math.round(item.confidence_score * 100)}%` : '—'}
                           </span>
                         </td>
                         <td className="py-3.5 px-4 text-slate-500 font-mono whitespace-nowrap">

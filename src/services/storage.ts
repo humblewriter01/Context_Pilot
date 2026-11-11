@@ -66,12 +66,21 @@ const STORAGE_KEYS = {
   USAGE: 'context_pilot_usage',
   ANALYSES: 'context_pilot_analyses',
   FEEDBACK: 'context_pilot_feedback',
-  GITHUB_REPO: 'context_pilot_gh_repo',
-  GITHUB_USER: 'context_pilot_gh_user'
 };
 
-const GITHUB_OAUTH_TOKEN_KEY = 'context_pilot_github_oauth_access_token';
-const LEGACY_GITHUB_TOKEN_KEY = 'context_pilot_gh_token';
+const GITHUB_REPO_KEY = 'context_pilot_repo';
+
+// Purge credentials saved by older verifier builds without ever reading them.
+if (typeof window !== 'undefined') {
+  for (const key of Object.keys(localStorage)) {
+    if (key.startsWith('context_pilot_gh_') || key.startsWith('context_pilot_github_')) {
+      localStorage.removeItem(key);
+    }
+  }
+  for (const key of Object.keys(sessionStorage)) {
+    if (key.startsWith('context_pilot_github_')) sessionStorage.removeItem(key);
+  }
+}
 
 export const storageService = {
   getUser(): UserProfile | null {
@@ -134,9 +143,7 @@ export const storageService = {
     localStorage.setItem(STORAGE_KEYS.LOGGED_OUT, 'true');
     localStorage.removeItem(STORAGE_KEYS.ANALYSES);
     localStorage.removeItem(STORAGE_KEYS.FEEDBACK);
-    this.clearGitHubAuth();
-    localStorage.removeItem(STORAGE_KEYS.GITHUB_REPO);
-    localStorage.removeItem(STORAGE_KEYS.GITHUB_USER);
+    localStorage.removeItem(GITHUB_REPO_KEY);
   },
 
   updateTier(tier: SubscriptionTier): UserProfile | null {
@@ -261,42 +268,12 @@ export const storageService = {
     return newRecord;
   },
 
-  getGitHubSettings(): { oauthAccessToken: string; repo: string; username: string; avatarUrl?: string } {
-    // Remove any manually entered PAT saved by older app versions. Only OAuth
-    // credentials issued by our callback are accepted, and only for this tab.
-    localStorage.removeItem(LEGACY_GITHUB_TOKEN_KEY);
-    const oauthAccessToken = sessionStorage.getItem(GITHUB_OAUTH_TOKEN_KEY) || '';
-    return {
-      oauthAccessToken,
-      repo: localStorage.getItem(STORAGE_KEYS.GITHUB_REPO) || '',
-      username: oauthAccessToken ? localStorage.getItem(STORAGE_KEYS.GITHUB_USER) || '' : '',
-      avatarUrl: oauthAccessToken ? localStorage.getItem('context_pilot_gh_avatar') || '' : '',
-    };
-  },
-
-  saveGitHubOAuthSession(accessToken: string, repo?: string, username?: string, avatarUrl?: string) {
-    localStorage.removeItem(LEGACY_GITHUB_TOKEN_KEY);
-    sessionStorage.setItem(GITHUB_OAUTH_TOKEN_KEY, accessToken);
-    if (repo !== undefined) localStorage.setItem(STORAGE_KEYS.GITHUB_REPO, repo);
-    if (username !== undefined) {
-      if (username) localStorage.setItem(STORAGE_KEYS.GITHUB_USER, username);
-      else localStorage.removeItem(STORAGE_KEYS.GITHUB_USER);
-    }
-    if (avatarUrl !== undefined) {
-      if (avatarUrl) localStorage.setItem('context_pilot_gh_avatar', avatarUrl);
-      else localStorage.removeItem('context_pilot_gh_avatar');
-    }
+  getGitHubRepo(): string {
+    return localStorage.getItem(GITHUB_REPO_KEY) || '';
   },
 
   saveGitHubRepo(repo: string) {
-    if (repo.trim()) localStorage.setItem(STORAGE_KEYS.GITHUB_REPO, repo.trim());
-    else localStorage.removeItem(STORAGE_KEYS.GITHUB_REPO);
+    if (repo.trim()) localStorage.setItem(GITHUB_REPO_KEY, repo.trim());
+    else localStorage.removeItem(GITHUB_REPO_KEY);
   },
-
-  clearGitHubAuth() {
-    sessionStorage.removeItem(GITHUB_OAUTH_TOKEN_KEY);
-    localStorage.removeItem(LEGACY_GITHUB_TOKEN_KEY);
-    localStorage.removeItem(STORAGE_KEYS.GITHUB_USER);
-    localStorage.removeItem('context_pilot_gh_avatar');
-  }
 };

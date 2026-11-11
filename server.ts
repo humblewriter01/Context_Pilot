@@ -126,10 +126,6 @@ const SERVER_STORE = {
   users: [] as StoredUser[],
   transactions: [] as StoredTransaction[],
   promos: [] as StoredPromoCode[],
-  telemetry: {
-    totalRequests: 0,
-    startTime: Date.now(),
-  },
   settings: {
     paystackPublicKey: process.env.PAYSTACK_PUBLIC_KEY || '',
     paystackSecretKey: process.env.PAYSTACK_SECRET_KEY || '',
@@ -157,19 +153,16 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 type ServerSettings = typeof SERVER_STORE.settings;
 
-function escapeHtml(value: unknown): string {
-  const map: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-  return String(value ?? '').replace(/[&<>"']/g, (ch) => map[ch]);
-}
-
-/** Serializes a value for safe inlining inside a <script> block. */
-function toInlineJson(value: unknown): string {
-  return JSON.stringify(value ?? null)
-    .replace(/</g, '\\u003c')
-    .replace(/>/g, '\\u003e')
-    .replace(/&/g, '\\u0026')
-    .replace(/\u2028/g, '\\u2028')
-    .replace(/\u2029/g, '\\u2029');
+async function fetchAllQueryRows(query: any, pageSize = 1000): Promise<any[]> {
+  const rows: any[] = [];
+  for (let offset = 0; offset < 100_000; offset += pageSize) {
+    const { data, error } = await query.range(offset, offset + pageSize - 1);
+    if (error) throw new Error(error.message || 'Supabase query failed.');
+    const page = Array.isArray(data) ? data : [];
+    rows.push(...page);
+    if (page.length < pageSize) return rows;
+  }
+  throw new Error('Admin statistics exceeded the supported pagination limit.');
 }
 
 // ---------------------------------------------------------
@@ -981,146 +974,251 @@ app.get('/api/admin/verify', requireAdmin, (req: any, res) => {
   });
 });
 
-// Admin System Overview & Analytics
+// Admin System Overview & Analytics (database-backed; no in-memory/demo fallbacks).
 app.get('/api/admin/overview', requireAdmin, async (_req, res) => {
-  let totalUsers = SERVER_STORE.users.length;
-  let proUsers = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'pro').length;
-  let enterpriseUsers = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'enterprise').length;
-  let freeUsers = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'free').length;
-
-  if (supabaseServer) {
-    try {
-      const { data: dbUsers } = await supabaseServer.from('users').select('subscription_tier');
-      if (dbUsers && dbUsers.length > 0) {
-        totalUsers = dbUsers.length;
-        proUsers = dbUsers.filter((u: any) => u.subscription_tier === 'pro').length;
-        enterpriseUsers = dbUsers.filter((u: any) => u.subscription_tier === 'enterprise').length;
-        freeUsers = dbUsers.filter((u: any) => u.subscription_tier === 'free').length;
-      }
-    } catch (e) {
-      console.warn('Overview Supabase users fetch error:', e);
-    }
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: 'Supabase service role client is not configured.' });
   }
 
-  const successfulTx = SERVER_STORE.transactions.filter((t) => t.status === 'success');
-  const totalRevenueNgn = successfulTx.reduce((acc, t) => acc + (t.currency === 'NGN' ? t.amount : t.amount * 1500), 0);
-  const uptimeSeconds = Math.floor((Date.now() - SERVER_STORE.telemetry.startTime) / 1000);
+  try {
+    const [dbUsers, dbTransactions] = await Promise.all([
+      fetchAllQueryRows(supabaseAdmin.from('users').select('subscription_tier,created_at').order('created_at', { ascending: true })),
+      fetchAllQueryRows(supabaseAdmin.from('transactions').select('amount,currency,status,created_at,tier').order('created_at', { ascending: true })),
+    ]);
 
-  res.json({
-    users: {
-      total: totalUsers,
-      free: freeUsers,
-      pro: proUsers,
-      enterprise: enterpriseUsers,
-    },
-    revenue: {
-      totalNgn: totalRevenueNgn,
-      transactionsCount: successfulTx.length,
-      pendingCount: SERVER_STORE.transactions.filter((t) => t.status === 'pending').length,
-    },
-    promos: {
-      total: SERVER_STORE.promos.length,
-      active: SERVER_STORE.promos.filter((p) => p.isActive).length,
-    },
-    system: {
-      uptimeSeconds,
-      gatewayConfigured: Boolean(SERVER_STORE.settings.paystackPublicKey && SERVER_STORE.settings.paystackSecretKey),
-      isLiveMode: SERVER_STORE.settings.isLiveMode,
-      currency: SERVER_STORE.settings.currency,
-    },
-  });
+    const recentCutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const successfulTx = dbTransactions.filter((tx) => tx.status === 'success');
+    const totalNgn = successfulTx
+      .filter((tx) => String(tx.currency).toUpperCase() === 'NGN')
+      .reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+    const totalUsd = successfulTx
+      .filter((tx) => String(tx.currency).toUpperCase() === 'USD')
+      .reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+    const userCounts = dbUsers.reduce((counts: Record<string, number>, user) => {
+      const tier = user.subscription_tier || 'free';
+      counts[tier] = (counts[tier] || 0) + 1;
+      return counts;
+    }, {});
+
+    return res.json({
+      users: {
+        total: dbUsers.length,
+        free: userCounts.free || 0,
+        pro: userCounts.pro || 0,
+        enterprise: userCounts.enterprise || 0,
+        createdLast14Days: dbUsers.filter((user) => {
+          const created = Date.parse(user.created_at);
+          return Number.isFinite(created) && created >= recentCutoff;
+        }).length,
+      },
+      revenue: {
+        totalNgn,
+        totalUsd,
+        transactionsCount: successfulTx.length,
+        pendingCount: dbTransactions.filter((tx) => tx.status === 'pending').length,
+      },
+      promos: {
+        total: SERVER_STORE.promos.length,
+        active: SERVER_STORE.promos.filter((promo) => promo.isActive).length,
+      },
+      system: {
+        gatewayConfigured: Boolean(SERVER_STORE.settings.paystackPublicKey && SERVER_STORE.settings.paystackSecretKey),
+        isLiveMode: SERVER_STORE.settings.isLiveMode,
+        currency: SERVER_STORE.settings.currency,
+      },
+    });
+  } catch (err: any) {
+    console.error('[Admin Overview Query Error]:', err?.message || err);
+    return res.status(500).json({ error: 'Could not load live user and transaction totals from Supabase.' });
+  }
 });
 
-// Admin Visual Analytics Trends (Signups, Revenue, API Usage)
-app.get('/api/admin/analytics', requireAdmin, (req, res) => {
-  const days = parseInt(req.query.days as string, 10) || 14;
-  const now = Date.now();
-  const dailyData = [];
-
-  let cumSignups = 0;
-  let cumRevenue = 0;
-
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(now - i * 86400000);
-    const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-    const fullDate = d.toISOString().split('T')[0];
-
-    // Check actual transactions on this date
-    const txOnDate = SERVER_STORE.transactions.filter(
-      (t) => t.createdAt && t.createdAt.startsWith(fullDate) && t.status === 'success'
-    );
-    const dailyRevenue = txOnDate.reduce((sum, t) => sum + t.amount, 0);
-    cumRevenue += dailyRevenue;
-
-    // Check actual signups on this date
-    const signupsOnDate = SERVER_STORE.users.filter(
-      (u) => u.createdAt && u.createdAt.startsWith(fullDate)
-    );
-    const signups = signupsOnDate.length;
-    cumSignups += signups;
-
-    const freeSignups = signupsOnDate.filter((u) => u.subscriptionTier === 'free').length;
-    const proSignups = signupsOnDate.filter((u) => u.subscriptionTier === 'pro').length;
-    const entSignups = signupsOnDate.filter((u) => u.subscriptionTier === 'enterprise').length;
-
-    dailyData.push({
-      date: dateStr,
-      fullDate,
-      signups,
-      cumSignups,
-      freeSignups,
-      proSignups,
-      enterpriseSignups: entSignups,
-      revenue: dailyRevenue,
-      cumRevenue,
-      proRevenue: txOnDate.filter((t) => t.tier === 'pro').reduce((sum, t) => sum + t.amount, 0),
-      enterpriseRevenue: txOnDate.filter((t) => t.tier === 'enterprise').reduce((sum, t) => sum + t.amount, 0),
-      apiCalls: 0,
-      geminiCalls: 0,
-      heuristicCalls: 0,
-      avgLatencyMs: 0,
-      predictedFiles: 0,
-    });
+// Admin visual analytics trends from persisted Supabase users, transactions,
+// and analysis_history rows. Zero-filled dates are only chart buckets; empty
+// data sources are flagged so the UI can render a clear empty state.
+app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: 'Supabase service role client is not configured.' });
   }
 
-  // Summary aggregates
-  const totalUsers = SERVER_STORE.users.length;
-  const proCount = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'pro').length;
-  const entCount = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'enterprise').length;
-  const freeCount = SERVER_STORE.users.filter((u) => u.subscriptionTier === 'free').length;
+  const requestedDays = Number.parseInt(String(req.query.days || ''), 10) || 14;
+  const days = Math.min(90, Math.max(1, requestedDays));
+  const today = new Date();
+  const todayUtc = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+  const periodStart = new Date(todayUtc - (days - 1) * 24 * 60 * 60 * 1000);
+  const periodEnd = new Date(todayUtc + 24 * 60 * 60 * 1000);
+  const periodStartIso = periodStart.toISOString();
+  const periodEndIso = periodEnd.toISOString();
 
-  const mrr = (proCount * (SERVER_STORE.settings.proPriceNgn || 15000)) + (entCount * (SERVER_STORE.settings.enterprisePriceNgn || 75000));
-  const arr = mrr * 12;
-  const totalRev = SERVER_STORE.transactions
-    .filter((t) => t.status === 'success')
-    .reduce((sum, t) => sum + t.amount, 0);
+  try {
+    const [allUsers, periodTransactions, periodAnalyses] = await Promise.all([
+      fetchAllQueryRows(supabaseAdmin.from('users').select('subscription_tier,created_at').order('created_at', { ascending: true })),
+      fetchAllQueryRows(
+        supabaseAdmin.from('transactions')
+          .select('amount,currency,status,created_at,tier')
+          .eq('status', 'success')
+          .order('created_at', { ascending: true })
+          .gte('created_at', periodStartIso)
+          .lt('created_at', periodEndIso),
+      ),
+      fetchAllQueryRows(
+        supabaseAdmin.from('analysis_history')
+          .select('created_at,processing_time_ms,total_files,frontend_files,backend_files,database_files,config_files,test_files')
+          .order('created_at', { ascending: true })
+          .gte('created_at', periodStartIso)
+          .lt('created_at', periodEndIso),
+      ),
+    ]);
 
-  res.json({
-    trends: dailyData,
-    summary: {
-      totalUsers,
-      freeCount,
-      proCount,
-      entCount,
-      mrr,
-      arr,
-      totalRevenue: totalRev,
-      totalApiCalls: SERVER_STORE.telemetry.totalRequests,
-      avgLatency: 0,
-    },
-    tierDistribution: [
-      { name: 'Free Plan', value: freeCount, color: '#94a3b8' },
-      { name: 'Pro Plan', value: proCount, color: '#6366f1' },
-      { name: 'Enterprise', value: entCount, color: '#a855f7' },
-    ],
-    apiCategories: [
-      { name: 'Frontend (React/UI)', value: 0, count: 0, color: '#38bdf8' },
-      { name: 'Backend API & Routes', value: 0, count: 0, color: '#818cf8' },
-      { name: 'Database & Schemas', value: 0, count: 0, color: '#34d399' },
-      { name: 'Test Suites (Unit/E2E)', value: 0, count: 0, color: '#fbbf24' },
-      { name: 'Config & Build', value: 0, count: 0, color: '#f472b6' },
-    ],
-  });
+    const trendByDate = new Map<string, any>();
+    for (let i = 0; i < days; i += 1) {
+      const date = new Date(todayUtc - (days - 1 - i) * 24 * 60 * 60 * 1000);
+      const fullDate = date.toISOString().slice(0, 10);
+      trendByDate.set(fullDate, {
+        fullDate,
+        date: date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }),
+        signups: 0,
+        cumSignups: 0,
+        freeSignups: 0,
+        proSignups: 0,
+        enterpriseSignups: 0,
+        revenueNgn: 0,
+        revenueUsd: 0,
+        cumRevenueNgn: 0,
+        cumRevenueUsd: 0,
+        apiCalls: 0,
+        avgLatencyMs: 0,
+        predictedFiles: 0,
+      });
+    }
+
+    const dateKey = (value: unknown) => {
+      const time = Date.parse(String(value || ''));
+      return Number.isFinite(time) ? new Date(time).toISOString().slice(0, 10) : null;
+    };
+
+    const recentUsersCutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const newUsersLast14Days = allUsers.filter((user) => {
+      const created = Date.parse(user.created_at);
+      return Number.isFinite(created) && created >= recentUsersCutoff;
+    }).length;
+
+    for (const user of allUsers) {
+      const key = dateKey(user.created_at);
+      const trend = key ? trendByDate.get(key) : null;
+      if (!trend) continue;
+      trend.signups += 1;
+      if (user.subscription_tier === 'pro') trend.proSignups += 1;
+      else if (user.subscription_tier === 'enterprise') trend.enterpriseSignups += 1;
+      else trend.freeSignups += 1;
+    }
+
+    for (const tx of periodTransactions) {
+      const key = dateKey(tx.created_at);
+      const trend = key ? trendByDate.get(key) : null;
+      if (!trend) continue;
+      const amount = Number(tx.amount || 0);
+      if (String(tx.currency).toUpperCase() === 'USD') trend.revenueUsd += amount;
+      else if (String(tx.currency).toUpperCase() === 'NGN') trend.revenueNgn += amount;
+    }
+
+    const fileTotals = { frontend: 0, backend: 0, database: 0, config: 0, tests: 0 };
+    const latencySamples: number[] = [];
+    for (const analysis of periodAnalyses) {
+      const key = dateKey(analysis.created_at);
+      const trend = key ? trendByDate.get(key) : null;
+      if (!trend) continue;
+      trend.apiCalls += 1;
+      const latency = Number(analysis.processing_time_ms);
+      if (Number.isFinite(latency) && latency > 0) {
+        latencySamples.push(latency);
+        trend._latencyTotal = (trend._latencyTotal || 0) + latency;
+        trend._latencySamples = (trend._latencySamples || 0) + 1;
+      }
+      trend.predictedFiles += Number(analysis.total_files || 0);
+      fileTotals.frontend += Array.isArray(analysis.frontend_files) ? analysis.frontend_files.length : 0;
+      fileTotals.backend += Array.isArray(analysis.backend_files) ? analysis.backend_files.length : 0;
+      fileTotals.database += Array.isArray(analysis.database_files) ? analysis.database_files.length : 0;
+      fileTotals.config += Array.isArray(analysis.config_files) ? analysis.config_files.length : 0;
+      fileTotals.tests += Array.isArray(analysis.test_files) ? analysis.test_files.length : 0;
+    }
+
+    let cumulativeSignups = 0;
+    let cumulativeNgn = 0;
+    let cumulativeUsd = 0;
+    const trends = [...trendByDate.values()].map((trend) => {
+      cumulativeSignups += trend.signups;
+      cumulativeNgn += trend.revenueNgn;
+      cumulativeUsd += trend.revenueUsd;
+      trend.cumSignups = cumulativeSignups;
+      trend.cumRevenueNgn = cumulativeNgn;
+      trend.cumRevenueUsd = cumulativeUsd;
+      trend.avgLatencyMs = trend._latencySamples ? trend._latencyTotal / trend._latencySamples : 0;
+      delete trend._latencyTotal;
+      delete trend._latencySamples;
+      return trend;
+    });
+
+    const tierCounts = allUsers.reduce((counts: Record<string, number>, user) => {
+      const tier = user.subscription_tier || 'free';
+      counts[tier] = (counts[tier] || 0) + 1;
+      return counts;
+    }, {});
+    const tierDistribution = [
+      { name: 'Free Plan', value: tierCounts.free || 0, color: '#94a3b8' },
+      { name: 'Pro Plan', value: tierCounts.pro || 0, color: '#6366f1' },
+      { name: 'Enterprise', value: tierCounts.enterprise || 0, color: '#a855f7' },
+    ].filter((entry) => entry.value > 0);
+
+    const fileCount = Object.values(fileTotals).reduce((sum, count) => sum + count, 0);
+    const categories = [
+      { name: 'Frontend', count: fileTotals.frontend, color: '#38bdf8' },
+      { name: 'Backend', count: fileTotals.backend, color: '#818cf8' },
+      { name: 'Database', count: fileTotals.database, color: '#34d399' },
+      { name: 'Tests', count: fileTotals.tests, color: '#fbbf24' },
+      { name: 'Config & Build', count: fileTotals.config, color: '#f472b6' },
+    ];
+    const apiCategories = fileCount
+      ? categories.filter((category) => category.count > 0).map((category) => ({
+          ...category,
+          value: Math.round((category.count / fileCount) * 100),
+        }))
+      : [];
+    const successfulRevenueNgn = periodTransactions
+      .filter((tx) => String(tx.currency).toUpperCase() === 'NGN')
+      .reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+    const successfulRevenueUsd = periodTransactions
+      .filter((tx) => String(tx.currency).toUpperCase() === 'USD')
+      .reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+    const usersInPeriod = trends.reduce((sum, trend) => sum + trend.signups, 0);
+    const hasRevenue = periodTransactions.length > 0;
+    const hasAnalyses = periodAnalyses.length > 0;
+
+    return res.json({
+      days,
+      hasSignups: usersInPeriod > 0,
+      hasRevenue,
+      hasAnalyses,
+      trends,
+      summary: {
+        totalUsers: allUsers.length,
+        newUsersInPeriod: usersInPeriod,
+        newUsersLast14Days,
+        totalRevenueNgn: successfulRevenueNgn,
+        totalRevenueUsd: successfulRevenueUsd,
+        totalApiCalls: periodAnalyses.length,
+        avgLatency: latencySamples.length
+          ? latencySamples.reduce((sum, value) => sum + value, 0) / latencySamples.length
+          : null,
+        totalFilesPredicted: periodAnalyses.reduce((sum, analysis) => sum + Number(analysis.total_files || 0), 0),
+      },
+      tierDistribution,
+      apiCategories,
+    });
+  } catch (err: any) {
+    console.error('[Admin Analytics Query Error]:', err?.message || err);
+    return res.status(500).json({ error: 'Could not load live analytics from Supabase.' });
+  }
 });
 
 // Admin Users Management (Directly wired to Supabase public.users table)
@@ -1570,7 +1668,6 @@ app.get('/api/admin/settings', requireAdmin, async (_req, res) => {
     paystackPublicKey: SERVER_STORE.settings.paystackPublicKey || process.env.PAYSTACK_PUBLIC_KEY || '',
     hasPaystackSecretKey: Boolean(sec),
     paystackSecretKeyMasked: maskedSecret,
-    githubOAuthConfigured: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
     isLiveMode: SERVER_STORE.settings.isLiveMode,
     currency: SERVER_STORE.settings.currency,
     proPriceNgn: SERVER_STORE.settings.proPriceNgn,
@@ -1660,188 +1757,6 @@ app.post('/api/auth/delete-account', authenticateUser, async (req: express.Reque
 });
 
 // ==========================================
-// 3. GitHub OAuth 1-Click Integration Endpoints
-// ==========================================
-
-function signGitHubOAuthState(origin: string, clientSecret: string): string {
-  const payload = Buffer.from(JSON.stringify({
-    origin,
-    nonce: crypto.randomBytes(24).toString('base64url'),
-    issuedAt: Date.now(),
-  })).toString('base64url');
-  const signature = crypto.createHmac('sha256', clientSecret).update(payload).digest('base64url');
-  return `${payload}.${signature}`;
-}
-
-function verifyGitHubOAuthState(state: unknown, clientSecret: string): { origin: string; nonce: string; issuedAt: number } | null {
-  if (typeof state !== 'string') return null;
-  const [payload, signature, ...extra] = state.split('.');
-  if (!payload || !signature || extra.length) return null;
-
-  const expected = crypto.createHmac('sha256', clientSecret).update(payload).digest('base64url');
-  const providedBytes = Buffer.from(signature);
-  const expectedBytes = Buffer.from(expected);
-  if (providedBytes.length !== expectedBytes.length || !crypto.timingSafeEqual(providedBytes, expectedBytes)) return null;
-
-  try {
-    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    const parsedOrigin = new URL(parsed.origin);
-    const age = Date.now() - Number(parsed.issuedAt);
-    if (
-      parsedOrigin.origin !== parsed.origin ||
-      !parsed.nonce ||
-      !Number.isFinite(age) ||
-      age < -60_000 ||
-      age > 10 * 60_000
-    ) return null;
-    return { origin: parsedOrigin.origin, nonce: parsed.nonce, issuedAt: Number(parsed.issuedAt) };
-  } catch {
-    return null;
-  }
-}
-
-function sendGitHubOAuthPopup(
-  res: express.Response,
-  status: number,
-  title: string,
-  message: string,
-  targetOrigin?: string,
-  payload?: Record<string, unknown>,
-) {
-  res.status(status).set({
-    'Cache-Control': 'no-store, max-age=0',
-    'Referrer-Policy': 'no-referrer',
-    'X-Content-Type-Options': 'nosniff',
-  }).type('html').send(`
-    <!doctype html>
-    <html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title></head>
-    <body style="font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0f172a;color:#f8fafc;margin:0">
-      <main style="background:#1e293b;padding:28px;border-radius:12px;max-width:440px;text-align:center;border:1px solid #334155">
-        <h3>${escapeHtml(title)}</h3><p style="font-size:13px;color:#cbd5e1;line-height:1.5">${escapeHtml(message)}</p>
-        <button onclick="window.close()" style="background:#334155;color:white;border:0;padding:10px 20px;border-radius:8px;cursor:pointer">Close window</button>
-      </main>
-      ${targetOrigin && payload ? `<script>try{if(window.opener){window.opener.postMessage(${toInlineJson(payload)},${toInlineJson(targetOrigin)});setTimeout(()=>window.close(),400)}}catch{window.close()}</script>` : ''}
-    </body></html>
-  `);
-}
-
-// Build the OAuth URL using a signed, short-lived state. The client secret
-// never leaves this server; the callback only posts results to the signed origin.
-app.get('/api/auth/github/url', async (req, res) => {
-  await hydrateSettings();
-  const clientId = process.env.GITHUB_CLIENT_ID || '';
-  const clientSecret = process.env.GITHUB_CLIENT_SECRET || '';
-  if (!clientId || !clientSecret) {
-    return res.json({ isConfigured: false, error: 'GitHub OAuth credentials are not configured on the server.' });
-  }
-
-  const requestedOrigin = typeof req.query.origin === 'string'
-    ? req.query.origin
-    : process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
-  let origin: string;
-  try {
-    const parsed = new URL(requestedOrigin);
-    if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('Invalid origin');
-    origin = parsed.origin;
-    if (parsed.pathname !== '/' || parsed.search || parsed.hash) throw new Error('Expected an origin, not a URL path');
-  } catch {
-    return res.status(400).json({ error: 'A valid app origin is required to start GitHub OAuth.' });
-  }
-
-  const redirectUri = `${origin}/api/auth/github/callback`;
-  const state = signGitHubOAuthState(origin, clientSecret);
-  const params = new URLSearchParams({
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    scope: 'read:user,repo',
-    state,
-  });
-
-  res.set('Cache-Control', 'no-store').json({
-    url: `https://github.com/login/oauth/authorize?${params.toString()}`,
-    redirectUri,
-    state,
-    isConfigured: true,
-  });
-});
-
-// GitHub's OAuth App callback must be configured to this exact API route.
-app.get('/api/auth/github/callback', async (req, res) => {
-  await hydrateSettings();
-  const clientId = process.env.GITHUB_CLIENT_ID || '';
-  const clientSecret = process.env.GITHUB_CLIENT_SECRET || '';
-  if (!clientId || !clientSecret) {
-    return sendGitHubOAuthPopup(res, 503, 'GitHub OAuth unavailable', 'The server is missing its GitHub OAuth credentials.');
-  }
-
-  const oauthState = verifyGitHubOAuthState(req.query.state, clientSecret);
-  if (!oauthState) {
-    return sendGitHubOAuthPopup(res, 400, 'Invalid OAuth state', 'This GitHub authorization link is invalid or expired. Close this window and try again.');
-  }
-
-  const { code, error, error_description } = req.query;
-  if (error) {
-    const safeError = typeof error_description === 'string' ? error_description : String(error);
-    return sendGitHubOAuthPopup(
-      res,
-      400,
-      'GitHub authorization denied',
-      safeError,
-      oauthState.origin,
-      { type: 'GITHUB_OAUTH_ERROR', error: safeError, state: req.query.state },
-    );
-  }
-  if (typeof code !== 'string' || !code) {
-    return sendGitHubOAuthPopup(res, 400, 'Missing authorization code', 'GitHub did not return an authorization code.', oauthState.origin, {
-      type: 'GITHUB_OAUTH_ERROR', error: 'Missing authorization code.', state: req.query.state,
-    });
-  }
-
-  try {
-    const redirectUri = `${oauthState.origin}/api/auth/github/callback`;
-    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
-      method: 'POST',
-      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri }),
-    });
-    const tokenData = await tokenRes.json();
-    const accessToken = tokenData.access_token;
-    if (!tokenRes.ok || typeof accessToken !== 'string' || !accessToken) {
-      throw new Error(tokenData.error_description || tokenData.error || 'Failed to exchange authorization code for an access token.');
-    }
-
-    const userRes = await fetch('https://api.github.com/user', {
-      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/vnd.github+json' },
-    });
-    if (!userRes.ok) throw new Error('GitHub did not return the authorized user profile.');
-    const ghUserData = await userRes.json();
-    const payload = {
-      type: 'GITHUB_OAUTH_SUCCESS',
-      state: req.query.state,
-      accessToken,
-      user: {
-        login: ghUserData?.login || '',
-        name: ghUserData?.name || ghUserData?.login || 'GitHub User',
-        email: ghUserData?.email || `${ghUserData?.login || 'user'}@users.noreply.github.com`,
-        avatar_url: ghUserData?.avatar_url || '',
-      },
-    };
-
-    return sendGitHubOAuthPopup(res, 200, 'GitHub connected', 'Your GitHub account is connected. This window will close shortly.', oauthState.origin, payload);
-  } catch (err: any) {
-    console.error('[GitHub OAuth] Code exchange failed:', err?.message || err);
-    return sendGitHubOAuthPopup(
-      res,
-      502,
-      'GitHub authorization failed',
-      'Could not complete GitHub authorization. Close this window and try again.',
-      oauthState.origin,
-      { type: 'GITHUB_OAUTH_ERROR', error: 'Could not complete GitHub authorization.', state: req.query.state },
-    );
-  }
-});
-
-// ==========================================
 // 3. AI Analysis endpoint with robust fallback
 // ==========================================
 
@@ -1927,10 +1842,13 @@ async function handleTicketAnalysis(req: express.Request, res: express.Response)
   if (!ticket_text || typeof ticket_text !== 'string' || ticket_text.trim().length < 5) {
     return res.status(400).json({ error: 'Missing or insufficient ticket_text for analysis' });
   }
+  if (typeof ticket_key !== 'string' || !ticket_key.trim()) {
+    return res.status(400).json({ error: 'ticket_key is required for analysis history.' });
+  }
 
   await hydrateSettings();
 
-  const key = ticket_key || 'TICKET-LIVE';
+  const key = ticket_key.trim();
 
   // Prefer the verified Supabase identity over any client-supplied email.
   const auth = await resolveBearerUser(req);
@@ -2215,7 +2133,7 @@ app.get('/api/history', authenticateUser, async (req: express.Request, res: expr
   const userEmail = (req as any).userEmail as string;
 
   if (!supabaseAdmin) {
-    return res.json([]);
+    return res.status(503).json({ error: 'Supabase service role client is not configured.' });
   }
 
   try {
@@ -2228,7 +2146,7 @@ app.get('/api/history', authenticateUser, async (req: express.Request, res: expr
 
     if (error) {
       console.warn('[History Fetch Warning]:', error.message);
-      return res.json([]);
+      return res.status(500).json({ error: 'Failed to load analysis history.' });
     }
 
     return res.json(data || []);
@@ -2431,7 +2349,6 @@ app.get('/api/health', (_req, res) => {
       gemini: Boolean((process.env.GEMINI_API_KEY || '').trim()),
       geminiModel: GEMINI_MODEL,
       paystack: Boolean(process.env.PAYSTACK_SECRET_KEY),
-      githubOAuth: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
       adminEmailConfigured: Boolean(process.env.ADMIN_EMAIL),
     },
   });

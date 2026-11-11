@@ -33,8 +33,8 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
   const [ticketKey, setTicketKey] = useState('');
   const [ticketTitle, setTicketTitle] = useState('');
   const [ticketDescription, setTicketDescription] = useState('');
-  const [priority, setPriority] = useState<'Highest' | 'High' | 'Medium' | 'Low'>('Medium');
-  const [status, setStatus] = useState<'To Do' | 'In Progress' | 'In Review' | 'Done'>('In Progress');
+  const [priority, setPriority] = useState<'Highest' | 'High' | 'Medium' | 'Low' | ''>('');
+  const [status, setStatus] = useState<'To Do' | 'In Progress' | 'In Review' | 'Done' | ''>('');
   const [componentsList, setComponentsList] = useState<string>('');
 
   const [analyzing, setAnalyzing] = useState(false);
@@ -48,6 +48,10 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
   const handleAnalyze = async () => {
     setAnalysisError(null);
 
+    if (!ticketKey.trim()) {
+      setAnalysisError('Please enter a ticket key before analyzing.');
+      return;
+    }
     if (!ticketTitle.trim() && !ticketDescription.trim()) {
       setAnalysisError('Please enter a ticket title or description to analyze.');
       return;
@@ -68,17 +72,17 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
       const currentUser = storageService.getUser();
       const result = await analyzeTicket(
         fullText,
-        ticketKey || 'TICKET-01',
+        ticketKey.trim(),
         currentUser?.email,
-        ticketTitle || 'Untitled Ticket'
+        ticketTitle.trim() || ticketKey.trim()
       );
       const processingTime = Date.now() - startTime;
 
       const record: AnalysisRecord = {
         id: result.historyId || Date.now(),
         userId: 1,
-        ticketKey: ticketKey || 'TICKET-01',
-        ticketTitle: ticketTitle || 'Untitled Ticket',
+        ticketKey: ticketKey.trim(),
+        ticketTitle: ticketTitle.trim() || ticketKey.trim(),
         ticketText: fullText,
         ...result,
         processingTimeMs: processingTime,
@@ -94,7 +98,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
       const updatedUsage = storageService.getUsage();
       onUsageUpdated(updatedUsage);
 
-      setActiveAnalysisTicketKey(ticketKey || 'TICKET-01');
+      setActiveAnalysisTicketKey(ticketKey.trim());
       setAnalysisResult({
         ...result,
         processingTimeMs: processingTime,
@@ -169,7 +173,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
               <span className="w-2.5 h-2.5 rounded-full bg-slate-300" />
             </div>
             <span className="ml-1 sm:ml-2 font-mono text-[11px] sm:text-xs text-slate-400 truncate min-w-0">
-              jira.company.com/browse/{ticketKey || 'PROJ-123'}
+              Issue workspace{ticketKey ? ` / ${ticketKey}` : ''}
             </span>
           </div>
           <div className="flex items-center gap-1.5 font-medium text-slate-600 shrink-0 text-[11px] sm:text-xs whitespace-nowrap">
@@ -184,11 +188,9 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
           <div className="lg:col-span-2 space-y-6">
             {/* Breadcrumbs */}
             <div className="flex items-center gap-2 text-xs text-slate-500">
-              <span className="font-medium text-slate-700">Projects</span>
-              <span>/</span>
-              <span className="font-medium text-slate-700">Engineering</span>
-              <span>/</span>
-              <span className="font-semibold text-indigo-600">{ticketKey || 'PROJ-123'}</span>
+              <span className="font-medium text-slate-700">Issue</span>
+              {ticketKey && <span>/</span>}
+              {ticketKey && <span className="font-semibold text-indigo-600 truncate">{ticketKey}</span>}
             </div>
 
             {/* Editable Issue Header */}
@@ -196,14 +198,14 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
               <div className="flex flex-col sm:flex-row gap-2">
                 <input
                   type="text"
-                  placeholder="e.g. PROJ-123"
+                  placeholder="Ticket key"
                   value={ticketKey}
                   onChange={(e) => setTicketKey(e.target.value)}
                   className="w-full sm:w-36 px-3 py-1.5 border border-slate-300 rounded-lg text-sm font-bold text-slate-900 font-mono bg-white focus:outline-indigo-500"
                 />
                 <input
                   type="text"
-                  placeholder="e.g. Implement Google OAuth 2.0 with session tokens"
+                  placeholder="Issue summary"
                   value={ticketTitle}
                   onChange={(e) => setTicketTitle(e.target.value)}
                   className="flex-1 px-3 py-1.5 border border-slate-300 rounded-lg text-sm sm:text-base font-bold text-slate-900 bg-white focus:outline-indigo-500"
@@ -286,6 +288,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                 onChange={(e: any) => setStatus(e.target.value)}
                 className="w-full px-3 py-2 bg-blue-50 border border-blue-200 text-blue-700 rounded-lg font-semibold text-xs focus:outline-blue-500"
               >
+                <option value="" disabled>Select status</option>
                 <option value="To Do">To Do</option>
                 <option value="In Progress">In Progress</option>
                 <option value="In Review">In Review</option>
@@ -301,6 +304,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                 onChange={(e: any) => setPriority(e.target.value)}
                 className="w-full px-3 py-2 bg-slate-50 border border-slate-300 text-slate-800 rounded-lg font-semibold text-xs focus:outline-indigo-500"
               >
+                <option value="" disabled>Select priority</option>
                 <option value="Highest">Highest</option>
                 <option value="High">High</option>
                 <option value="Medium">Medium</option>
@@ -315,7 +319,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                 type="text"
                 value={componentsList}
                 onChange={(e) => setComponentsList(e.target.value)}
-                placeholder="e.g. Authentication, Backend, API"
+                placeholder="Components (comma-separated)"
                 className="w-full px-3 py-2 bg-white border border-slate-300 text-slate-800 rounded-lg text-xs font-mono focus:outline-indigo-500"
               />
             </div>

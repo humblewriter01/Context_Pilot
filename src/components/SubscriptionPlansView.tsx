@@ -37,7 +37,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
   const plans = Object.values(SUBSCRIPTION_PLANS);
   const [paystackConfig, setPaystackConfig] = useState<any>(null);
   const [billingCycle, setBillingCycle] = useState<'monthly' | 'annual'>('monthly');
-  const [selectedCurrency, setSelectedCurrency] = useState<'NGN' | 'USD'>('NGN');
+  const [selectedCurrency, setSelectedCurrency] = useState<'NGN' | 'USD'>('USD');
   const [loadingTier, setLoadingTier] = useState<string | null>(null);
   const [paymentNotice, setPaymentNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
@@ -64,37 +64,41 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
       })
       .catch(console.error);
 
-    // 2. Auto-Currency Detection (Geo-IP)
+    // 2. Auto-detect Nigeria before honoring a saved manual choice. USD remains
+    // the immediate first-render default; a Nigerian IP switches the UI to NGN.
     const storedCurrency = sessionStorage.getItem('cp_selected_currency') as 'NGN' | 'USD' | null;
-    if (storedCurrency === 'NGN' || storedCurrency === 'USD') {
-      setSelectedCurrency(storedCurrency);
-    } else {
-      fetch('https://ipapi.co/json/')
-        .then((res) => {
-          if (!res.ok) throw new Error('Geo-IP lookup failed');
-          return res.json();
-        })
-        .then((data) => {
-          const isNigeria =
-            data?.country_code === 'NG' ||
-            data?.country === 'Nigeria' ||
-            data?.country_name === 'Nigeria';
-          const detected: 'NGN' | 'USD' = isNigeria ? 'NGN' : 'USD';
-          setSelectedCurrency(detected);
-          sessionStorage.setItem('cp_selected_currency', detected);
-        })
-        .catch(() => {
-          // Fallback: check browser locale / timezone if ipapi is unreachable
-          try {
-            const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-            const isNgTz = timeZone.includes('Lagos') || timeZone.includes('Africa/Lagos');
-            const detected: 'NGN' | 'USD' = isNgTz ? 'NGN' : 'USD';
-            setSelectedCurrency(detected);
-          } catch {
-            setSelectedCurrency('USD');
-          }
-        });
-    }
+    const hasManualCurrencyChoice = sessionStorage.getItem('cp_currency_user_selected') === 'true';
+    fetch('https://ipapi.co/json/')
+      .then((res) => {
+        if (!res.ok) throw new Error('Geo-IP lookup failed');
+        return res.json();
+      })
+      .then((data) => {
+        const isNigeria =
+          data?.country_code === 'NG' ||
+          data?.country === 'Nigeria' ||
+          data?.country_name === 'Nigeria';
+        const detected: 'NGN' | 'USD' = isNigeria
+          ? 'NGN'
+          : hasManualCurrencyChoice && (storedCurrency === 'NGN' || storedCurrency === 'USD')
+          ? storedCurrency
+          : 'USD';
+        setSelectedCurrency(detected);
+        sessionStorage.setItem('cp_selected_currency', detected);
+      })
+      .catch(() => {
+        // If geo lookup is unavailable, retain an explicit user choice; otherwise
+        // use USD unless the browser timezone identifies Nigeria.
+        const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        const isNgTz = timeZone.includes('Lagos') || timeZone.includes('Africa/Lagos');
+        const detected: 'NGN' | 'USD' = isNgTz
+          ? 'NGN'
+          : hasManualCurrencyChoice && (storedCurrency === 'NGN' || storedCurrency === 'USD')
+          ? storedCurrency
+          : 'USD';
+        setSelectedCurrency(detected);
+        sessionStorage.setItem('cp_selected_currency', detected);
+      });
 
     // 3. Check if redirected from Paystack with ?payment_ref= or ?reference=
     const params = new URLSearchParams(window.location.search);
@@ -107,6 +111,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
   const handleCurrencySelect = (curr: 'NGN' | 'USD') => {
     setSelectedCurrency(curr);
     sessionStorage.setItem('cp_selected_currency', curr);
+    sessionStorage.setItem('cp_currency_user_selected', 'true');
     // Promo discounts are validated per currency; clear so no stale amount is applied.
     setAppliedPromo(null);
   };

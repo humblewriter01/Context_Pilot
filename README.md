@@ -50,7 +50,7 @@ The repository ships with a serverless-ready layout:
 | Path | Purpose |
 | --- | --- |
 | `api/index.js` | Prebuilt serverless bundle (generated from `server.ts` by `npm run build:api`). Vercel must see a real file here, so it is committed and refreshed on every build. |
-| `vercel.json` | Rewrites `/api/*` to the function and serves the SPA elsewhere. The OAuth callback is `/api/auth/github/callback`. |
+| `vercel.json` | Rewrites `/api/*` to the function and serves the SPA elsewhere. |
 | `dist/` | `vite build` output, served as static assets by Vercel. |
 
 1. Import the repository into [Vercel](https://vercel.com) (framework preset **Vite**).
@@ -71,11 +71,10 @@ The repository ships with a serverless-ready layout:
 | `GEMINI_API_KEY` | ✅ | Server-side Gemini access. |
 | `ADMIN_EMAIL` | ✅ | Email allowed into `/admin`. |
 | `PAYSTACK_PUBLIC_KEY` / `PAYSTACK_SECRET_KEY` | optional | Needed for live billing. |
-| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | ✅ for GitHub verification | Server-side OAuth credentials. Configure the GitHub OAuth App callback as `https://<your-domain>/api/auth/github/callback`. |
 | `GEMINI_MODEL` | optional | Defaults to `gemini-2.5-flash`. |
 | `USD_NGN_RATE` | optional | Conversion used for fixed NGN promo discounts charged in USD (default `1500`). |
 
-Then run `supabase/schema.sql` in the Supabase SQL editor. GitHub verification uses OAuth only; set the OAuth App callback URL to `https://<your-domain>/api/auth/github/callback`. The verifier keeps the OAuth token in the current browser tab session and removes legacy manually-entered tokens.
+Then run `supabase/schema.sql` in the Supabase SQL editor. GitHub verification uses the GitHub provider configured under Supabase Authentication → Providers. Add your app origin to the Supabase redirect URL allowlist. GitHub authorization is handled through the Supabase Auth session; the verifier does not add a separate credential store.
 
 **Post-deploy verification**
 

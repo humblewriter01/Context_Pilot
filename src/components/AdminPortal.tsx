@@ -85,6 +85,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
   const [promos, setPromos] = useState<PromoCode[]>([]);
   const [settings, setSettings] = useState<AdminSystemSettings | null>(null);
   const [loadingData, setLoadingData] = useState(false);
+  const [adminDataError, setAdminDataError] = useState<string | null>(null);
+  const [analyticsError, setAnalyticsError] = useState<string | null>(null);
 
   // Search in users
   const [userSearch, setUserSearch] = useState('');
@@ -125,15 +127,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
         adminService.getTransactions(),
         adminService.getPromos(),
         adminService.getSettings(),
-        adminService.getAnalytics(analyticsDays).catch(() => null),
+        adminService.getAnalytics(analyticsDays).catch((error) => {
+          setAnalyticsError(error?.message || 'Could not load Supabase analytics.');
+          return null;
+        }),
         adminService.getFeedback().catch(() => []),
       ]);
+      setAdminDataError(null);
       setOverview(ov);
       setUsers(us);
       setTransactions(tx);
       setPromos(pr);
       setSettings(st);
-      if (an) setAnalytics(an);
+      if (an) {
+        setAnalytics(an);
+        setAnalyticsError(null);
+      } else {
+        setAnalytics(null);
+      }
       if (fb) setFeedbackList(fb);
 
       setPaystackPublic(st.paystackPublicKey || '');
@@ -148,6 +159,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
       setProLimit(st.proLimit || 150);
     } catch (err: any) {
       console.error(err);
+      setAdminDataError('Live admin metrics could not be loaded from Supabase. Please retry after checking the server connection.');
       if (err?.message?.includes('Unauthorized')) {
         setProfile(null);
       }
@@ -162,8 +174,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
     try {
       const an = await adminService.getAnalytics(days);
       setAnalytics(an);
+      setAnalyticsError(null);
     } catch (err) {
       console.error('Failed to change analytics range:', err);
+      setAnalyticsError('Could not load Supabase analytics for this range.');
+      setAnalytics(null);
     } finally {
       setAnalyticsLoading(false);
     }
@@ -563,6 +578,17 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
           })}
         </div>
 
+        {adminDataError && (
+          <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-200 text-xs" role="alert">
+            {adminDataError}
+          </div>
+        )}
+        {analyticsError && activeTab === 'analytics' && (
+          <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-200 text-xs" role="alert">
+            {analyticsError}
+          </div>
+        )}
+
         {saveSuccess && (
           <div className="p-3 bg-emerald-500/20 border border-emerald-500/40 rounded-xl text-emerald-300 text-xs flex items-center gap-2 animate-in fade-in">
             <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
@@ -576,19 +602,21 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
               <div className="p-5 bg-slate-900 border border-slate-800 rounded-2xl space-y-2">
                 <span className="text-xs font-semibold uppercase text-slate-400">Total Users</span>
-                <div className="text-2xl font-bold text-white">{overview?.users?.total || users.length}</div>
+                <div className="text-2xl font-bold text-white">{overview?.users?.total ?? users.length}</div>
                 <div className="text-[11px] text-slate-400">
                   {overview?.users?.pro || 0} Pro • {overview?.users?.enterprise || 0} Enterprise
+                  <span className="block mt-1">{overview?.users?.createdLast14Days ?? 0} created in the past 14 days</span>
                 </div>
               </div>
 
               <div className="p-5 bg-slate-900 border border-slate-800 rounded-2xl space-y-2">
-                <span className="text-xs font-semibold uppercase text-slate-400">Total Paystack Revenue</span>
+                <span className="text-xs font-semibold uppercase text-slate-400">Successful Transaction Revenue</span>
                 <div className="text-2xl font-bold text-emerald-400">
-                  ₦{(overview?.revenue?.totalNgn || 90000).toLocaleString()}
+                  ₦{(overview?.revenue?.totalNgn ?? 0).toLocaleString()}
                 </div>
                 <div className="text-[11px] text-slate-400">
-                  {overview?.revenue?.transactionsCount || transactions.length} confirmed transactions
+                  {overview?.revenue?.transactionsCount ?? 0} confirmed transactions
+                  <span className="block mt-1">USD: ${Number(overview?.revenue?.totalUsd ?? 0).toLocaleString()}</span>
                 </div>
               </div>
 
@@ -626,7 +654,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   <span>Recent Successful Transactions</span>
                 </h3>
                 <div className="space-y-2">
-                  {transactions.slice(0, 4).map((tx) => (
+                  {transactions.filter((tx) => tx.status === 'success').slice(0, 4).map((tx) => (
                     <div
                       key={tx.id || tx.reference}
                       className="p-3 bg-slate-950/70 rounded-xl border border-slate-800/80 flex items-center justify-between text-xs"
@@ -637,7 +665,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                       </div>
                       <div className="text-right">
                         <div className="font-bold text-emerald-400">
-                          ₦{Number(tx.amount).toLocaleString()}
+                          {tx.currency === 'USD' ? '$' : '₦'}{Number(tx.amount).toLocaleString()} {tx.currency || 'NGN'}
                         </div>
                         <span className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-500/20 text-emerald-300">
                           {tx.status}
@@ -689,11 +717,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   <h4 className="text-sm font-bold text-white flex items-center gap-2">
                     <span>Executive Analytics & Growth Telemetry</span>
                     <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold">
-                      Live Recharts Engine
+                      Supabase data
                     </span>
                   </h4>
                   <p className="text-xs text-slate-400">
-                    Visualize real-time user signups, Paystack subscription revenue trends, and Gemini AI latency curves.
+                    Explore Supabase user registrations, successful transactions, and persisted analyses.
                   </p>
                 </div>
               </div>
@@ -720,7 +748,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   <span>Executive Growth & Usage Analytics</span>
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Interactive Recharts telemetry for user signups, Paystack subscription revenue, and Gemini API impact prediction trends.
+                  Charts are calculated from saved Supabase users, transactions, and analysis history.
                 </p>
               </div>
 
@@ -758,30 +786,30 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   </div>
                 </div>
                 <div className="text-2xl font-bold text-white">
-                  {analytics?.summary?.totalUsers || users.length}
+                  {analytics?.summary?.totalUsers ?? users.length}
                 </div>
                 <div className="flex items-center justify-between text-[11px] text-slate-400">
                   <span className="text-emerald-400 flex items-center gap-0.5 font-semibold">
                     <ArrowUpRight className="w-3.5 h-3.5" />
-                    +{analytics?.trends?.reduce((acc: number, d: any) => acc + d.signups, 0) || 18} in {analyticsDays}d
+                    +{analytics?.summary?.newUsersInPeriod ?? 0} in {analyticsDays}d
                   </span>
-                  <span>Active pipeline</span>
+                  <span>Selected period</span>
                 </div>
               </div>
 
               <div className="p-5 bg-slate-900 border border-slate-800 rounded-2xl space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">Monthly Run Rate (MRR)</span>
+                  <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">Successful Revenue (NGN)</span>
                   <div className="w-7 h-7 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center">
                     <DollarSign className="w-4 h-4" />
                   </div>
                 </div>
                 <div className="text-2xl font-bold text-emerald-400 font-mono">
-                  ₦{Number(analytics?.summary?.mrr || 90000).toLocaleString()}
+                  ₦{Number(analytics?.summary?.totalRevenueNgn ?? 0).toLocaleString()}
                 </div>
                 <div className="flex items-center justify-between text-[11px] text-slate-400">
-                  <span>ARR: ₦{Number(analytics?.summary?.arr || 1080000).toLocaleString()}</span>
-                  <span className="text-emerald-400 font-medium">+24.8% MoM</span>
+                  <span>USD: ${Number(analytics?.summary?.totalRevenueUsd ?? 0).toLocaleString()}</span>
+                  <span>{analyticsDays}-day period</span>
                 </div>
               </div>
 
@@ -793,11 +821,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   </div>
                 </div>
                 <div className="text-2xl font-bold text-sky-400 font-mono">
-                  {analytics?.summary?.totalApiCalls?.toLocaleString() || '1,420'}
+                  {(analytics?.summary?.totalApiCalls ?? 0).toLocaleString()}
                 </div>
                 <div className="flex items-center justify-between text-[11px] text-slate-400">
-                  <span>Gemini 3.8 Flash</span>
-                  <span className="text-sky-400 font-medium">99.9% Uptime</span>
+                  <span>Persisted analyses</span>
+                  <span>Selected period</span>
                 </div>
               </div>
 
@@ -809,11 +837,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   </div>
                 </div>
                 <div className="text-2xl font-bold text-amber-400 font-mono">
-                  {analytics?.summary?.avgLatency || 298} ms
+                  {analytics?.summary?.avgLatency == null ? '—' : `${Math.round(analytics.summary.avgLatency)} ms`}
                 </div>
                 <div className="flex items-center justify-between text-[11px] text-slate-400">
-                  <span>Target: &lt;500ms</span>
-                  <span className="text-emerald-400 font-medium">Optimal</span>
+                  <span>Measured from saved analyses</span>
                 </div>
               </div>
             </div>
@@ -857,7 +884,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   </div>
                 </div>
 
-                <div className="h-72 w-full pt-2">
+                <div className="h-72 w-full pt-2 relative">
+                  {analytics?.hasSignups ? null : <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-900 text-sm text-slate-400">{loadingData || analyticsLoading ? 'Loading analytics…' : analyticsError ? 'Analytics unavailable' : 'No data yet'}</div> }
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={analytics?.trends || []}>
                       <defs>
@@ -878,7 +906,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                       <Area
                         type="monotone"
                         dataKey={signupViewMode === 'daily' ? 'signups' : 'cumSignups'}
-                        name={signupViewMode === 'daily' ? 'New Signups' : 'Cumulative Users'}
+                        name={signupViewMode === 'daily' ? 'New Signups' : 'Cumulative Signups in Period'}
                         stroke="#6366f1"
                         strokeWidth={2}
                         fillOpacity={1}
@@ -887,7 +915,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                       <Area
                         type="monotone"
                         dataKey="proSignups"
-                        name="Pro Tier Subscriptions"
+                        name="New Pro-tier Registrations"
                         stroke="#a855f7"
                         strokeWidth={2}
                         fillOpacity={1}
@@ -911,6 +939,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                 </div>
 
                 <div className="h-48 w-full flex items-center justify-center relative">
+                  {(analytics?.tierDistribution || []).length === 0 && (
+                    <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-900 text-sm text-slate-400">
+                      {loadingData || analyticsLoading ? 'Loading analytics…' : analyticsError ? 'Analytics unavailable' : 'No data yet'}
+                    </div>
+                  )}
                   <ResponsiveContainer width="100%" height="100%">
                     <PieChart>
                       <Pie
@@ -931,7 +964,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   </ResponsiveContainer>
                   <div className="absolute text-center pointer-events-none">
                     <div className="text-xl font-bold text-white font-mono">
-                      {analytics?.summary?.totalUsers || users.length}
+                      {analytics?.summary?.totalUsers ?? users.length}
                     </div>
                     <div className="text-[10px] text-slate-400 uppercase">Accounts</div>
                   </div>
@@ -957,45 +990,30 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                 <div>
                   <h3 className="font-bold text-sm text-white flex items-center gap-2">
                     <DollarSign className="w-4 h-4 text-emerald-400" />
-                    <span>Paystack Subscription Revenue Trends (NGN)</span>
+                    <span>Successful Transaction Revenue</span>
                   </h3>
                   <p className="text-[11px] text-slate-400">
-                    Daily recurring payments, upgrade transactions, and cumulative cashflow.
+                    Successful transaction amounts by currency, from Supabase.
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-xs px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-mono font-bold">
-                    Projected ARR: ₦{Number(analytics?.summary?.arr || 1080000).toLocaleString()}
+                    NGN: ₦{Number(analytics?.summary?.totalRevenueNgn ?? 0).toLocaleString()} · USD: ${Number(analytics?.summary?.totalRevenueUsd ?? 0).toLocaleString()}
                   </span>
                 </div>
               </div>
 
-              <div className="h-72 w-full pt-2">
+              <div className="h-72 w-full pt-2 relative">
+                  {analytics?.hasRevenue ? null : <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-900 text-sm text-slate-400">{loadingData || analyticsLoading ? 'Loading analytics…' : analyticsError ? 'Analytics unavailable' : 'No data yet'}</div> }
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={analytics?.trends || []}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.5} />
                     <XAxis dataKey="date" stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                    <YAxis
-                      stroke="#94a3b8"
-                      tickFormatter={(v) => `₦${v >= 1000 ? `${Math.round(v / 1000)}k` : v}`}
-                      tick={{ fontSize: 11 }}
-                    />
+                    <YAxis stroke="#94a3b8" tick={{ fontSize: 11 }} />
                     <Tooltip content={<AnalyticsTooltip />} />
                     <Legend wrapperStyle={{ fontSize: '11px', paddingTop: '10px' }} />
-                    <Bar
-                      dataKey="proRevenue"
-                      name="Pro Tier Revenue (₦15k)"
-                      fill="#6366f1"
-                      stackId="rev"
-                      radius={[0, 0, 0, 0]}
-                    />
-                    <Bar
-                      dataKey="enterpriseRevenue"
-                      name="Enterprise Tier Revenue (₦75k)"
-                      fill="#10b981"
-                      stackId="rev"
-                      radius={[4, 4, 0, 0]}
-                    />
+                    <Bar dataKey="revenueNgn" name="NGN revenue" fill="#10b981" />
+                    <Bar dataKey="revenueUsd" name="USD revenue" fill="#6366f1" />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -1011,15 +1029,13 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                       <span>API Analysis Usage & Latency Telemetry</span>
                     </h3>
                     <p className="text-[11px] text-slate-400">
-                      Volume of Jira ticket impact analyses across Gemini 3.8 Flash vs Heuristic engines with millisecond response latency.
+                      Persisted analysis count and processing latency from Supabase analysis history.
                     </p>
                   </div>
-                  <span className="text-xs px-2.5 py-1 rounded-lg bg-sky-500/20 text-sky-300 border border-sky-500/30 font-mono">
-                    Model: gemini-3.8-flash
-                  </span>
                 </div>
 
-                <div className="h-72 w-full pt-2">
+                <div className="h-72 w-full pt-2 relative">
+                  {analytics?.hasAnalyses ? null : <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-900 text-sm text-slate-400">{loadingData || analyticsLoading ? 'Loading analytics…' : analyticsError ? 'Analytics unavailable' : 'No data yet'}</div> }
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={analytics?.trends || []}>
                       <defs>
@@ -1049,15 +1065,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                         strokeWidth={2}
                         fill="url(#apiCallsGrad)"
                       />
-                      <Area
-                        yAxisId="left"
-                        type="monotone"
-                        dataKey="geminiCalls"
-                        name="Gemini AI Calls"
-                        stroke="#818cf8"
-                        strokeWidth={1.5}
-                        fill="none"
-                      />
                       <Line
                         yAxisId="right"
                         type="monotone"
@@ -1080,12 +1087,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                     <span>Predicted Impact by Domain</span>
                   </h3>
                   <p className="text-[11px] text-slate-400">
-                    File categories predicted across all analyzed tickets.
+                    File categories from analyses in the selected period.
                   </p>
                 </div>
 
                 <div className="space-y-3.5 my-auto">
-                  {(analytics?.apiCategories || []).map((cat: any) => (
+                  {(analytics?.apiCategories || []).length === 0 ? (
+                    <div className="py-8 text-center text-sm text-slate-400">
+                      {loadingData || analyticsLoading ? 'Loading analytics…' : analyticsError ? 'Analytics unavailable' : 'No data yet'}
+                    </div>
+                  ) : (analytics.apiCategories || []).map((cat: any) => (
                     <div key={cat.name} className="space-y-1">
                       <div className="flex items-center justify-between text-xs">
                         <span className="text-slate-300 font-medium">{cat.name}</span>
@@ -1105,7 +1116,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                 </div>
 
                 <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 text-[11px] text-slate-400">
-                  <span className="font-semibold text-slate-300">Heuristic + AI Hybrid:</span> 88% analyzed via Gemini 3.8 Flash, 12% instant local fallback.
+                  Category totals are calculated from stored analysis history for the selected period.
                 </div>
               </div>
             </div>
@@ -1546,7 +1557,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                       <td className="p-3 font-mono text-indigo-300 font-bold">{tx.reference}</td>
                       <td className="p-3 text-slate-300">{tx.email}</td>
                       <td className="p-3 capitalize text-slate-200">{tx.tier}</td>
-                      <td className="p-3 font-bold text-emerald-400">₦{Number(tx.amount).toLocaleString()}</td>
+                      <td className="p-3 font-bold text-emerald-400">{tx.currency === 'USD' ? '$' : '₦'}{Number(tx.amount).toLocaleString()} {tx.currency || 'NGN'}</td>
                       <td className="p-3">
                         <span
                           className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
@@ -1738,24 +1749,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                 </label>
               </div>
 
-              <div className="pt-4 border-t border-slate-800 space-y-3">
-                <div>
-                  <h3 className="text-xs font-bold text-white flex items-center gap-2">
-                    <span className={`w-2 h-2 rounded-full ${settings?.githubOAuthConfigured ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
-                    GitHub OAuth
-                  </h3>
-                  <p className="text-[11px] text-slate-400 mt-1">
-                    {settings?.githubOAuthConfigured
-                      ? 'OAuth credentials are configured as server-side Vercel environment variables.'
-                      : 'Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in the Vercel project environment.'}
-                  </p>
-                  <p className="text-[11px] text-slate-400 mt-1">
-                    Configure this exact callback URL in the GitHub OAuth App:
-                  </p>
-                </div>
-                <div className="font-mono text-indigo-300 bg-slate-950 p-2 rounded select-all break-all text-[11px]">
-                  {window.location.origin}/api/auth/github/callback
-                </div>
+              <div className="pt-4 border-t border-slate-800 space-y-2">
+                <h3 className="text-xs font-bold text-white">GitHub sign-in provider</h3>
+                <p className="text-[11px] text-slate-400">
+                  GitHub OAuth is managed in Supabase Authentication &gt; Providers. Add this app origin to Supabase's redirect URL allowlist; the frontend uses Supabase Auth directly.
+                </p>
               </div>
 
               <div className="flex justify-end pt-2">

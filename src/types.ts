@@ -161,5 +161,4 @@ export interface AdminSystemSettings {
   proLimit: number;
   maintenanceMode: boolean;
   geminiModel: string;
-  githubOAuthConfigured?: boolean;
 }

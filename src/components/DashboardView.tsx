@@ -148,8 +148,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {totalAnalyses > 0 ? `${avgConfidence}%` : '--'}
             </span>
             {totalAnalyses > 0 && (
-              <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">
-                High
+              <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${avgConfidence >= 80 ? 'bg-emerald-100 text-emerald-700' : avgConfidence >= 50 ? 'bg-amber-100 text-amber-700' : 'bg-rose-100 text-rose-700'}`}>
+                {avgConfidence >= 80 ? 'High' : avgConfidence >= 50 ? 'Moderate' : 'Low'}
               </span>
             )}
           </div>
