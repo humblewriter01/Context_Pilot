@@ -8,6 +8,7 @@ import {
   resetPasswordForEmail,
   signInWithGitHub
 } from '../services/supabase';
+import { describeAuthError, isEmailAlreadyExistsError } from '../services/authErrors';
 import {
   X,
   Mail,
@@ -54,10 +55,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
         const dynamicRedirect = `${window.location.origin}/#reset-password`;
         const { error: resetErr } = await resetPasswordForEmail(email.trim(), dynamicRedirect);
         if (resetErr) {
-          throw new Error(resetErr.message || 'Failed to dispatch reset email via Supabase');
+          throw new Error(describeAuthError(resetErr, 'Failed to send the password reset email.'));
         }
 
-        setSuccessMessage(`Password reset link has been dispatched to ${email.trim()} via Supabase. Please check your inbox.`);
+        setSuccessMessage(`Password reset link has been sent to ${email.trim()}. Please check your inbox.`);
         return;
       }
 
@@ -68,7 +69,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
 
         const data = await signUpWithEmailPassword(email.trim(), password, displayName.trim());
         if (!data?.user) {
-          throw new Error('Registration failed: no user returned by Supabase');
+          throw new Error('Registration failed. Please try again.');
         }
 
         if (!data.session) {
@@ -96,7 +97,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
         return;
       }
 
-      // Default: Sign In mode via Supabase
+      // Default: e-mail + password sign-in
       if (!email.trim()) throw new Error('Please enter your work email');
       if (!password) throw new Error('Please enter your password');
 
@@ -128,7 +129,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
       onClose();
     } catch (err: any) {
       console.warn('[Authentication Notice]', err?.message || err);
-      setError(err?.message || 'Invalid login credentials. Please check your credentials.');
+      if (isEmailAlreadyExistsError(err)) {
+        // The address is registered: show the sign-in form (password + GitHub).
+        setMode('signin');
+      }
+      setError(describeAuthError(err, 'Invalid login credentials. Please check your credentials.'));
     } finally {
       setLoading(false);
     }
@@ -142,7 +147,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
     try {
       await signInWithGitHub(window.location.origin);
     } catch (err: any) {
-      setError(err?.message || 'Failed to authenticate with GitHub.');
+      setError(describeAuthError(err, 'Failed to authenticate with GitHub.'));
       setLoading(false);
     }
   };
@@ -170,7 +175,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
           <h2 className="text-xl font-bold text-slate-900 tracking-tight">
             {mode === 'signin' && 'Sign In to Context Pilot'}
             {mode === 'signup' && 'Create Your Account'}
-            {mode === 'forgot' && 'Reset Password via Supabase'}
+            {mode === 'forgot' && 'Reset Your Password'}
           </h2>
           <p className="text-xs text-slate-500 max-w-xs mx-auto">
             {mode === 'signin' && 'Access AI code impact predictions, audit history, and Jira tools'}
@@ -307,7 +312,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
               {loading ? (
                 <>
                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  <span>Processing with Supabase...</span>
+                  <span>Processing securely...</span>
                 </>
               ) : (
                 <span>

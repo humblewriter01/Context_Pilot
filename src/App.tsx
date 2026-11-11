@@ -22,6 +22,7 @@ import {
   type UserSyncSnapshot,
   type RemoteAnalysisRecord,
 } from './services/supabase';
+import { readAuthRedirectError, clearAuthRedirectError } from './services/authErrors';
 import ResetPasswordModal from './components/ResetPasswordModal';
 import { formatDisplayName } from './components/UserAvatar';
 import { UserProfile, UsageStats, AnalysisRecord, FeedbackRecord, SubscriptionTier } from './types';
@@ -56,6 +57,15 @@ export const App: React.FC = () => {
   // Modals
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
+
+  // A failed GitHub / e-mail-link redirect lands back here with the reason in the
+  // URL. Capture it once so the sign-in screen can explain what happened.
+  const [authRedirectError, setAuthRedirectError] = useState<string | null>(() => readAuthRedirectError());
+
+  useEffect(() => {
+    // Once somebody is signed in the old failure is no longer relevant.
+    if (user) setAuthRedirectError(null);
+  }, [user]);
 
   // Password recovery (Supabase link -> update password)
   const [isRecoveryMode, setIsRecoveryMode] = useState(() => {
@@ -203,6 +213,8 @@ export const App: React.FC = () => {
           setUser(null);
         }
       } finally {
+        // The auth client has finished reading the redirect by now.
+        clearAuthRedirectError();
         if (isMounted) {
           setIsCheckingSession(false);
         }
@@ -326,7 +338,7 @@ export const App: React.FC = () => {
     try {
       await signOut();
     } catch (e) {
-      console.warn('Supabase sign out error:', e);
+      console.warn('Sign out error:', e);
     }
     storageService.logoutUser();
     setUser(null);
@@ -375,7 +387,7 @@ export const App: React.FC = () => {
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
           </svg>
-          <span>Verifying session with Supabase...</span>
+          <span>Verifying your session...</span>
         </div>
       </div>
     );
@@ -399,6 +411,7 @@ export const App: React.FC = () => {
   if (!user) {
     return (
       <SignInGate
+        initialError={authRedirectError}
         onAuthSuccess={(authedUser) => {
           setUser(authedUser);
           setUsage(storageService.getUsage());

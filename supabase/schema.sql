@@ -133,10 +133,11 @@ create policy "Allow users to read own profile"
   on public.users for select
   using (auth.uid() = auth_id or auth.jwt() ->> 'email' = email);
 
+-- Profiles are written only by the backend (service role), never from the
+-- browser. An UPDATE policy here would let a signed-in user change their own
+-- plan or status through the public data API, so there is none. The statement
+-- below removes the policy that earlier versions of this script created.
 drop policy if exists "Allow users to update own profile" on public.users;
-create policy "Allow users to update own profile"
-  on public.users for update
-  using (auth.uid() = auth_id or auth.jwt() ->> 'email' = email);
 
 -- Analysis History RLS
 drop policy if exists "Allow users to read own analyses" on public.analysis_history;
@@ -156,8 +157,8 @@ create policy "Users can delete own analyses"
 
 -- ===================================================================
 -- EXPLICIT PRIVILEGES (required on top of RLS)
--- service_role bypasses RLS but still needs table privileges; anon needs
--- to read pricing settings for the marketing/pricing screens.
+-- service_role bypasses RLS but still needs table privileges. The browser
+-- roles get the bare minimum (see below).
 -- ===================================================================
 
 grant usage on schema public to anon, authenticated, service_role;
@@ -165,21 +166,31 @@ grant usage on schema public to anon, authenticated, service_role;
 grant all privileges on all tables in schema public to service_role;
 grant all privileges on all sequences in schema public to service_role;
 
-grant select, insert, update on public.users to authenticated;
-grant select, insert, update, delete on public.user_usage to authenticated;
-grant select, insert, delete on public.analysis_history to authenticated;
-grant select, insert, delete on public.feedback to authenticated;
-grant select on public.transactions to authenticated;
-grant select on public.system_settings to authenticated;
+-- Browser roles (anon = visitor without a session, authenticated = signed-in
+-- user): least privilege. The app reads and writes these tables only through
+-- the backend (service role), so the browser roles keep just what a row level
+-- security policy in this script can actually use. Start from nothing, which
+-- also takes back whatever the platform defaults or earlier versions of this
+-- script handed out (TRUNCATE, REFERENCES, TRIGGER, UPDATE, DELETE, ...), then
+-- grant the few privileges that are needed.
+revoke all on
+  public.users, public.user_usage, public.analysis_history, public.feedback,
+  public.transactions, public.promo_codes, public.system_settings
+from anon, authenticated;
 
-grant select on public.system_settings to anon;
-grant select on public.promo_codes to anon, authenticated;
+grant select on public.system_settings to anon, authenticated;    -- public prices (also the keep-alive ping)
+grant select on public.users to authenticated;                     -- own profile
+grant select, insert on public.analysis_history to authenticated;  -- own analyses
+grant insert on public.feedback to authenticated;                  -- own feedback
+grant select on public.transactions to authenticated;              -- own receipts
+-- No browser access at all: public.user_usage (quotas) and public.promo_codes
+-- (discount codes). No UPDATE, DELETE or TRUNCATE on any table: profiles, plans
+-- and quotas are written only by the backend, analyses are deleted through the
+-- API, and row level security does not cover TRUNCATE. A privilege that no
+-- policy uses only waits for a mistaken policy to make it dangerous.
 
 alter default privileges in schema public grant all on tables to service_role;
 alter default privileges in schema public grant all on sequences to service_role;
-
--- Explicitly grant DELETE permission to authenticated users
-grant delete on public.analysis_history to authenticated;
 
 -- Feedback RLS
 drop policy if exists "Allow users to insert feedback" on public.feedback;
@@ -187,11 +198,12 @@ create policy "Allow users to insert feedback"
   on public.feedback for insert
   with check (auth.jwt() ->> 'email' = user_email);
 
--- Promo Codes RLS (Public read for active validation during checkout)
+-- Promo Codes RLS: no policy at all. Codes are validated by the backend
+-- (POST /api/promos/validate, service role). A public SELECT policy would let
+-- anyone holding the public key list every active discount code, so there is
+-- none. The statement below removes the policy that earlier versions of this
+-- script created.
 drop policy if exists "Allow public to validate active promos" on public.promo_codes;
-create policy "Allow public to validate active promos"
-  on public.promo_codes for select
-  using (is_active = true);
 
 -- System Settings RLS (Public read for plan prices in NGN and USD)
 drop policy if exists "Allow public to read system settings" on public.system_settings;
@@ -207,27 +219,98 @@ create policy "Allow users to read own transactions"
 
 
 -- ===================================================================
--- AUTH TRIGGER (Auto-create user profile on signup)
+-- AUTH TRIGGER (one profile per e-mail address)
+--
+-- Every new row in auth.users (e-mail sign-up, GitHub OAuth, ...) provisions
+-- its profile in public.users. When the address already owns a profile, the
+-- new auth_id is linked to that profile instead of creating a duplicate.
+--
+-- Upgrading a project created with an earlier version of this file? Run
+-- supabase/migrations/link_profiles_by_email.sql instead: it merges any existing
+-- duplicate profiles before adding the unique index below.
 -- ===================================================================
 
--- Create a function to handle new user signups
-create or replace function public.handle_new_user() 
-returns trigger as $$
+-- One profile per address, regardless of letter case
+create unique index if not exists users_email_lower_key on public.users (lower(email));
+
+-- Keep in sync with the copy in supabase/migrations/link_profiles_by_email.sql
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_email      text;
+  v_name       text;
+  v_photo      text;
+  v_profile_id uuid;
 begin
-  insert into public.users (auth_id, email, display_name)
-  values (
-    new.id, 
-    new.email, 
-    coalesce(new.raw_user_meta_data->>'full_name', 'Developer')
-  )
-  on conflict (email) do update 
-    set auth_id = excluded.auth_id; -- Syncs the auth_id if the user existed beforehand
+  v_email := lower(nullif(btrim(new.email), ''));
+
+  -- Sign-ins without an e-mail address (e.g. phone) have no profile key yet.
+  if v_email is null then
+    return new;
+  end if;
+
+  v_name := nullif(btrim(coalesce(
+    nullif(btrim(new.raw_user_meta_data ->> 'full_name'), ''),
+    nullif(btrim(new.raw_user_meta_data ->> 'display_name'), ''),
+    nullif(btrim(new.raw_user_meta_data ->> 'name'), ''),
+    nullif(btrim(new.raw_user_meta_data ->> 'user_name'), ''),
+    new.raw_user_meta_data ->> 'preferred_username'
+  )), '');
+
+  v_photo := nullif(btrim(coalesce(
+    nullif(btrim(new.raw_user_meta_data ->> 'avatar_url'), ''),
+    new.raw_user_meta_data ->> 'picture'
+  )), '');
+
+  -- 1. The address already has a profile: link this sign-in to it and keep
+  --    its plan, status and history. Only blank details are filled in.
+  update public.users as u
+     set auth_id       = new.id,
+         display_name  = case
+                           when nullif(btrim(u.display_name), '') is null
+                             or btrim(u.display_name) = 'Developer'
+                             then coalesce(v_name, 'Developer')
+                           else u.display_name
+                         end,
+         photo_url     = coalesce(nullif(btrim(u.photo_url), ''), v_photo),
+         last_login_at = timezone('utc', now())
+   where u.id = (
+           select p.id
+             from public.users as p
+            where lower(p.email) = v_email
+            order by (p.email = v_email) desc, p.created_at, p.id
+            limit 1
+         )
+  returning u.id into v_profile_id;
+
+  -- 2. First time this address is seen: create its profile.
+  if v_profile_id is null then
+    insert into public.users (auth_id, email, display_name, photo_url)
+    values (new.id, v_email, coalesce(v_name, 'Developer'), v_photo)
+    on conflict (email) do update
+      set auth_id = excluded.auth_id;
+  end if;
+
   return new;
+exception
+  when others then
+    -- A profile problem must never block a sign-up or sign-in. The API links
+    -- or creates the profile on the first authenticated request instead.
+    raise warning 'handle_new_user: could not sync the profile for auth user % (SQLSTATE %): %',
+      new.id, sqlstate, sqlerrm;
+    return new;
 end;
-$$ language plpgsql security definer;
+$$;
+
+comment on function public.handle_new_user() is
+  'Provisions public.users for a new auth user, linking to the existing profile when the e-mail address already has one.';
 
 -- Trigger the function every time a user is created
 drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
   after insert on auth.users
-  for each row execute procedure public.handle_new_user();
+  for each row execute function public.handle_new_user();

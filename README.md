@@ -76,6 +76,41 @@ The repository ships with a serverless-ready layout:
 
 Then run `supabase/schema.sql` in the Supabase SQL editor. GitHub verification uses the GitHub provider configured under Supabase Authentication → Providers. Add your app origin to the Supabase redirect URL allowlist. GitHub authorization is handled through the Supabase Auth session; the verifier does not add a separate credential store.
 
+**Upgrading an existing database** — run `supabase/migrations/link_profiles_by_email.sql` once in the Supabase SQL editor
+(it is safe to run again). It merges profiles that share an e-mail address, enforces one profile per address regardless of
+letter case, and updates the sign-up trigger so that a new sign-in method (for example GitHub after e-mail sign-up) is linked
+to the existing profile instead of creating a second one. New installations get the same behaviour from `supabase/schema.sql`.
+Linking is done by verified e-mail address, so keep **Confirm email** enabled under Supabase Authentication.
+
+**Database access from the browser** — the app reads and writes its tables only through the backend (service role). The two
+browser roles keep the bare minimum, and every privilege they keep is paired with a row level security policy:
+
+| Table | Visitor (`anon`) | Signed-in user (`authenticated`) |
+| --- | --- | --- |
+| `system_settings` | read | read |
+| `users` | – | read own row |
+| `analysis_history` | – | read and insert own rows |
+| `feedback` | – | insert own rows |
+| `transactions` | – | read own rows |
+| `user_usage`, `promo_codes` | – | – |
+
+So a plan, account status, quota or price can never be set from the browser, promo codes cannot be listed with the public key,
+and neither role holds UPDATE, DELETE or TRUNCATE on any table. Profile edits such as a display name belong in a backend
+endpoint. The keep-alive workflow relies on the visitor's read access to `system_settings`.
+
+Databases created before these rules must run three files from `supabase/migrations/` once in the Supabase SQL editor:
+`drop_users_update_policy.sql`, `drop_promo_codes_public_policy.sql` and `restrict_browser_privileges.sql`
+(`revoke_users_write_grants.sql` is an earlier, narrower step that the last file includes). Each is safe to run again, and
+re-running `supabase/schema.sql` applies all of them.
+
+**Billing currency** — the pricing page starts in USD and switches to NGN only for visitors located in Nigeria, or when the
+visitor picks NGN. The selected currency is what Paystack is asked to charge (USD in cents, NGN in kobo), priced on the server.
+USD has to be enabled on the Paystack merchant account; until it is, USD checkouts are declined with a message that offers NGN.
+
+**GitHub repositories** — the verifier lists the connected account's repositories (most recently updated first). Sign-in asks
+GitHub for no repository scope, so only public repositories are listed until the user chooses *Include private repositories*,
+which requests the `repo` scope. Any public repository can still be entered manually as `owner/repo`.
+
 **Post-deploy verification**
 
 | Check | Expected |

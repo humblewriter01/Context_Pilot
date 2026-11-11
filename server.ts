@@ -33,6 +33,39 @@ app.use(
   })
 );
 
+// ---------------------------------------------------------
+// White-label guard
+// API responses are rendered by the product UI, so the text fields of a JSON
+// body must never name the infrastructure vendor. Messages written in this file
+// are already neutral; this is the safety net for text forwarded from client
+// libraries and upstream services. The original is kept in the server log.
+// The /api/supabase/* routes are operator diagnostics and are left untouched.
+// ---------------------------------------------------------
+const VENDOR_NAME_RE = /supabase/i;
+const WHITE_LABEL_TEXT_FIELDS = ['error', 'message', 'hint'] as const;
+const WHITE_LABEL_FALLBACK = 'A backend service error occurred. Please try again.';
+
+function whiteLabelBody(body: unknown): unknown {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  let sanitized: Record<string, unknown> | null = null;
+  for (const field of WHITE_LABEL_TEXT_FIELDS) {
+    const value = (body as Record<string, unknown>)[field];
+    if (typeof value === 'string' && VENDOR_NAME_RE.test(value)) {
+      console.warn(`[White-label] Replaced "${field}" in an API response: ${value}`);
+      sanitized = sanitized || { ...(body as Record<string, unknown>) };
+      sanitized[field] = WHITE_LABEL_FALLBACK;
+    }
+  }
+  return sanitized || body;
+}
+
+app.use('/api', (req, res, next) => {
+  if (req.path.startsWith('/supabase/')) return next();
+  const sendJson = res.json.bind(res);
+  res.json = (body?: any) => sendJson(whiteLabelBody(body));
+  next();
+});
+
 // Helper to get current YYYY-MM
 function getCurrentMonthYear(): string {
   const d = new Date();
@@ -157,7 +190,7 @@ async function fetchAllQueryRows(query: any, pageSize = 1000): Promise<any[]> {
   const rows: any[] = [];
   for (let offset = 0; offset < 100_000; offset += pageSize) {
     const { data, error } = await query.range(offset, offset + pageSize - 1);
-    if (error) throw new Error(error.message || 'Supabase query failed.');
+    if (error) throw new Error(error.message || 'Database query failed.');
     const page = Array.isArray(data) ? data : [];
     rows.push(...page);
     if (page.length < pageSize) return rows;
@@ -397,19 +430,88 @@ async function updateUserByIdentifier(identifier: string, patch: Record<string, 
   }
 }
 
+/** Canonical form of an e-mail address: the key of a public.users profile. */
+function normalizeEmail(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+const PG_UNIQUE_VIOLATION = '23505';
+
 /**
- * Guarantees a public.users row exists for the signed-in identity so that
- * quota checks and history inserts never fail on foreign keys.
+ * Points a profile at the auth identity that is signing in. An auth identity can
+ * back only one profile, so it is first released from any other (stale) row.
+ */
+async function linkProfileToAuthUser(email: string, authUserId: string): Promise<void> {
+  if (!supabaseAdmin) return;
+
+  const { error: releaseError } = await supabaseAdmin
+    .from('users')
+    .update({ auth_id: null })
+    .eq('auth_id', authUserId)
+    .neq('email', email);
+  if (releaseError) console.warn('[User Profile Link Warning]:', releaseError.message);
+
+  const { error: linkError } = await supabaseAdmin
+    .from('users')
+    .update({ auth_id: authUserId })
+    .eq('email', email);
+  if (linkError) console.warn('[User Profile Link Warning]:', linkError.message);
+}
+
+/**
+ * Guarantees exactly one public.users row per e-mail address, so quota checks
+ * and history inserts never fail on foreign keys and no duplicate profile is
+ * created when the same person signs in with another method.
+ *
+ * When the address already has a profile (for example it signed up with e-mail
+ * and now signs in with GitHub), the signed-in auth identity is linked to that
+ * existing profile instead of creating a new one. This mirrors the
+ * public.handle_new_user() database trigger for requests that reach the API
+ * before, or without, the trigger having run.
  */
 async function ensureUserProfile(email: string, authUserId?: string): Promise<void> {
-  if (!supabaseAdmin || !email) return;
+  const normalizedEmail = normalizeEmail(email);
+  if (!supabaseAdmin || !normalizedEmail) return;
+
   try {
-    const row: Record<string, unknown> = { email: email.trim().toLowerCase() };
+    const { data: existing, error: lookupError } = await supabaseAdmin
+      .from('users')
+      .select('auth_id')
+      .eq('email', normalizedEmail)
+      .maybeSingle();
+    if (lookupError) {
+      console.warn('[User Profile Lookup Warning]:', lookupError.message);
+      return;
+    }
+
+    if (existing) {
+      if (authUserId && existing.auth_id !== authUserId) {
+        await linkProfileToAuthUser(normalizedEmail, authUserId);
+      }
+      return;
+    }
+
+    const row: Record<string, unknown> = { email: normalizedEmail };
     if (authUserId) row.auth_id = authUserId;
-    const { error } = await supabaseAdmin.from('users').upsert(row, { onConflict: 'email' });
-    if (error) console.warn('[User Profile Upsert Warning]:', error.message);
+    const { error: insertError } = await supabaseAdmin.from('users').insert(row);
+    if (!insertError) return;
+
+    if (insertError.code !== PG_UNIQUE_VIOLATION) {
+      console.warn('[User Profile Insert Warning]:', insertError.message);
+      return;
+    }
+
+    // Unique violation: either a parallel request (or the sign-up trigger) created
+    // the profile first, or this auth identity is still attached to another row.
+    if (authUserId) {
+      await linkProfileToAuthUser(normalizedEmail, authUserId);
+    }
+    const { error: retryError } = await supabaseAdmin
+      .from('users')
+      .upsert(row, { onConflict: 'email', ignoreDuplicates: !authUserId });
+    if (retryError) console.warn('[User Profile Upsert Warning]:', retryError.message);
   } catch (err) {
-    console.warn('[User Profile Upsert Error]:', err);
+    console.warn('[User Profile Sync Error]:', err);
   }
 }
 
@@ -440,16 +542,16 @@ async function resolveBearerUser(req: express.Request): Promise<AuthLookup> {
 async function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(403).json({ error: 'Forbidden. Supabase authentication token required.' });
+    return res.status(403).json({ error: 'Forbidden. An authentication token is required.' });
   }
 
   const token = authHeader.split('Bearer ')[1]?.trim();
   if (!token) {
-    return res.status(403).json({ error: 'Forbidden. Supabase authentication token required.' });
+    return res.status(403).json({ error: 'Forbidden. An authentication token is required.' });
   }
 
   if (!supabaseServer) {
-    return res.status(403).json({ error: 'Forbidden. Supabase is not configured on the server.' });
+    return res.status(403).json({ error: 'Forbidden. Authentication is not configured on the server.' });
   }
 
   try {
@@ -517,8 +619,10 @@ app.post('/api/paystack/initialize', async (req, res) => {
     } = req.body;
     await hydrateSettings();
     const secretKey = SERVER_STORE.settings.paystackSecretKey || process.env.PAYSTACK_SECRET_KEY;
+    // Profiles are keyed by the canonical (lower-case) address.
+    const customerEmail = normalizeEmail(email);
 
-    if (!email || !tier || !['pro', 'enterprise'].includes(tier)) {
+    if (!customerEmail || !tier || !['pro', 'enterprise'].includes(tier)) {
       return res.status(400).json({ error: 'Missing required fields: email and a paid tier (pro or enterprise)' });
     }
 
@@ -530,7 +634,9 @@ app.post('/api/paystack/initialize', async (req, res) => {
       });
     }
 
-    const selectedCurrency = (clientCurrency === 'USD' || clientCurrency === 'NGN')
+    // The currency chosen on the pricing page; the store default applies only
+    // when a client does not send one.
+    const selectedCurrency: 'NGN' | 'USD' = (clientCurrency === 'USD' || clientCurrency === 'NGN')
       ? clientCurrency
       : SERVER_STORE.settings.currency;
 
@@ -567,7 +673,7 @@ app.post('/api/paystack/initialize', async (req, res) => {
     const reference = `CP_${tier.toUpperCase()}_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
 
     const paystackPayload = {
-      email,
+      email: customerEmail,
       amount: amountInSubunits,
       currency: selectedCurrency,
       reference,
@@ -575,7 +681,7 @@ app.post('/api/paystack/initialize', async (req, res) => {
       metadata: {
         tier,
         app: 'Context Pilot',
-        customer_email: email,
+        customer_email: customerEmail,
         promo_code: appliedPromo ? appliedPromo.code : null,
         final_amount: finalAmount,
         currency: selectedCurrency,
@@ -595,8 +701,20 @@ app.post('/api/paystack/initialize', async (req, res) => {
     const data = await response.json();
 
     if (!response.ok || !data.status) {
+      const gatewayMessage = typeof data?.message === 'string' ? data.message : '';
+      // The merchant account has not been enabled for this currency.
+      if (/currency/i.test(gatewayMessage) && /not supported|unsupported|not enabled|invalid/i.test(gatewayMessage)) {
+        console.warn(`[Paystack Initialize] ${selectedCurrency} rejected by the gateway: ${gatewayMessage}`);
+        return res.status(400).json({
+          error: `${selectedCurrency} payments are not enabled for this store yet. Please switch to ${
+            selectedCurrency === 'USD' ? 'NGN (₦)' : 'USD ($)'
+          } or contact support.`,
+          code: 'currency_not_supported',
+          currency: selectedCurrency,
+        });
+      }
       return res.status(400).json({
-        error: data.message || 'Failed to initialize transaction with Paystack API',
+        error: gatewayMessage || 'Failed to initialize transaction with Paystack API',
         details: data,
       });
     }
@@ -610,7 +728,7 @@ app.post('/api/paystack/initialize', async (req, res) => {
       reference,
       amount: finalAmount,
       currency: selectedCurrency,
-      email,
+      email: customerEmail,
       tier,
       status: 'pending',
       createdAt: new Date().toISOString(),
@@ -621,14 +739,13 @@ app.post('/api/paystack/initialize', async (req, res) => {
     // Persist the pending transaction so the admin ledger survives serverless cold starts.
     if (supabaseAdmin) {
       try {
-        await supabaseAdmin.from('users').upsert(
-          { email, last_login_at: new Date().toISOString() },
-          { onConflict: 'email', ignoreDuplicates: true }
-        );
+        // The ledger row references the profile by e-mail: reuse the existing
+        // profile for this address, creating one only if none exists yet.
+        await ensureUserProfile(customerEmail);
         await supabaseAdmin.from('transactions').upsert(
           {
             reference,
-            user_email: email,
+            user_email: customerEmail,
             tier,
             amount: finalAmount,
             currency: selectedCurrency,
@@ -648,6 +765,7 @@ app.post('/api/paystack/initialize', async (req, res) => {
       access_code: data.data.access_code,
       reference: data.data.reference,
       finalAmount,
+      currency: selectedCurrency,
     });
   } catch (error: any) {
     console.error('Paystack initialization error:', error);
@@ -683,7 +801,7 @@ app.get('/api/paystack/verify/:reference', async (req, res) => {
     const txData = data.data;
     const isSuccess = txData.status === 'success';
     const tier = (txData.metadata?.tier as 'free' | 'pro' | 'enterprise') || 'pro';
-    const customerEmail = txData.customer?.email || '';
+    const customerEmail = normalizeEmail(txData.customer?.email);
 
     const existingTxIndex = SERVER_STORE.transactions.findIndex((t) => t.reference === reference);
     const updatedTx: StoredTransaction = {
@@ -736,8 +854,9 @@ app.get('/api/paystack/verify/:reference', async (req, res) => {
         });
       }
 
-      // Sync with Supabase if configured
+      // Persist to the database when configured
       if (supabaseAdmin) {
+        await ensureUserProfile(customerEmail);
         await supabaseAdmin.from('transactions').upsert(
           {
             reference,
@@ -821,7 +940,7 @@ app.post('/api/paystack/webhook', async (req: any, res) => {
     const event = req.body;
     if (event && event.event === 'charge.success') {
       const data = event.data;
-      const userEmail = (data.customer?.email || '').toLowerCase().trim();
+      const userEmail = normalizeEmail(data.customer?.email);
       const reference = data.reference;
       const amount = (data.amount || 0) / 100;
       const currency = data.currency || 'NGN';
@@ -860,8 +979,11 @@ app.post('/api/paystack/webhook', async (req: any, res) => {
         memUser.subscriptionTier = tier;
       }
 
-      // 2. Persist to Supabase using supabaseAdmin (bypassing RLS)
+      // 2. Persist with the service-role client (bypassing RLS)
       if (supabaseAdmin && userEmail) {
+        // The transaction and tier upgrade both hang off the customer's profile.
+        await ensureUserProfile(userEmail);
+
         // Record in transactions table
         const { error: txError } = await supabaseAdmin.from('transactions').upsert(
           {
@@ -878,7 +1000,7 @@ app.post('/api/paystack/webhook', async (req: any, res) => {
           { onConflict: 'reference' }
         );
         if (txError) {
-          console.error('[Paystack Webhook] Supabase transaction upsert error:', txError);
+          console.error('[Paystack Webhook] Transaction upsert error:', txError);
         }
 
         // Upgrade user subscription_tier in public.users table
@@ -890,9 +1012,9 @@ app.post('/api/paystack/webhook', async (req: any, res) => {
           })
           .eq('email', userEmail);
         if (userError) {
-          console.error('[Paystack Webhook] Supabase user tier update error:', userError);
+          console.error('[Paystack Webhook] User tier update error:', userError);
         } else {
-          console.log(`[Paystack Webhook] Successfully updated ${userEmail} to ${tier} in Supabase public.users`);
+          console.log(`[Paystack Webhook] Successfully updated ${userEmail} to ${tier} in public.users`);
         }
 
         // Update quota in user_usage table for current month
@@ -977,7 +1099,7 @@ app.get('/api/admin/verify', requireAdmin, (req: any, res) => {
 // Admin System Overview & Analytics (database-backed; no in-memory/demo fallbacks).
 app.get('/api/admin/overview', requireAdmin, async (_req, res) => {
   if (!supabaseAdmin) {
-    return res.status(503).json({ error: 'Supabase service role client is not configured.' });
+    return res.status(503).json({ error: 'The database service is not configured on the server.' });
   }
 
   try {
@@ -1029,7 +1151,7 @@ app.get('/api/admin/overview', requireAdmin, async (_req, res) => {
     });
   } catch (err: any) {
     console.error('[Admin Overview Query Error]:', err?.message || err);
-    return res.status(500).json({ error: 'Could not load live user and transaction totals from Supabase.' });
+    return res.status(500).json({ error: 'Could not load live user and transaction totals from the database.' });
   }
 });
 
@@ -1038,7 +1160,7 @@ app.get('/api/admin/overview', requireAdmin, async (_req, res) => {
 // data sources are flagged so the UI can render a clear empty state.
 app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
   if (!supabaseAdmin) {
-    return res.status(503).json({ error: 'Supabase service role client is not configured.' });
+    return res.status(503).json({ error: 'The database service is not configured on the server.' });
   }
 
   const requestedDays = Number.parseInt(String(req.query.days || ''), 10) || 14;
@@ -1217,7 +1339,7 @@ app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
     });
   } catch (err: any) {
     console.error('[Admin Analytics Query Error]:', err?.message || err);
-    return res.status(500).json({ error: 'Could not load live analytics from Supabase.' });
+    return res.status(500).json({ error: 'Could not load live analytics from the database.' });
   }
 });
 
@@ -1719,8 +1841,8 @@ app.post('/api/admin/settings', requireAdmin, async (req, res) => {
   res.json({
     success: true,
     message: supabaseAdmin
-      ? 'System settings updated and saved to Supabase.'
-      : 'System settings updated in memory only (Supabase service role key not configured).',
+      ? 'System settings updated and saved to the database.'
+      : 'System settings updated in memory only (database service key not configured).',
     persisted: Boolean(supabaseAdmin),
   });
 });
@@ -2133,7 +2255,7 @@ app.get('/api/history', authenticateUser, async (req: express.Request, res: expr
   const userEmail = (req as any).userEmail as string;
 
   if (!supabaseAdmin) {
-    return res.status(503).json({ error: 'Supabase service role client is not configured.' });
+    return res.status(503).json({ error: 'The database service is not configured on the server.' });
   }
 
   try {
@@ -2265,7 +2387,7 @@ app.delete('/api/history/:id', authenticateUser, async (req: express.Request, re
           .eq('user_email', userEmail);
 
         if (deleteErr) {
-          return res.status(500).json({ error: deleteErr.message || 'Failed to delete record from Supabase.' });
+          return res.status(500).json({ error: deleteErr.message || 'Failed to delete the record from the database.' });
         }
       } else {
         // Fallback delete by ticket key when the client did not have a database UUID.
@@ -2298,7 +2420,7 @@ app.delete('/api/history', authenticateUser, async (req: express.Request, res: e
         .eq('user_email', userEmail);
 
       if (deleteErr) {
-        return res.status(500).json({ error: deleteErr.message || 'Failed to clear records from Supabase.' });
+        return res.status(500).json({ error: deleteErr.message || 'Failed to clear records from the database.' });
       }
     }
 
@@ -2442,14 +2564,14 @@ app.post('/api/auth/reset-password', async (req, res) => {
       if (error) {
         return res.status(400).json({ error: error.message });
       }
-      return res.json({ success: true, message: 'Password reset link sent successfully via Supabase' });
+      return res.json({ success: true, message: 'Password reset link sent successfully.' });
     } catch (e: any) {
       return res.status(500).json({ error: e?.message || 'Failed to dispatch reset email' });
     }
   }
 
   return res.status(503).json({
-    error: 'Authentication service is currently unavailable. Please ensure SUPABASE_URL is set in environment variables.',
+    error: 'Authentication service is currently unavailable. Please try again later.',
   });
 });
 

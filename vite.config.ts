@@ -14,7 +14,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          'vendor-supabase': ['@supabase/supabase-js'],
+          'vendor-auth': ['@supabase/supabase-js'],
           'vendor-charts': ['recharts'],
           'vendor-icons': ['lucide-react'],
         },

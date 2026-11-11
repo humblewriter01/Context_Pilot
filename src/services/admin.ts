@@ -13,7 +13,7 @@ export const adminService = {
         return session.access_token;
       }
     } catch (e) {
-      console.warn('Error reading Supabase session for admin:', e);
+      console.warn('Error reading admin session:', e);
     }
     return localStorage.getItem(ADMIN_TOKEN_KEY);
   },
@@ -241,7 +241,7 @@ export const adminService = {
     return await res.json();
   },
 
-  async validatePromo(code: string, tier: 'pro' | 'enterprise', amount: number, currency: 'NGN' | 'USD' = 'NGN') {
+  async validatePromo(code: string, tier: 'pro' | 'enterprise', amount: number, currency: 'NGN' | 'USD' = 'USD') {
     const res = await fetch('/api/promos/validate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

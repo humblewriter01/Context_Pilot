@@ -8,6 +8,7 @@ import {
   resetPasswordForEmail,
   signInWithGitHub
 } from '../services/supabase';
+import { describeAuthError, isEmailAlreadyExistsError } from '../services/authErrors';
 import {
   Mail,
   Lock,
@@ -27,16 +28,18 @@ import {
 
 interface SignInGateProps {
   onAuthSuccess: (user: UserProfile) => void;
+  /** Message carried over from a failed sign-in redirect (e.g. a cancelled GitHub login). */
+  initialError?: string | null;
 }
 
-export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
+export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess, initialError = null }) => {
   const [tab, setTab] = useState<'signin' | 'signup' | 'forgot'>('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(initialError);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -53,7 +56,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
         const dynamicRedirect = `${window.location.origin}/#reset-password`;
         const { error: resetErr } = await resetPasswordForEmail(email.trim(), dynamicRedirect);
         if (resetErr) {
-          throw new Error(resetErr.message || 'Failed to dispatch password recovery link.');
+          throw new Error(describeAuthError(resetErr, 'Failed to dispatch password recovery link.'));
         }
         setInfoMessage(`Password reset link dispatched to ${email.trim()}! Please check your inbox.`);
         return;
@@ -66,10 +69,10 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
 
         const data = await signUpWithEmailPassword(email.trim(), password, displayName.trim());
         if (!data?.user) {
-          throw new Error('Sign up failed: no user record returned by Supabase.');
+          throw new Error('Sign up failed. Please try again.');
         }
 
-        // If email confirmation is required by Supabase configuration
+        // E-mail confirmation is required before the first sign-in
         if (!data.session) {
           setInfoMessage(
             `Registration successful! A confirmation email has been sent to ${email.trim()}. Please verify your email before signing in.`
@@ -96,7 +99,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
         return;
       }
 
-      // Default: Sign In strictly via Supabase auth.signInWithPassword
+      // Default: e-mail + password sign-in
       if (!email.trim() || !email.includes('@')) throw new Error('Please enter your email address');
       if (!password) throw new Error('Please enter your password');
 
@@ -127,7 +130,12 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
       onAuthSuccess(profile);
     } catch (err: any) {
       console.warn('[Authentication Notice]', err?.message || err);
-      setError(err?.message || 'Invalid login credentials. Please check your email and password.');
+      if (isEmailAlreadyExistsError(err)) {
+        // The address is registered: send the visitor to the sign-in form, where
+        // both the password and the GitHub options are available.
+        setTab('signin');
+      }
+      setError(describeAuthError(err, 'Invalid login credentials. Please check your email and password.'));
     } finally {
       setLoading(false);
     }
@@ -141,7 +149,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
       await signInWithGitHub(`${window.location.origin}`);
     } catch (err: any) {
       console.warn('[GitHub Auth Notice]', err?.message || err);
-      setError(err?.message || 'Authentication is currently unavailable. Please check server configuration.');
+      setError(describeAuthError(err, 'GitHub sign-in is currently unavailable. Please try again shortly.'));
       setLoading(false);
     }
   };
@@ -175,7 +183,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
           <div className="lg:col-span-6 space-y-6 text-center lg:text-left">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
               <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-              <span>Supabase Authentication Required</span>
+              <span>Secure Sign In Required</span>
             </div>
 
             <h1 className="text-3xl sm:text-4xl lg:text-5xl font-extrabold tracking-tight text-white leading-tight">
@@ -269,7 +277,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                 </div>
               ) : (
                 <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-                  <span className="font-bold text-sm text-white">Reset Password via Supabase</span>
+                  <span className="font-bold text-sm text-white">Reset Your Password</span>
                   <button
                     type="button"
                     onClick={() => {
@@ -351,7 +359,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                 {tab === 'forgot' && (
                   <div className="space-y-3">
                     <p className="text-xs text-slate-300 leading-relaxed">
-                      Enter your registered email address and Supabase will dispatch a password recovery link.
+                      Enter your registered email address and we will send you a password recovery link.
                     </p>
                     <div>
                       <label className="block text-xs font-medium text-slate-300 mb-1.5">
@@ -443,7 +451,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                   {loading ? (
                     <>
                       <RefreshCw className="w-4 h-4 animate-spin" />
-                      <span>Authenticating with Supabase...</span>
+                      <span>Authenticating securely...</span>
                     </>
                   ) : (
                     <>
@@ -452,7 +460,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
                           ? 'Sign In to Workspace'
                           : tab === 'signup'
                           ? 'Create Account & Enter'
-                          : 'Send Reset Link via Supabase'}
+                          : 'Send Reset Link'}
                       </span>
                       <ArrowRight className="w-4 h-4" />
                     </>
@@ -481,7 +489,7 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess }) => {
           </div>
 
           <div className="flex items-center gap-4 text-slate-500">
-            <span>Supabase Enabled</span>
+            <span>Secure Authentication</span>
             <span>•</span>
             <span>Paystack Billing</span>
             <span>•</span>

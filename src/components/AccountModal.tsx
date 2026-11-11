@@ -254,7 +254,7 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                     className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs sm:text-sm bg-slate-50 text-slate-500 cursor-not-allowed font-mono"
                   />
                   <p className="text-[11px] text-slate-400 mt-1">
-                    Your email address is managed through your primary Supabase login.
+                    Your email address is tied to your sign-in method and cannot be changed here.
                   </p>
                 </div>
 
@@ -311,11 +311,11 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                     </div>
                   </div>
                   <span className="px-2.5 py-1 rounded-full border text-[11px] font-semibold bg-slate-100 text-slate-700 border-slate-200">
-                    Supabase OAuth
+                    GitHub OAuth
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-500 border-t border-slate-100 pt-3">
-                  GitHub authorization is managed by your Supabase Auth session. Use the GitHub Codebase Verifier to authorize repository access.
+                  GitHub authorization is tied to your current sign-in session. Use the GitHub Codebase Verifier to authorize repository access.
                 </p>
               </div>
             </div>

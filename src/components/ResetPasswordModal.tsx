@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { KeyRound, Eye, EyeOff, CheckCircle2, AlertCircle } from 'lucide-react';
 import { updatePassword } from '../services/supabase';
+import { describeAuthError } from '../services/authErrors';
 
 interface ResetPasswordModalProps {
   /** Called after the password has been updated successfully. */
@@ -41,7 +42,7 @@ export const ResetPasswordModal: React.FC<ResetPasswordModalProps> = ({ onComple
       setIsDone(true);
       setTimeout(() => onCompleted(), 1200);
     } catch (err: any) {
-      setError(err?.message || 'Could not update your password. Please request a new reset link.');
+      setError(describeAuthError(err, 'Could not update your password. Please request a new reset link.'));
     } finally {
       setIsSaving(false);
     }
