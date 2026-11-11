@@ -128,7 +128,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
         adminService.getPromos(),
         adminService.getSettings(),
         adminService.getAnalytics(analyticsDays).catch((error) => {
-          setAnalyticsError(error?.message || 'Could not load Supabase analytics.');
+          setAnalyticsError(error?.message || 'Could not load live analytics.');
           return null;
         }),
         adminService.getFeedback().catch(() => []),
@@ -159,7 +159,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
       setProLimit(st.proLimit || 150);
     } catch (err: any) {
       console.error(err);
-      setAdminDataError('Live admin metrics could not be loaded from Supabase. Please retry after checking the server connection.');
+      setAdminDataError('Live admin metrics could not be loaded from the database. Please retry after checking the server connection.');
       if (err?.message?.includes('Unauthorized')) {
         setProfile(null);
       }
@@ -177,7 +177,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
       setAnalyticsError(null);
     } catch (err) {
       console.error('Failed to change analytics range:', err);
-      setAnalyticsError('Could not load Supabase analytics for this range.');
+      setAnalyticsError('Could not load analytics for this range.');
       setAnalytics(null);
     } finally {
       setAnalyticsLoading(false);
@@ -406,7 +406,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
 
               <div>
                 <label className="block text-xs font-semibold uppercase text-slate-300 mb-1.5">
-                  Supabase Account Password
+                  Account Password
                 </label>
                 <div className="relative">
                   <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -717,11 +717,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   <h4 className="text-sm font-bold text-white flex items-center gap-2">
                     <span>Executive Analytics & Growth Telemetry</span>
                     <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold">
-                      Supabase data
+                      Live data
                     </span>
                   </h4>
                   <p className="text-xs text-slate-400">
-                    Explore Supabase user registrations, successful transactions, and persisted analyses.
+                    Explore user registrations, successful transactions, and persisted analyses.
                   </p>
                 </div>
               </div>
@@ -748,7 +748,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   <span>Executive Growth & Usage Analytics</span>
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Charts are calculated from saved Supabase users, transactions, and analysis history.
+                  Charts are calculated from saved users, transactions, and analysis history.
                 </p>
               </div>
 
@@ -993,7 +993,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                     <span>Successful Transaction Revenue</span>
                   </h3>
                   <p className="text-[11px] text-slate-400">
-                    Successful transaction amounts by currency, from Supabase.
+                    Successful transaction amounts by currency, from the live ledger.
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
@@ -1029,7 +1029,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                       <span>API Analysis Usage & Latency Telemetry</span>
                     </h3>
                     <p className="text-[11px] text-slate-400">
-                      Persisted analysis count and processing latency from Supabase analysis history.
+                      Persisted analysis count and processing latency from saved analysis history.
                     </p>
                   </div>
                 </div>
@@ -1582,7 +1582,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
           </div>
         )}
 
-        {/* 6. USER ACCURACY FEEDBACK (From Supabase public.feedback) */}
+        {/* 6. USER ACCURACY FEEDBACK (from the public.feedback table) */}
         {activeTab === 'feedback' && (
           <div className="p-6 bg-slate-900 border border-slate-800 rounded-2xl space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1592,7 +1592,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                   <span>User Prediction Feedback & Model Quality</span>
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Live accuracy ratings, comments, and file prediction evaluations from the Supabase <code className="text-indigo-400 font-mono">public.feedback</code> table.
+                  Live accuracy ratings, comments, and file prediction evaluations from the <code className="text-indigo-400 font-mono">public.feedback</code> table.
                 </p>
               </div>
 
@@ -1752,7 +1752,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
               <div className="pt-4 border-t border-slate-800 space-y-2">
                 <h3 className="text-xs font-bold text-white">GitHub sign-in provider</h3>
                 <p className="text-[11px] text-slate-400">
-                  GitHub OAuth is managed in Supabase Authentication &gt; Providers. Add this app origin to Supabase's redirect URL allowlist; the frontend uses Supabase Auth directly.
+                  GitHub OAuth is managed in your authentication provider's dashboard (Authentication &gt; Providers). Add this app origin to its redirect URL allowlist.
                 </p>
               </div>
 

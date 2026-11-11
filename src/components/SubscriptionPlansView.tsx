@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { SubscriptionPlan, SubscriptionTier, UsageStats, UserProfile } from '../types';
 import { SUBSCRIPTION_PLANS, storageService } from '../services/storage';
 import { paystackService } from '../services/paystack';
@@ -19,6 +19,52 @@ import {
   ArrowLeft
 } from 'lucide-react';
 
+type Currency = 'NGN' | 'USD';
+
+/** Billing currency every visitor starts with. */
+const DEFAULT_CURRENCY: Currency = 'USD';
+
+const CURRENCY_STORAGE_KEY = 'cp_selected_currency';
+const CURRENCY_MANUAL_FLAG_KEY = 'cp_currency_user_selected';
+const GEO_LOOKUP_TIMEOUT_MS = 4000;
+
+/** The currency remembered for this browser session, and whether the visitor picked it. */
+function readStoredCurrency(): { currency: Currency; manual: boolean } | null {
+  try {
+    const value = sessionStorage.getItem(CURRENCY_STORAGE_KEY);
+    if (value !== 'NGN' && value !== 'USD') return null;
+    return { currency: value, manual: sessionStorage.getItem(CURRENCY_MANUAL_FLAG_KEY) === 'true' };
+  } catch {
+    return null; // Storage can be unavailable (private mode, embedded contexts).
+  }
+}
+
+function storeCurrency(currency: Currency, manual: boolean): void {
+  try {
+    sessionStorage.setItem(CURRENCY_STORAGE_KEY, currency);
+    if (manual) sessionStorage.setItem(CURRENCY_MANUAL_FLAG_KEY, 'true');
+  } catch {
+    // Not persisted: the choice still applies for as long as this view is open.
+  }
+}
+
+/** Best effort: NGN for visitors located in Nigeria, USD for everyone else. */
+async function detectVisitorCurrency(signal: AbortSignal): Promise<Currency> {
+  try {
+    const res = await fetch('https://ipapi.co/json/', { signal });
+    if (!res.ok) throw new Error(`Geo-IP lookup failed (${res.status})`);
+    const data = await res.json();
+    if (!data || data.error) throw new Error('Geo-IP lookup was rejected');
+    const isNigeria =
+      data.country_code === 'NG' || data.country === 'NG' || data.country_name === 'Nigeria';
+    return isNigeria ? 'NGN' : 'USD';
+  } catch {
+    // Lookup blocked, rate limited or timed out: fall back to the device time zone.
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+    return timeZone === 'Africa/Lagos' ? 'NGN' : 'USD';
+  }
+}
+
 interface SubscriptionPlansViewProps {
   user: UserProfile | null;
   usage: UsageStats;
@@ -37,7 +83,12 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
   const plans = Object.values(SUBSCRIPTION_PLANS);
   const [paystackConfig, setPaystackConfig] = useState<any>(null);
   const [billingCycle, setBillingCycle] = useState<'monthly' | 'annual'>('monthly');
-  const [selectedCurrency, setSelectedCurrency] = useState<'NGN' | 'USD'>('USD');
+  // Billing currency. The state always starts as USD; a remembered choice or the
+  // visitor's location may adjust it, but only through the effects below.
+  const [selectedCurrency, setSelectedCurrency] = useState<Currency>(DEFAULT_CURRENCY);
+  // True once the currency is decided (restored, chosen, or in use by a checkout),
+  // so a late geo-IP answer can never change it under the visitor.
+  const currencySettledRef = useRef(false);
   const [loadingTier, setLoadingTier] = useState<string | null>(null);
   const [paymentNotice, setPaymentNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
@@ -49,11 +100,45 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
     discountValue: number;
     /** Discount in the currency it was validated against. */
     discountAmount: number;
-    currency: 'NGN' | 'USD';
+    currency: Currency;
     applicableTiers: ('pro' | 'enterprise')[];
   } | null>(null);
   const [promoError, setPromoError] = useState<string | null>(null);
   const [validatingPromo, setValidatingPromo] = useState(false);
+
+  // Restore the currency remembered for this session before the browser paints,
+  // so returning to this view never flashes a different price.
+  useLayoutEffect(() => {
+    const stored = readStoredCurrency();
+    if (!stored) return;
+    currencySettledRef.current = true;
+    setSelectedCurrency(stored.currency);
+  }, []);
+
+  // IP-based auto-detection. Runs strictly after the initial (USD) render, only
+  // when nothing is known about the visitor yet, and never overrides a choice.
+  useEffect(() => {
+    if (currencySettledRef.current) return;
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), GEO_LOOKUP_TIMEOUT_MS);
+    let active = true;
+
+    detectVisitorCurrency(controller.signal)
+      .then((detected) => {
+        if (!active || currencySettledRef.current) return;
+        currencySettledRef.current = true;
+        storeCurrency(detected, false);
+        setSelectedCurrency(detected);
+      })
+      .finally(() => window.clearTimeout(timeout));
+
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, []);
 
   useEffect(() => {
     // 1. Fetch backend gateway config & live prices
@@ -64,43 +149,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
       })
       .catch(console.error);
 
-    // 2. Auto-detect Nigeria before honoring a saved manual choice. USD remains
-    // the immediate first-render default; a Nigerian IP switches the UI to NGN.
-    const storedCurrency = sessionStorage.getItem('cp_selected_currency') as 'NGN' | 'USD' | null;
-    const hasManualCurrencyChoice = sessionStorage.getItem('cp_currency_user_selected') === 'true';
-    fetch('https://ipapi.co/json/')
-      .then((res) => {
-        if (!res.ok) throw new Error('Geo-IP lookup failed');
-        return res.json();
-      })
-      .then((data) => {
-        const isNigeria =
-          data?.country_code === 'NG' ||
-          data?.country === 'Nigeria' ||
-          data?.country_name === 'Nigeria';
-        const detected: 'NGN' | 'USD' = isNigeria
-          ? 'NGN'
-          : hasManualCurrencyChoice && (storedCurrency === 'NGN' || storedCurrency === 'USD')
-          ? storedCurrency
-          : 'USD';
-        setSelectedCurrency(detected);
-        sessionStorage.setItem('cp_selected_currency', detected);
-      })
-      .catch(() => {
-        // If geo lookup is unavailable, retain an explicit user choice; otherwise
-        // use USD unless the browser timezone identifies Nigeria.
-        const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-        const isNgTz = timeZone.includes('Lagos') || timeZone.includes('Africa/Lagos');
-        const detected: 'NGN' | 'USD' = isNgTz
-          ? 'NGN'
-          : hasManualCurrencyChoice && (storedCurrency === 'NGN' || storedCurrency === 'USD')
-          ? storedCurrency
-          : 'USD';
-        setSelectedCurrency(detected);
-        sessionStorage.setItem('cp_selected_currency', detected);
-      });
-
-    // 3. Check if redirected from Paystack with ?payment_ref= or ?reference=
+    // 2. Check if redirected from Paystack with ?payment_ref= or ?reference=
     const params = new URLSearchParams(window.location.search);
     const ref = params.get('payment_ref') || params.get('reference');
     if (ref) {
@@ -108,15 +157,16 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
     }
   }, []);
 
-  const handleCurrencySelect = (curr: 'NGN' | 'USD') => {
+  const handleCurrencySelect = (curr: Currency) => {
+    // An explicit choice is final for this session: auto-detection stands down.
+    currencySettledRef.current = true;
     setSelectedCurrency(curr);
-    sessionStorage.setItem('cp_selected_currency', curr);
-    sessionStorage.setItem('cp_currency_user_selected', 'true');
+    storeCurrency(curr, true);
     // Promo discounts are validated per currency; clear so no stale amount is applied.
     setAppliedPromo(null);
   };
 
-  const planPrice = (tier: 'pro' | 'enterprise', currency: 'NGN' | 'USD') => {
+  const planPrice = (tier: 'pro' | 'enterprise', currency: Currency) => {
     if (currency === 'USD') {
       return tier === 'pro' ? paystackConfig?.proPriceUsd || 10 : paystackConfig?.enterprisePriceUsd || 50;
     }
@@ -169,6 +219,8 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
 
     setValidatingPromo(true);
     setPromoError(null);
+    // The code is validated against the currency on screen, so keep it fixed.
+    currencySettledRef.current = true;
 
     try {
       const code = promoInput.trim().toUpperCase();
@@ -227,9 +279,12 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
 
     setLoadingTier(plan.tier);
     setPaymentNotice(null);
+    // Charge exactly what is on screen: the currency can no longer auto-change.
+    currencySettledRef.current = true;
+    const checkoutCurrency: Currency = selectedCurrency;
 
     let baseAmount = plan.tier === 'pro' || plan.tier === 'enterprise'
-      ? planPrice(plan.tier, selectedCurrency)
+      ? planPrice(plan.tier, checkoutCurrency)
       : 0;
 
     // Apply 20% discount for annual billing
@@ -240,45 +295,27 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
     // Promo codes only apply to the tiers they were issued for.
     const promoCodeToPass = promoAppliesTo(plan.tier) ? appliedPromo!.code : undefined;
 
-    // Amount used by the in-page Paystack popup, which charges exactly what we pass.
-    const chargeAmount = promoAppliesTo(plan.tier)
-      ? Math.max(1, Math.round((baseAmount - promoDiscountFor(baseAmount)) * 100) / 100)
-      : baseAmount;
-
     try {
-      // Attempt inline popup checkout if public key is active
-      if (paystackConfig?.paystackPublicKey) {
-        const popupOpened = await paystackService.openInlineCheckout({
-          publicKey: paystackConfig.paystackPublicKey,
-          email: user.email,
-          amount: chargeAmount,
-          currency: selectedCurrency,
-          tier: plan.tier,
-          promoCode: promoCodeToPass,
-          onSuccess: (ref) => {
-            handleVerifyReference(ref);
-          },
-          onClose: () => {
-            setLoadingTier(null);
-          },
-        });
-
-        if (popupOpened) {
-          return;
-        }
-      }
-
-      // Standard Paystack authorization redirect flow.
-      // The base amount is sent undiscounted: the server applies the promo once.
+      // Checkout is initialised by the server, which is the single source of truth
+      // for the price: it charges the plan in the selected currency (Paystack
+      // receives USD in cents and NGN in kobo) and applies the promo code once.
+      // `baseAmount` is sent undiscounted and only used to flag price mismatches.
       const initRes = await paystackService.initializeTransaction(
         user.email,
         plan.tier,
         baseAmount,
         window.location.href,
         promoCodeToPass,
-        selectedCurrency,
+        checkoutCurrency,
         billingCycle
       );
+
+      // Never send the customer to a checkout priced in a different currency.
+      if (initRes.currency && initRes.currency !== checkoutCurrency) {
+        throw new Error(
+          `Checkout was prepared in ${initRes.currency} instead of ${checkoutCurrency}. No payment was taken. Please try again.`
+        );
+      }
 
       if (initRes.authorization_url) {
         window.location.href = initRes.authorization_url;

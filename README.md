@@ -76,6 +76,20 @@ The repository ships with a serverless-ready layout:
 
 Then run `supabase/schema.sql` in the Supabase SQL editor. GitHub verification uses the GitHub provider configured under Supabase Authentication → Providers. Add your app origin to the Supabase redirect URL allowlist. GitHub authorization is handled through the Supabase Auth session; the verifier does not add a separate credential store.
 
+**Upgrading an existing database** — run `supabase/migrations/link_profiles_by_email.sql` once in the Supabase SQL editor
+(it is safe to run again). It merges profiles that share an e-mail address, enforces one profile per address regardless of
+letter case, and updates the sign-up trigger so that a new sign-in method (for example GitHub after e-mail sign-up) is linked
+to the existing profile instead of creating a second one. New installations get the same behaviour from `supabase/schema.sql`.
+Linking is done by verified e-mail address, so keep **Confirm email** enabled under Supabase Authentication.
+
+**Billing currency** — the pricing page starts in USD and switches to NGN only for visitors located in Nigeria, or when the
+visitor picks NGN. The selected currency is what Paystack is asked to charge (USD in cents, NGN in kobo), priced on the server.
+USD has to be enabled on the Paystack merchant account; until it is, USD checkouts are declined with a message that offers NGN.
+
+**GitHub repositories** — the verifier lists the connected account's repositories (most recently updated first). Sign-in asks
+GitHub for no repository scope, so only public repositories are listed until the user chooses *Include private repositories*,
+which requests the `repo` scope. Any public repository can still be entered manually as `owner/repo`.
+
 **Post-deploy verification**
 
 | Check | Expected |

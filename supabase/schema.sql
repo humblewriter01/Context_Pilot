@@ -207,27 +207,98 @@ create policy "Allow users to read own transactions"
 
 
 -- ===================================================================
--- AUTH TRIGGER (Auto-create user profile on signup)
+-- AUTH TRIGGER (one profile per e-mail address)
+--
+-- Every new row in auth.users (e-mail sign-up, GitHub OAuth, ...) provisions
+-- its profile in public.users. When the address already owns a profile, the
+-- new auth_id is linked to that profile instead of creating a duplicate.
+--
+-- Upgrading a project created with an earlier version of this file? Run
+-- supabase/migrations/link_profiles_by_email.sql instead: it merges any existing
+-- duplicate profiles before adding the unique index below.
 -- ===================================================================
 
--- Create a function to handle new user signups
-create or replace function public.handle_new_user() 
-returns trigger as $$
+-- One profile per address, regardless of letter case
+create unique index if not exists users_email_lower_key on public.users (lower(email));
+
+-- Keep in sync with the copy in supabase/migrations/link_profiles_by_email.sql
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_email      text;
+  v_name       text;
+  v_photo      text;
+  v_profile_id uuid;
 begin
-  insert into public.users (auth_id, email, display_name)
-  values (
-    new.id, 
-    new.email, 
-    coalesce(new.raw_user_meta_data->>'full_name', 'Developer')
-  )
-  on conflict (email) do update 
-    set auth_id = excluded.auth_id; -- Syncs the auth_id if the user existed beforehand
+  v_email := lower(nullif(btrim(new.email), ''));
+
+  -- Sign-ins without an e-mail address (e.g. phone) have no profile key yet.
+  if v_email is null then
+    return new;
+  end if;
+
+  v_name := nullif(btrim(coalesce(
+    nullif(btrim(new.raw_user_meta_data ->> 'full_name'), ''),
+    nullif(btrim(new.raw_user_meta_data ->> 'display_name'), ''),
+    nullif(btrim(new.raw_user_meta_data ->> 'name'), ''),
+    nullif(btrim(new.raw_user_meta_data ->> 'user_name'), ''),
+    new.raw_user_meta_data ->> 'preferred_username'
+  )), '');
+
+  v_photo := nullif(btrim(coalesce(
+    nullif(btrim(new.raw_user_meta_data ->> 'avatar_url'), ''),
+    new.raw_user_meta_data ->> 'picture'
+  )), '');
+
+  -- 1. The address already has a profile: link this sign-in to it and keep
+  --    its plan, status and history. Only blank details are filled in.
+  update public.users as u
+     set auth_id       = new.id,
+         display_name  = case
+                           when nullif(btrim(u.display_name), '') is null
+                             or btrim(u.display_name) = 'Developer'
+                             then coalesce(v_name, 'Developer')
+                           else u.display_name
+                         end,
+         photo_url     = coalesce(nullif(btrim(u.photo_url), ''), v_photo),
+         last_login_at = timezone('utc', now())
+   where u.id = (
+           select p.id
+             from public.users as p
+            where lower(p.email) = v_email
+            order by (p.email = v_email) desc, p.created_at, p.id
+            limit 1
+         )
+  returning u.id into v_profile_id;
+
+  -- 2. First time this address is seen: create its profile.
+  if v_profile_id is null then
+    insert into public.users (auth_id, email, display_name, photo_url)
+    values (new.id, v_email, coalesce(v_name, 'Developer'), v_photo)
+    on conflict (email) do update
+      set auth_id = excluded.auth_id;
+  end if;
+
   return new;
+exception
+  when others then
+    -- A profile problem must never block a sign-up or sign-in. The API links
+    -- or creates the profile on the first authenticated request instead.
+    raise warning 'handle_new_user: could not sync the profile for auth user % (SQLSTATE %): %',
+      new.id, sqlstate, sqlerrm;
+    return new;
 end;
-$$ language plpgsql security definer;
+$$;
+
+comment on function public.handle_new_user() is
+  'Provisions public.users for a new auth user, linking to the existing profile when the e-mail address already has one.';
 
 -- Trigger the function every time a user is created
 drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
   after insert on auth.users
-  for each row execute procedure public.handle_new_user();
+  for each row execute function public.handle_new_user();

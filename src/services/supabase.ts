@@ -1,4 +1,5 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { EmailAlreadyExistsError, isEmailAlreadyExistsError, isObfuscatedExistingUser } from './authErrors';
 
 // Browser Supabase configuration must come from Vite's public build-time variables.
 const clientUrl = import.meta.env.VITE_SUPABASE_URL || '';
@@ -42,7 +43,11 @@ export async function signInWithEmailPassword(email: string, password: string) {
 }
 
 /**
- * Strictly registers a new user via Supabase Auth (signUp).
+ * Registers a new e-mail/password user.
+ *
+ * Throws EmailAlreadyExistsError when the address already belongs to an account
+ * (for example one that was created with GitHub), so callers can point the
+ * visitor back to their original sign-in method instead of creating a duplicate.
  */
 export async function signUpWithEmailPassword(email: string, password: string, displayName: string) {
   const client = await getOrInitSupabase();
@@ -62,7 +67,14 @@ export async function signUpWithEmailPassword(email: string, password: string, d
   });
 
   if (error) {
+    if (isEmailAlreadyExistsError(error)) throw new EmailAlreadyExistsError();
     throw error;
+  }
+
+  // With e-mail confirmation enabled the API does not return an error for a
+  // registered address; it answers with a placeholder user and sends nothing.
+  if (isObfuscatedExistingUser(data)) {
+    throw new EmailAlreadyExistsError();
   }
 
   return data;

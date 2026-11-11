@@ -1,8 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { GitHubVerificationResult, CategorizedFiles } from '../types';
-import { githubService } from '../services/github';
+import { githubService, normalizeRepoFullName, type GitHubRepoSummary } from '../services/github';
 import { storageService } from '../services/storage';
 import { getOrInitSupabase } from '../services/supabase';
+import { describeAuthError } from '../services/authErrors';
+import { RepoPicker } from './RepoPicker';
 import {
   GitBranch,
   CheckCircle2,
@@ -29,6 +31,22 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
   const [username, setUsername] = useState('');
   const [avatarUrl, setAvatarUrl] = useState('');
   const [connectingOAuth, setConnectingOAuth] = useState(false);
+
+  // Repositories of the connected account (GitHub: GET /user/repos?sort=updated).
+  const [repos, setRepos] = useState<GitHubRepoSummary[]>([]);
+  const [reposLoading, setReposLoading] = useState(false);
+  const [reposError, setReposError] = useState<string | null>(null);
+  const [reposTruncated, setReposTruncated] = useState(false);
+  const [tokenScopes, setTokenScopes] = useState<string[] | null>(null);
+  const [repoReloadKey, setRepoReloadKey] = useState(0);
+  // Manual owner/repo entry: the fallback for public repositories the account does not own.
+  const [manualEntry, setManualEntry] = useState(false);
+
+  // Latest values for async callbacks that must not re-run when they change.
+  const repoNameRef = useRef(repoName);
+  repoNameRef.current = repoName;
+  const branchEditedRef = useRef(false);
+  const sessionUserIdRef = useRef<string | null>(null);
 
   const [filesInput, setFilesInput] = useState<string>(() => {
     if (initialFiles && initialFiles.length > 0) {
@@ -74,10 +92,17 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
 
     const updateFromSession = (session: any) => {
       const user = session?.user;
-      const hasGithubIdentity = user?.identities?.some((identity: any) => identity.provider === 'github');
-      const providerToken = hasGithubIdentity ? session?.provider_token : '';
+      const hasGithubIdentity = Boolean(
+        user?.identities?.some((identity: any) => identity.provider === 'github')
+      );
+      const freshToken =
+        hasGithubIdentity && typeof session?.provider_token === 'string' ? session.provider_token : '';
+      const sameUser = Boolean(user?.id) && sessionUserIdRef.current === user.id;
+      sessionUserIdRef.current = user?.id ?? null;
       if (!mounted) return;
-      setGitHubProviderToken(typeof providerToken === 'string' ? providerToken : '');
+      // A silent session refresh no longer carries the GitHub token. Keep the one
+      // already held in memory for the same signed-in user; it is never persisted.
+      setGitHubProviderToken((current) => freshToken || (hasGithubIdentity && sameUser ? current : ''));
       setUsername(hasGithubIdentity
         ? user?.user_metadata?.user_name || user?.user_metadata?.preferred_username || user?.email?.split('@')[0] || ''
         : '');
@@ -87,7 +112,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     const initialize = async () => {
       const client = await getOrInitSupabase();
       if (!client) {
-        if (mounted) setErrorMsg('GitHub sign-in is unavailable because Supabase is not configured in the frontend build.');
+        if (mounted) setErrorMsg('GitHub sign-in is unavailable because authentication is not configured for this deployment.');
         return;
       }
       const { data: { subscription } } = client.auth.onAuthStateChange((_event, session) => {
@@ -100,7 +125,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
 
     initialize().catch((error) => {
       console.error('[GitHub OAuth session]', error);
-      if (mounted) setErrorMsg('Could not read the Supabase GitHub session. Please sign in again.');
+      if (mounted) setErrorMsg('Could not read your GitHub session. Please sign in again.');
     });
 
     return () => {
@@ -114,7 +139,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     setErrorMsg(null);
     try {
       const client = await getOrInitSupabase();
-      if (!client) throw new Error('Supabase is not configured in the frontend build.');
+      if (!client) throw new Error('Authentication is not configured for this deployment.');
       const { error } = await client.auth.signInWithOAuth({
         provider: 'github',
         options: {
@@ -125,10 +150,84 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
       if (error) throw error;
     } catch (err: any) {
       console.error('[GitHub OAuth start]', err);
-      setErrorMsg(err?.message || 'Could not start GitHub sign-in. Check the GitHub provider in Supabase Auth.');
+      setErrorMsg(describeAuthError(err, 'Could not start GitHub sign-in. Please try again.'));
       setConnectingOAuth(false);
     }
   };
+
+  // Load the connected account's repositories for the searchable picker.
+  useEffect(() => {
+    if (!githubProviderToken) {
+      setRepos([]);
+      setReposLoading(false);
+      setReposError(null);
+      setReposTruncated(false);
+      setTokenScopes(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    setReposLoading(true);
+    setReposError(null);
+
+    githubService
+      .listUserRepos(githubProviderToken, controller.signal)
+      .then((listing) => {
+        if (controller.signal.aborted) return;
+        setRepos(listing.repos);
+        setReposTruncated(listing.truncated);
+        setTokenScopes(listing.scopes);
+
+        const saved = repoNameRef.current.trim().toLowerCase();
+        if (!saved) return;
+        const match = listing.repos.find((repo) => repo.fullName.toLowerCase() === saved);
+        if (match) {
+          setRepoName(match.fullName);
+          if (!branchEditedRef.current) setBranch(match.defaultBranch);
+        } else {
+          // The remembered repository is not one of theirs: it was entered manually.
+          setManualEntry(true);
+        }
+      })
+      .catch((err: any) => {
+        if (controller.signal.aborted) return;
+        console.error('[GitHub repositories]', err);
+        setRepos([]);
+        setReposTruncated(false);
+        if (err?.status === 401) {
+          // Revoked or expired authorization: fall back to the connect banner.
+          setGitHubProviderToken('');
+          setErrorMsg(err.message);
+          return;
+        }
+        setReposError(err?.message || 'Could not load your repositories from GitHub.');
+        // The list is unavailable, so offer the manual owner/repo field instead.
+        setManualEntry(true);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setReposLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [githubProviderToken, repoReloadKey]);
+
+  const handleRepoSelect = (repo: GitHubRepoSummary) => {
+    setRepoName(repo.fullName);
+    setBranch(repo.defaultBranch);
+    branchEditedRef.current = false;
+    setErrorMsg(null);
+  };
+
+  const handleUseCustomRepo = (fullName: string) => {
+    setRepoName(fullName);
+    setManualEntry(true);
+    setErrorMsg(null);
+  };
+
+  const reloadRepos = () => setRepoReloadKey((key) => key + 1);
+
+  // Private repositories are only listed when the `repo` scope was granted.
+  const privateReposHidden = tokenScopes !== null && !tokenScopes.includes('repo');
 
   useEffect(() => {
     if (initialFiles && initialFiles.length > 0) {
@@ -159,10 +258,17 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
       return;
     }
 
-    if (!repoName.trim()) {
-      setErrorMsg('Please specify a repository name (e.g. owner/repo)');
+    const targetRepo = normalizeRepoFullName(repoName);
+    if (!targetRepo) {
+      setErrorMsg(
+        repoName.trim()
+          ? `"${repoName.trim()}" is not a valid repository. Use the owner/repo format (e.g. facebook/react).`
+          : 'Select a repository, or enter one as owner/repo (e.g. facebook/react).'
+      );
       return;
     }
+    if (targetRepo !== repoName) setRepoName(targetRepo);
+    const targetBranch = branch.trim() || 'main';
 
     const fileList = filesInput
       .split('\n')
@@ -175,11 +281,11 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     }
 
     setLoading(true);
-    storageService.saveGitHubRepo(repoName);
+    storageService.saveGitHubRepo(targetRepo);
 
     try {
-      const res = await githubService.verifyFiles(repoName, fileList, githubProviderToken, branch);
-      const struct = await githubService.analyzeRepoStructure(repoName, githubProviderToken, branch);
+      const res = await githubService.verifyFiles(targetRepo, fileList, githubProviderToken, targetBranch);
+      const struct = await githubService.analyzeRepoStructure(targetRepo, githubProviderToken, targetBranch);
       setResult(res);
       setStructure(struct);
     } catch (err: any) {
@@ -238,23 +344,22 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
           {/* 1-Click Connect Banner or Connected Account Header */}
           {githubProviderToken && username ? (
             <div className="p-3 bg-gradient-to-br from-slate-50 to-indigo-50/40 border border-indigo-100 rounded-xl flex items-center justify-between">
-              <div className="flex items-center gap-2.5">
+              <div className="flex items-center gap-2.5 min-w-0">
                 {avatarUrl ? (
-                  <img src={avatarUrl} alt={username} className="w-8 h-8 rounded-full border border-indigo-200 shadow-2xs" />
+                  <img src={avatarUrl} alt={username} className="w-8 h-8 rounded-full border border-indigo-200 shadow-2xs shrink-0" />
                 ) : (
-                  <div className="w-8 h-8 rounded-full bg-slate-900 text-white flex items-center justify-center font-bold text-xs">
+                  <div className="w-8 h-8 rounded-full bg-slate-900 text-white flex items-center justify-center font-bold text-xs shrink-0">
                     {username.charAt(0).toUpperCase()}
                   </div>
                 )}
-                <div>
+                <div className="min-w-0">
                   <div className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
-                    <span>@{username}</span>
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                    <span className="truncate">@{username}</span>
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
                   </div>
-                  <div className="text-[10px] text-slate-500">Connected through Supabase Auth</div>
+                  <div className="text-[10px] text-slate-500">Connected via GitHub OAuth</div>
                 </div>
               </div>
-<span className="text-[10px] text-slate-500">Supabase session</span>
             </div>
           ) : (
             <div className="p-3 bg-slate-900 text-white rounded-xl shadow-xs space-y-2.5">
@@ -268,7 +373,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 </span>
               </div>
               <p className="text-[11px] text-slate-300 leading-snug">
-                Authorize your GitHub account through Supabase to verify repositories available to that account.
+                Authorize your GitHub account to browse and verify the repositories available to it.
               </p>
               <button
                 type="button"
@@ -295,17 +400,89 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
 
           <form onSubmit={handleVerify} className="space-y-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">
-                Repository (owner/repo)
-              </label>
-              <input
-                type="text"
-                placeholder="owner/repository"
-                value={repoName}
-                onChange={(e) => setRepoName(e.target.value)}
-                required
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-indigo-500 font-mono"
-              />
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <label
+                  htmlFor="verifier-repo-input"
+                  className="block text-xs font-semibold text-slate-700 uppercase"
+                >
+                  {githubProviderToken ? 'Repository' : 'Repository (owner/repo)'}
+                </label>
+                {githubProviderToken && (
+                  <button
+                    type="button"
+                    onClick={() => setManualEntry((manual) => !manual)}
+                    className="text-[11px] text-indigo-600 hover:text-indigo-800 font-medium shrink-0 whitespace-nowrap"
+                  >
+                    {manualEntry ? 'Choose from my repositories' : 'Enter manually'}
+                  </button>
+                )}
+              </div>
+
+              {githubProviderToken && !manualEntry ? (
+                <RepoPicker
+                  id="verifier-repo-input"
+                  repos={repos}
+                  value={repoName}
+                  onSelect={handleRepoSelect}
+                  onUseCustom={handleUseCustomRepo}
+                  onRefresh={reloadRepos}
+                  loading={reposLoading}
+                  error={reposError}
+                  truncated={reposTruncated}
+                />
+              ) : (
+                <input
+                  id="verifier-repo-input"
+                  type="text"
+                  placeholder="owner/repository"
+                  value={repoName}
+                  onChange={(e) => setRepoName(e.target.value)}
+                  onBlur={() => {
+                    // Accept pasted GitHub URLs and reduce them to owner/repo.
+                    const normalized = normalizeRepoFullName(repoName);
+                    if (normalized && normalized !== repoName) setRepoName(normalized);
+                  }}
+                  required
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-indigo-500 font-mono"
+                />
+              )}
+
+              {githubProviderToken && manualEntry && (
+                <p className="mt-1 text-[11px] text-slate-500">
+                  Works for any public repository, including ones you don't own (e.g.{' '}
+                  <span className="font-mono">facebook/react</span>).
+                </p>
+              )}
+
+              {githubProviderToken && reposError && (
+                <p className="mt-1 text-[11px] text-amber-700">
+                  {reposError}{' '}
+                  <button
+                    type="button"
+                    onClick={reloadRepos}
+                    disabled={reposLoading}
+                    className="font-semibold underline hover:text-amber-900 disabled:opacity-50"
+                  >
+                    {reposLoading ? 'Retrying…' : 'Retry'}
+                  </button>
+                </p>
+              )}
+
+              {githubProviderToken && !manualEntry && privateReposHidden && (
+                <p className="mt-1 text-[11px] text-slate-500">
+                  Only public repositories are listed.{' '}
+                  <button
+                    type="button"
+                    onClick={handleConnectGitHub}
+                    disabled={connectingOAuth}
+                    className="font-semibold text-indigo-600 hover:text-indigo-800 disabled:opacity-50"
+                  >
+                    Include private repositories
+                  </button>
+                </p>
+              )}
             </div>
 
             <div>
@@ -314,7 +491,10 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 type="text"
                 placeholder="main"
                 value={branch}
-                onChange={(e) => setBranch(e.target.value)}
+                onChange={(e) => {
+                  branchEditedRef.current = true;
+                  setBranch(e.target.value);
+                }}
                 className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-indigo-500 font-mono"
               />
             </div>

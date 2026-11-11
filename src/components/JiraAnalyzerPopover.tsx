@@ -105,7 +105,7 @@ export const JiraAnalyzerPopover: React.FC<JiraAnalyzerPopoverProps> = ({
         comments: comment,
       });
     } catch (err) {
-      console.warn('Could not save feedback to Supabase:', err);
+      console.warn('Could not save feedback to the server:', err);
     }
 
     if (onFeedbackSubmitted) onFeedbackSubmitted();

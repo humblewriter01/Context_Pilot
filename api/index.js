@@ -27,6 +27,28 @@ app.use(
     }
   })
 );
+var VENDOR_NAME_RE = /supabase/i;
+var WHITE_LABEL_TEXT_FIELDS = ["error", "message", "hint"];
+var WHITE_LABEL_FALLBACK = "A backend service error occurred. Please try again.";
+function whiteLabelBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  let sanitized = null;
+  for (const field of WHITE_LABEL_TEXT_FIELDS) {
+    const value = body[field];
+    if (typeof value === "string" && VENDOR_NAME_RE.test(value)) {
+      console.warn(`[White-label] Replaced "${field}" in an API response: ${value}`);
+      sanitized = sanitized || { ...body };
+      sanitized[field] = WHITE_LABEL_FALLBACK;
+    }
+  }
+  return sanitized || body;
+}
+app.use("/api", (req, res, next) => {
+  if (req.path.startsWith("/supabase/")) return next();
+  const sendJson = res.json.bind(res);
+  res.json = (body) => sendJson(whiteLabelBody(body));
+  next();
+});
 function getCurrentMonthYear() {
   const d = /* @__PURE__ */ new Date();
   const year = d.getFullYear();
@@ -90,7 +112,7 @@ async function fetchAllQueryRows(query, pageSize = 1e3) {
   const rows = [];
   for (let offset = 0; offset < 1e5; offset += pageSize) {
     const { data, error } = await query.range(offset, offset + pageSize - 1);
-    if (error) throw new Error(error.message || "Supabase query failed.");
+    if (error) throw new Error(error.message || "Database query failed.");
     const page = Array.isArray(data) ? data : [];
     rows.push(...page);
     if (page.length < pageSize) return rows;
@@ -273,15 +295,47 @@ async function updateUserByIdentifier(identifier, patch) {
     return null;
   }
 }
+function normalizeEmail(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+var PG_UNIQUE_VIOLATION = "23505";
+async function linkProfileToAuthUser(email, authUserId) {
+  if (!supabaseAdmin) return;
+  const { error: releaseError } = await supabaseAdmin.from("users").update({ auth_id: null }).eq("auth_id", authUserId).neq("email", email);
+  if (releaseError) console.warn("[User Profile Link Warning]:", releaseError.message);
+  const { error: linkError } = await supabaseAdmin.from("users").update({ auth_id: authUserId }).eq("email", email);
+  if (linkError) console.warn("[User Profile Link Warning]:", linkError.message);
+}
 async function ensureUserProfile(email, authUserId) {
-  if (!supabaseAdmin || !email) return;
+  const normalizedEmail = normalizeEmail(email);
+  if (!supabaseAdmin || !normalizedEmail) return;
   try {
-    const row = { email: email.trim().toLowerCase() };
+    const { data: existing, error: lookupError } = await supabaseAdmin.from("users").select("auth_id").eq("email", normalizedEmail).maybeSingle();
+    if (lookupError) {
+      console.warn("[User Profile Lookup Warning]:", lookupError.message);
+      return;
+    }
+    if (existing) {
+      if (authUserId && existing.auth_id !== authUserId) {
+        await linkProfileToAuthUser(normalizedEmail, authUserId);
+      }
+      return;
+    }
+    const row = { email: normalizedEmail };
     if (authUserId) row.auth_id = authUserId;
-    const { error } = await supabaseAdmin.from("users").upsert(row, { onConflict: "email" });
-    if (error) console.warn("[User Profile Upsert Warning]:", error.message);
+    const { error: insertError } = await supabaseAdmin.from("users").insert(row);
+    if (!insertError) return;
+    if (insertError.code !== PG_UNIQUE_VIOLATION) {
+      console.warn("[User Profile Insert Warning]:", insertError.message);
+      return;
+    }
+    if (authUserId) {
+      await linkProfileToAuthUser(normalizedEmail, authUserId);
+    }
+    const { error: retryError } = await supabaseAdmin.from("users").upsert(row, { onConflict: "email", ignoreDuplicates: !authUserId });
+    if (retryError) console.warn("[User Profile Upsert Warning]:", retryError.message);
   } catch (err) {
-    console.warn("[User Profile Upsert Error]:", err);
+    console.warn("[User Profile Sync Error]:", err);
   }
 }
 async function resolveBearerUser(req) {
@@ -302,14 +356,14 @@ async function resolveBearerUser(req) {
 async function requireAdmin(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(403).json({ error: "Forbidden. Supabase authentication token required." });
+    return res.status(403).json({ error: "Forbidden. An authentication token is required." });
   }
   const token = authHeader.split("Bearer ")[1]?.trim();
   if (!token) {
-    return res.status(403).json({ error: "Forbidden. Supabase authentication token required." });
+    return res.status(403).json({ error: "Forbidden. An authentication token is required." });
   }
   if (!supabaseServer) {
-    return res.status(403).json({ error: "Forbidden. Supabase is not configured on the server." });
+    return res.status(403).json({ error: "Forbidden. Authentication is not configured on the server." });
   }
   try {
     const { data: { user }, error } = await supabaseServer.auth.getUser(token);
@@ -364,7 +418,8 @@ app.post("/api/paystack/initialize", async (req, res) => {
     } = req.body;
     await hydrateSettings();
     const secretKey = SERVER_STORE.settings.paystackSecretKey || process.env.PAYSTACK_SECRET_KEY;
-    if (!email || !tier || !["pro", "enterprise"].includes(tier)) {
+    const customerEmail = normalizeEmail(email);
+    if (!customerEmail || !tier || !["pro", "enterprise"].includes(tier)) {
       return res.status(400).json({ error: "Missing required fields: email and a paid tier (pro or enterprise)" });
     }
     if (!secretKey) {
@@ -399,7 +454,7 @@ app.post("/api/paystack/initialize", async (req, res) => {
     const amountInSubunits = Math.round(finalAmount * 100);
     const reference = `CP_${tier.toUpperCase()}_${Date.now()}_${Math.floor(Math.random() * 1e3)}`;
     const paystackPayload = {
-      email,
+      email: customerEmail,
       amount: amountInSubunits,
       currency: selectedCurrency,
       reference,
@@ -407,7 +462,7 @@ app.post("/api/paystack/initialize", async (req, res) => {
       metadata: {
         tier,
         app: "Context Pilot",
-        customer_email: email,
+        customer_email: customerEmail,
         promo_code: appliedPromo ? appliedPromo.code : null,
         final_amount: finalAmount,
         currency: selectedCurrency,
@@ -424,8 +479,17 @@ app.post("/api/paystack/initialize", async (req, res) => {
     });
     const data = await response.json();
     if (!response.ok || !data.status) {
+      const gatewayMessage = typeof data?.message === "string" ? data.message : "";
+      if (/currency/i.test(gatewayMessage) && /not supported|unsupported|not enabled|invalid/i.test(gatewayMessage)) {
+        console.warn(`[Paystack Initialize] ${selectedCurrency} rejected by the gateway: ${gatewayMessage}`);
+        return res.status(400).json({
+          error: `${selectedCurrency} payments are not enabled for this store yet. Please switch to ${selectedCurrency === "USD" ? "NGN (\u20A6)" : "USD ($)"} or contact support.`,
+          code: "currency_not_supported",
+          currency: selectedCurrency
+        });
+      }
       return res.status(400).json({
-        error: data.message || "Failed to initialize transaction with Paystack API",
+        error: gatewayMessage || "Failed to initialize transaction with Paystack API",
         details: data
       });
     }
@@ -437,7 +501,7 @@ app.post("/api/paystack/initialize", async (req, res) => {
       reference,
       amount: finalAmount,
       currency: selectedCurrency,
-      email,
+      email: customerEmail,
       tier,
       status: "pending",
       createdAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -446,14 +510,11 @@ app.post("/api/paystack/initialize", async (req, res) => {
     SERVER_STORE.transactions.unshift(pendingTx);
     if (supabaseAdmin) {
       try {
-        await supabaseAdmin.from("users").upsert(
-          { email, last_login_at: (/* @__PURE__ */ new Date()).toISOString() },
-          { onConflict: "email", ignoreDuplicates: true }
-        );
+        await ensureUserProfile(customerEmail);
         await supabaseAdmin.from("transactions").upsert(
           {
             reference,
-            user_email: email,
+            user_email: customerEmail,
             tier,
             amount: finalAmount,
             currency: selectedCurrency,
@@ -471,7 +532,8 @@ app.post("/api/paystack/initialize", async (req, res) => {
       authorization_url: data.data.authorization_url,
       access_code: data.data.access_code,
       reference: data.data.reference,
-      finalAmount
+      finalAmount,
+      currency: selectedCurrency
     });
   } catch (error) {
     console.error("Paystack initialization error:", error);
@@ -500,7 +562,7 @@ app.get("/api/paystack/verify/:reference", async (req, res) => {
     const txData = data.data;
     const isSuccess = txData.status === "success";
     const tier = txData.metadata?.tier || "pro";
-    const customerEmail = txData.customer?.email || "";
+    const customerEmail = normalizeEmail(txData.customer?.email);
     const existingTxIndex = SERVER_STORE.transactions.findIndex((t) => t.reference === reference);
     const updatedTx = {
       id: reference,
@@ -547,6 +609,7 @@ app.get("/api/paystack/verify/:reference", async (req, res) => {
         });
       }
       if (supabaseAdmin) {
+        await ensureUserProfile(customerEmail);
         await supabaseAdmin.from("transactions").upsert(
           {
             reference,
@@ -611,7 +674,7 @@ app.post("/api/paystack/webhook", async (req, res) => {
     const event = req.body;
     if (event && event.event === "charge.success") {
       const data = event.data;
-      const userEmail = (data.customer?.email || "").toLowerCase().trim();
+      const userEmail = normalizeEmail(data.customer?.email);
       const reference = data.reference;
       const amount = (data.amount || 0) / 100;
       const currency = data.currency || "NGN";
@@ -645,6 +708,7 @@ app.post("/api/paystack/webhook", async (req, res) => {
         memUser.subscriptionTier = tier;
       }
       if (supabaseAdmin && userEmail) {
+        await ensureUserProfile(userEmail);
         const { error: txError } = await supabaseAdmin.from("transactions").upsert(
           {
             reference,
@@ -660,16 +724,16 @@ app.post("/api/paystack/webhook", async (req, res) => {
           { onConflict: "reference" }
         );
         if (txError) {
-          console.error("[Paystack Webhook] Supabase transaction upsert error:", txError);
+          console.error("[Paystack Webhook] Transaction upsert error:", txError);
         }
         const { error: userError } = await supabaseAdmin.from("users").update({
           subscription_tier: tier,
           last_login_at: (/* @__PURE__ */ new Date()).toISOString()
         }).eq("email", userEmail);
         if (userError) {
-          console.error("[Paystack Webhook] Supabase user tier update error:", userError);
+          console.error("[Paystack Webhook] User tier update error:", userError);
         } else {
-          console.log(`[Paystack Webhook] Successfully updated ${userEmail} to ${tier} in Supabase public.users`);
+          console.log(`[Paystack Webhook] Successfully updated ${userEmail} to ${tier} in public.users`);
         }
         const currentMonth = getCurrentMonthYear();
         const limit = tier === "enterprise" ? -1 : tier === "pro" ? SERVER_STORE.settings.proLimit || 150 : 10;
@@ -735,7 +799,7 @@ app.get("/api/admin/verify", requireAdmin, (req, res) => {
 });
 app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
   if (!supabaseAdmin) {
-    return res.status(503).json({ error: "Supabase service role client is not configured." });
+    return res.status(503).json({ error: "The database service is not configured on the server." });
   }
   try {
     const [dbUsers, dbTransactions] = await Promise.all([
@@ -780,12 +844,12 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
     });
   } catch (err) {
     console.error("[Admin Overview Query Error]:", err?.message || err);
-    return res.status(500).json({ error: "Could not load live user and transaction totals from Supabase." });
+    return res.status(500).json({ error: "Could not load live user and transaction totals from the database." });
   }
 });
 app.get("/api/admin/analytics", requireAdmin, async (req, res) => {
   if (!supabaseAdmin) {
-    return res.status(503).json({ error: "Supabase service role client is not configured." });
+    return res.status(503).json({ error: "The database service is not configured on the server." });
   }
   const requestedDays = Number.parseInt(String(req.query.days || ""), 10) || 14;
   const days = Math.min(90, Math.max(1, requestedDays));
@@ -935,7 +999,7 @@ app.get("/api/admin/analytics", requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error("[Admin Analytics Query Error]:", err?.message || err);
-    return res.status(500).json({ error: "Could not load live analytics from Supabase." });
+    return res.status(500).json({ error: "Could not load live analytics from the database." });
   }
 });
 app.get("/api/admin/users", requireAdmin, async (_req, res) => {
@@ -1329,7 +1393,7 @@ app.post("/api/admin/settings", requireAdmin, async (req, res) => {
   await persistSettings();
   res.json({
     success: true,
-    message: supabaseAdmin ? "System settings updated and saved to Supabase." : "System settings updated in memory only (Supabase service role key not configured).",
+    message: supabaseAdmin ? "System settings updated and saved to the database." : "System settings updated in memory only (database service key not configured).",
     persisted: Boolean(supabaseAdmin)
   });
 });
@@ -1632,7 +1696,7 @@ async function authenticateUser(req, res, next) {
 app.get("/api/history", authenticateUser, async (req, res) => {
   const userEmail = req.userEmail;
   if (!supabaseAdmin) {
-    return res.status(503).json({ error: "Supabase service role client is not configured." });
+    return res.status(503).json({ error: "The database service is not configured on the server." });
   }
   try {
     const { data, error } = await supabaseAdmin.from("analysis_history").select("*").eq("user_email", userEmail).order("created_at", { ascending: false }).limit(200);
@@ -1711,7 +1775,7 @@ app.delete("/api/history/:id", authenticateUser, async (req, res) => {
         }
         const { error: deleteErr } = await supabaseAdmin.from("analysis_history").delete().eq("id", recordId).eq("user_email", userEmail);
         if (deleteErr) {
-          return res.status(500).json({ error: deleteErr.message || "Failed to delete record from Supabase." });
+          return res.status(500).json({ error: deleteErr.message || "Failed to delete the record from the database." });
         }
       } else {
         const decodedId = decodeURIComponent(recordId);
@@ -1731,7 +1795,7 @@ app.delete("/api/history", authenticateUser, async (req, res) => {
     if (supabaseAdmin) {
       const { error: deleteErr } = await supabaseAdmin.from("analysis_history").delete().eq("user_email", userEmail);
       if (deleteErr) {
-        return res.status(500).json({ error: deleteErr.message || "Failed to clear records from Supabase." });
+        return res.status(500).json({ error: deleteErr.message || "Failed to clear records from the database." });
       }
     }
     return res.json({ success: true, message: "All analysis history cleared successfully." });
@@ -1847,13 +1911,13 @@ app.post("/api/auth/reset-password", async (req, res) => {
       if (error) {
         return res.status(400).json({ error: error.message });
       }
-      return res.json({ success: true, message: "Password reset link sent successfully via Supabase" });
+      return res.json({ success: true, message: "Password reset link sent successfully." });
     } catch (e) {
       return res.status(500).json({ error: e?.message || "Failed to dispatch reset email" });
     }
   }
   return res.status(503).json({
-    error: "Authentication service is currently unavailable. Please ensure SUPABASE_URL is set in environment variables."
+    error: "Authentication service is currently unavailable. Please try again later."
   });
 });
 app.use("/api", (_req, res) => {
