@@ -1,0 +1,27 @@
+-- ===================================================================
+-- Context Pilot — profiles cannot be changed from the browser
+--
+-- Why
+--   The policy "Allow users to update own profile" let every signed-in user
+--   UPDATE any column of their own row in public.users through the public
+--   data API, including subscription_tier and status. A user could give
+--   themselves a paid plan, or lift a suspension, without going through the
+--   backend.
+--
+-- What this script does
+--   Drops that policy. Row level security stays enabled, so with no UPDATE
+--   policy a signed-in user can still read their own profile but cannot
+--   change it. The backend is not affected: it uses the service role, which
+--   bypasses row level security.
+--
+--   Profile edits (display name, photo) belong in the API, which decides
+--   which columns a user may change.
+--
+-- How to use
+--   Existing project: run this file once in the SQL editor (Dashboard ->
+--   SQL Editor -> Run). New project: supabase/schema.sql does not create the
+--   policy, so this file is not needed.
+--   Safe to run multiple times.
+-- ===================================================================
+
+drop policy if exists "Allow users to update own profile" on public.users;

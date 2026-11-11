@@ -82,6 +82,11 @@ letter case, and updates the sign-up trigger so that a new sign-in method (for e
 to the existing profile instead of creating a second one. New installations get the same behaviour from `supabase/schema.sql`.
 Linking is done by verified e-mail address, so keep **Confirm email** enabled under Supabase Authentication.
 
+**Profile security** — signed-in users can read their own row in `public.users` but cannot change it. The backend (service
+role) is the only writer, so a plan or account status can never be set from the browser. Databases created before this rule
+must run `supabase/migrations/drop_users_update_policy.sql` once in the Supabase SQL editor to remove the old update policy
+(re-running `supabase/schema.sql` removes it too). Profile edits such as a display name belong in a backend endpoint.
+
 **Billing currency** — the pricing page starts in USD and switches to NGN only for visitors located in Nigeria, or when the
 visitor picks NGN. The selected currency is what Paystack is asked to charge (USD in cents, NGN in kobo), priced on the server.
 USD has to be enabled on the Paystack merchant account; until it is, USD checkouts are declined with a message that offers NGN.

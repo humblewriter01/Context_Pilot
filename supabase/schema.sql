@@ -133,10 +133,11 @@ create policy "Allow users to read own profile"
   on public.users for select
   using (auth.uid() = auth_id or auth.jwt() ->> 'email' = email);
 
+-- Profiles are written only by the backend (service role), never from the
+-- browser. An UPDATE policy here would let a signed-in user change their own
+-- plan or status through the public data API, so there is none. The statement
+-- below removes the policy that earlier versions of this script created.
 drop policy if exists "Allow users to update own profile" on public.users;
-create policy "Allow users to update own profile"
-  on public.users for update
-  using (auth.uid() = auth_id or auth.jwt() ->> 'email' = email);
 
 -- Analysis History RLS
 drop policy if exists "Allow users to read own analyses" on public.analysis_history;
