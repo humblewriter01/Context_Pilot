@@ -166,7 +166,14 @@ grant usage on schema public to anon, authenticated, service_role;
 grant all privileges on all tables in schema public to service_role;
 grant all privileges on all sequences in schema public to service_role;
 
-grant select, insert, update on public.users to authenticated;
+-- Profiles are read-only from the browser. Row level security (above) has no
+-- INSERT or UPDATE policy for public.users; as a second, independent barrier
+-- neither browser role holds the INSERT or UPDATE privilege, so such a write is
+-- refused even if a permissive policy is ever added by mistake. Only the
+-- backend (service role) writes profiles. The revoke also takes back what
+-- earlier versions of this script, or the platform defaults, handed out.
+grant select on public.users to authenticated;
+revoke insert, update on public.users from anon, authenticated;
 grant select, insert, update, delete on public.user_usage to authenticated;
 grant select, insert, delete on public.analysis_history to authenticated;
 grant select, insert, delete on public.feedback to authenticated;

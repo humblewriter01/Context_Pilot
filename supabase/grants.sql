@@ -23,7 +23,10 @@ grant all privileges on all tables in schema public to service_role;
 grant all privileges on all sequences in schema public to service_role;
 
 -- 3. Least-privilege access for signed-in users --------------------------
-grant select, insert, update on public.users to authenticated;
+-- Profiles (public.users) are read-only from the browser: only the backend
+-- (service role) writes them, so neither browser role keeps INSERT or UPDATE.
+grant select on public.users to authenticated;
+revoke insert, update on public.users from anon, authenticated;
 grant select, insert, update, delete on public.user_usage to authenticated;
 grant select, insert, delete on public.analysis_history to authenticated;
 grant select, insert, delete on public.feedback to authenticated;

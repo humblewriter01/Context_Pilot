@@ -83,9 +83,12 @@ to the existing profile instead of creating a second one. New installations get 
 Linking is done by verified e-mail address, so keep **Confirm email** enabled under Supabase Authentication.
 
 **Profile security** — signed-in users can read their own row in `public.users` but cannot change it. The backend (service
-role) is the only writer, so a plan or account status can never be set from the browser. Databases created before this rule
-must run `supabase/migrations/drop_users_update_policy.sql` once in the Supabase SQL editor to remove the old update policy
-(re-running `supabase/schema.sql` removes it too). Profile edits such as a display name belong in a backend endpoint.
+role) is the only writer, so a plan or account status can never be set from the browser. Two independent barriers enforce
+this: row level security has no INSERT or UPDATE policy for the table, and the browser roles (`anon`, `authenticated`) hold
+no INSERT or UPDATE privilege on it. Databases created before this rule must run
+`supabase/migrations/drop_users_update_policy.sql` and `supabase/migrations/revoke_users_write_grants.sql` once in the
+Supabase SQL editor (re-running `supabase/schema.sql` applies both). Profile edits such as a display name belong in a
+backend endpoint.
 
 **Billing currency** — the pricing page starts in USD and switches to NGN only for visitors located in Nigeria, or when the
 visitor picks NGN. The selected currency is what Paystack is asked to charge (USD in cents, NGN in kobo), priced on the server.
