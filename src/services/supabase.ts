@@ -265,16 +265,16 @@ export async function fetchUserSync(): Promise<UserSyncSnapshot | null> {
 /**
  * Loads the signed-in user's persisted analysis history from Supabase.
  */
-export async function fetchAnalysisHistory(): Promise<RemoteAnalysisRecord[]> {
+export async function fetchAnalysisHistory(): Promise<RemoteAnalysisRecord[] | null> {
   try {
     const headers = await getAuthHeaders();
     const res = await fetch('/api/history', { headers });
-    if (!res.ok) return [];
+    if (!res.ok) return null;
     const data = await res.json();
-    return Array.isArray(data) ? (data as RemoteAnalysisRecord[]) : [];
+    return Array.isArray(data) ? (data as RemoteAnalysisRecord[]) : null;
   } catch (e) {
     console.warn('Failed to fetch analysis history:', e);
-    return [];
+    return null;
   }
 }
 

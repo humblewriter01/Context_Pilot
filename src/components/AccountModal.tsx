@@ -57,7 +57,6 @@ export const AccountModal: React.FC<AccountModalProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, onClose]);
 
-  const savedGh = storageService.getGitHubSettings();
 
   // Account deletion modal state
   const [confirmDeleteModal, setConfirmDeleteModal] = useState(false);
@@ -307,16 +306,16 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                     <div>
                       <div className="font-semibold text-slate-800 text-xs">GitHub Repository Access</div>
                       <div className="text-slate-500 text-[11px]">
-                        {savedGh.oauthAccessToken ? `Connected as @${savedGh.username}` : 'Connect from the GitHub Codebase Verifier'}
+                        Authorize from the GitHub Codebase Verifier
                       </div>
                     </div>
                   </div>
-                  <span className={`px-2.5 py-1 rounded-full border text-[11px] font-semibold ${savedGh.oauthAccessToken ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-slate-100 text-slate-700 border-slate-200'}`}>
-                    {savedGh.oauthAccessToken ? 'OAuth Connected' : 'Not Connected'}
+                  <span className="px-2.5 py-1 rounded-full border text-[11px] font-semibold bg-slate-100 text-slate-700 border-slate-200">
+                    Supabase OAuth
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-500 border-t border-slate-100 pt-3">
-                  GitHub access is available only through the Connect with GitHub OAuth flow. The OAuth session is kept in this browser tab; personal access tokens are not accepted or stored.
+                  GitHub authorization is managed by your Supabase Auth session. Use the GitHub Codebase Verifier to authorize repository access.
                 </p>
               </div>
             </div>

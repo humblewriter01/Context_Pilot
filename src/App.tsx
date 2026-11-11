@@ -85,7 +85,7 @@ export const App: React.FC = () => {
     database_files: row.database_files || [],
     config_files: row.config_files || [],
     test_files: row.test_files || [],
-    confidence_score: Number(row.confidence_score) || 0.85,
+    confidence_score: Number(row.confidence_score ?? 0),
     reasoning: row.reasoning || '',
     total_files: Number(row.total_files) || 0,
     processingTimeMs: Number(row.processing_time_ms) || 0,
@@ -118,7 +118,7 @@ export const App: React.FC = () => {
     setUsage(storageService.getUsage());
 
     const remoteRows = await fetchAnalysisHistory();
-    if (remoteRows.length > 0) {
+    if (remoteRows !== null) {
       const mapped = remoteRows.map((row) => mapRemoteAnalysis(row, snapshot.subscriptionTier));
       storageService.setAnalyses(mapped);
       setAnalyses(mapped);
