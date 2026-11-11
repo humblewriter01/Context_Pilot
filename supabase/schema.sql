@@ -150,10 +150,11 @@ create policy "Allow users to insert own analyses"
   on public.analysis_history for insert
   with check (auth.jwt() ->> 'email' = user_email);
 
+-- Analyses are deleted through the API (DELETE /api/history, service role),
+-- never from the browser, so there is no DELETE policy and the browser roles
+-- hold no DELETE privilege. The statement below removes the policy that
+-- earlier versions of this script created.
 drop policy if exists "Users can delete own analyses" on public.analysis_history;
-create policy "Users can delete own analyses"
-  on public.analysis_history for delete
-  using (auth.jwt() ->> 'email' = user_email);
 
 -- ===================================================================
 -- EXPLICIT PRIVILEGES (required on top of RLS)
