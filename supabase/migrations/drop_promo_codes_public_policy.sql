@@ -1,0 +1,24 @@
+-- ===================================================================
+-- Context Pilot — promo codes cannot be listed with the public key
+--
+-- Why
+--   The policy "Allow public to validate active promos" let anyone holding
+--   the app's public (anon) key read every active row of public.promo_codes
+--   through the data API, in other words list all valid discount codes. The
+--   app never needed that: codes are checked by the backend
+--   (POST /api/promos/validate), which uses the service role and bypasses
+--   row level security.
+--
+-- What this script does
+--   Drops that policy. Row level security stays enabled, so with no policy
+--   left the browser roles cannot read a single promo code. Checkout and the
+--   admin portal are not affected: both go through the backend.
+--
+-- How to use
+--   Existing project: run this file once in the SQL editor (Dashboard ->
+--   SQL Editor -> Run). New project: supabase/schema.sql does not create the
+--   policy, so this file is not needed.
+--   Safe to run multiple times.
+-- ===================================================================
+
+drop policy if exists "Allow public to validate active promos" on public.promo_codes;

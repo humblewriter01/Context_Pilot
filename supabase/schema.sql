@@ -157,8 +157,8 @@ create policy "Users can delete own analyses"
 
 -- ===================================================================
 -- EXPLICIT PRIVILEGES (required on top of RLS)
--- service_role bypasses RLS but still needs table privileges; anon needs
--- to read pricing settings for the marketing/pricing screens.
+-- service_role bypasses RLS but still needs table privileges. The browser
+-- roles get the bare minimum (see below).
 -- ===================================================================
 
 grant usage on schema public to anon, authenticated, service_role;
@@ -166,28 +166,31 @@ grant usage on schema public to anon, authenticated, service_role;
 grant all privileges on all tables in schema public to service_role;
 grant all privileges on all sequences in schema public to service_role;
 
--- Profiles are read-only from the browser. Row level security (above) has no
--- INSERT or UPDATE policy for public.users; as a second, independent barrier
--- neither browser role holds the INSERT or UPDATE privilege, so such a write is
--- refused even if a permissive policy is ever added by mistake. Only the
--- backend (service role) writes profiles. The revoke also takes back what
--- earlier versions of this script, or the platform defaults, handed out.
-grant select on public.users to authenticated;
-revoke insert, update on public.users from anon, authenticated;
-grant select, insert, update, delete on public.user_usage to authenticated;
-grant select, insert, delete on public.analysis_history to authenticated;
-grant select, insert, delete on public.feedback to authenticated;
-grant select on public.transactions to authenticated;
-grant select on public.system_settings to authenticated;
+-- Browser roles (anon = visitor without a session, authenticated = signed-in
+-- user): least privilege. The app reads and writes these tables only through
+-- the backend (service role), so the browser roles keep just what a row level
+-- security policy in this script can actually use. Start from nothing, which
+-- also takes back whatever the platform defaults or earlier versions of this
+-- script handed out (TRUNCATE, REFERENCES, TRIGGER, UPDATE, DELETE, ...), then
+-- grant the few privileges that are needed.
+revoke all on
+  public.users, public.user_usage, public.analysis_history, public.feedback,
+  public.transactions, public.promo_codes, public.system_settings
+from anon, authenticated;
 
-grant select on public.system_settings to anon;
-grant select on public.promo_codes to anon, authenticated;
+grant select on public.system_settings to anon, authenticated;    -- public prices (also the keep-alive ping)
+grant select on public.users to authenticated;                     -- own profile
+grant select, insert on public.analysis_history to authenticated;  -- own analyses
+grant insert on public.feedback to authenticated;                  -- own feedback
+grant select on public.transactions to authenticated;              -- own receipts
+-- No browser access at all: public.user_usage (quotas) and public.promo_codes
+-- (discount codes). No UPDATE, DELETE or TRUNCATE on any table: profiles, plans
+-- and quotas are written only by the backend, analyses are deleted through the
+-- API, and row level security does not cover TRUNCATE. A privilege that no
+-- policy uses only waits for a mistaken policy to make it dangerous.
 
 alter default privileges in schema public grant all on tables to service_role;
 alter default privileges in schema public grant all on sequences to service_role;
-
--- Explicitly grant DELETE permission to authenticated users
-grant delete on public.analysis_history to authenticated;
 
 -- Feedback RLS
 drop policy if exists "Allow users to insert feedback" on public.feedback;
@@ -195,11 +198,12 @@ create policy "Allow users to insert feedback"
   on public.feedback for insert
   with check (auth.jwt() ->> 'email' = user_email);
 
--- Promo Codes RLS (Public read for active validation during checkout)
+-- Promo Codes RLS: no policy at all. Codes are validated by the backend
+-- (POST /api/promos/validate, service role). A public SELECT policy would let
+-- anyone holding the public key list every active discount code, so there is
+-- none. The statement below removes the policy that earlier versions of this
+-- script created.
 drop policy if exists "Allow public to validate active promos" on public.promo_codes;
-create policy "Allow public to validate active promos"
-  on public.promo_codes for select
-  using (is_active = true);
 
 -- System Settings RLS (Public read for plan prices in NGN and USD)
 drop policy if exists "Allow public to read system settings" on public.system_settings;

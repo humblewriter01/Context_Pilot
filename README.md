@@ -82,13 +82,26 @@ letter case, and updates the sign-up trigger so that a new sign-in method (for e
 to the existing profile instead of creating a second one. New installations get the same behaviour from `supabase/schema.sql`.
 Linking is done by verified e-mail address, so keep **Confirm email** enabled under Supabase Authentication.
 
-**Profile security** — signed-in users can read their own row in `public.users` but cannot change it. The backend (service
-role) is the only writer, so a plan or account status can never be set from the browser. Two independent barriers enforce
-this: row level security has no INSERT or UPDATE policy for the table, and the browser roles (`anon`, `authenticated`) hold
-no INSERT or UPDATE privilege on it. Databases created before this rule must run
-`supabase/migrations/drop_users_update_policy.sql` and `supabase/migrations/revoke_users_write_grants.sql` once in the
-Supabase SQL editor (re-running `supabase/schema.sql` applies both). Profile edits such as a display name belong in a
-backend endpoint.
+**Database access from the browser** — the app reads and writes its tables only through the backend (service role). The two
+browser roles keep the bare minimum, and every privilege they keep is paired with a row level security policy:
+
+| Table | Visitor (`anon`) | Signed-in user (`authenticated`) |
+| --- | --- | --- |
+| `system_settings` | read | read |
+| `users` | – | read own row |
+| `analysis_history` | – | read and insert own rows |
+| `feedback` | – | insert own rows |
+| `transactions` | – | read own rows |
+| `user_usage`, `promo_codes` | – | – |
+
+So a plan, account status, quota or price can never be set from the browser, promo codes cannot be listed with the public key,
+and neither role holds UPDATE, DELETE or TRUNCATE on any table. Profile edits such as a display name belong in a backend
+endpoint. The keep-alive workflow relies on the visitor's read access to `system_settings`.
+
+Databases created before these rules must run three files from `supabase/migrations/` once in the Supabase SQL editor:
+`drop_users_update_policy.sql`, `drop_promo_codes_public_policy.sql` and `restrict_browser_privileges.sql`
+(`revoke_users_write_grants.sql` is an earlier, narrower step that the last file includes). Each is safe to run again, and
+re-running `supabase/schema.sql` applies all of them.
 
 **Billing currency** — the pricing page starts in USD and switches to NGN only for visitors located in Nigeria, or when the
 visitor picks NGN. The selected currency is what Paystack is asked to charge (USD in cents, NGN in kobo), priced on the server.
