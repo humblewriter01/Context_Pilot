@@ -1,6 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { GitHubVerificationResult, CategorizedFiles } from '../types';
-import { githubService, normalizeRepoFullName, type GitHubRepoSummary } from '../services/github';
+import {
+  githubService,
+  normalizeRepoFullName,
+  GITHUB_CONNECTION_EVENT,
+  type GitHubRepoSummary,
+  type GitHubConnectionStatus,
+  type GitHubRepoStructure,
+} from '../services/github';
 import { storageService } from '../services/storage';
 import { getOrInitSupabase } from '../services/supabase';
 import { describeAuthError } from '../services/authErrors';
@@ -27,10 +34,15 @@ interface GitHubVerifierViewProps {
 export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialFiles }) => {
   const [repoName, setRepoName] = useState(storageService.getGitHubRepo());
   const [branch, setBranch] = useState('main');
-  const [githubProviderToken, setGitHubProviderToken] = useState('');
-  const [username, setUsername] = useState('');
-  const [avatarUrl, setAvatarUrl] = useState('');
+  // Connection status comes from the backend; the OAuth token itself never
+  // reaches this component (it is captured once in App and stored encrypted).
+  const [connection, setConnection] = useState<GitHubConnectionStatus | null>(null);
+  const [connectionLoading, setConnectionLoading] = useState(true);
   const [connectingOAuth, setConnectingOAuth] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const githubConnected = Boolean(connection?.connected);
+  const username = connection?.login || '';
+  const avatarUrl = connection?.avatarUrl || '';
 
   // Repositories of the connected account (GitHub: GET /user/repos?sort=updated).
   const [repos, setRepos] = useState<GitHubRepoSummary[]>([]);
@@ -46,7 +58,6 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
   const repoNameRef = useRef(repoName);
   repoNameRef.current = repoName;
   const branchEditedRef = useRef(false);
-  const sessionUserIdRef = useRef<string | null>(null);
 
   const [filesInput, setFilesInput] = useState<string>(() => {
     if (initialFiles && initialFiles.length > 0) {
@@ -71,7 +82,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successNotice, setSuccessNotice] = useState<string | null>(null);
   const [result, setResult] = useState<GitHubVerificationResult | null>(null);
-  const [structure, setStructure] = useState<any>(null);
+  const [structure, setStructure] = useState<GitHubRepoStructure | null>(null);
 
   // Search filter and copy states for verified files
   const [verifiedSearchTerm, setVerifiedSearchTerm] = useState('');
@@ -86,51 +97,38 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     }, 2000);
   };
 
+  // Read the persisted connection status from the backend. Re-runs when App
+  // captures a fresh OAuth token (GITHUB_CONNECTION_EVENT).
   useEffect(() => {
     let mounted = true;
-    let unsubscribe: (() => void) | undefined;
 
-    const updateFromSession = (session: any) => {
-      const user = session?.user;
-      const hasGithubIdentity = Boolean(
-        user?.identities?.some((identity: any) => identity.provider === 'github')
-      );
-      const freshToken =
-        hasGithubIdentity && typeof session?.provider_token === 'string' ? session.provider_token : '';
-      const sameUser = Boolean(user?.id) && sessionUserIdRef.current === user.id;
-      sessionUserIdRef.current = user?.id ?? null;
-      if (!mounted) return;
-      // A silent session refresh no longer carries the GitHub token. Keep the one
-      // already held in memory for the same signed-in user; it is never persisted.
-      setGitHubProviderToken((current) => freshToken || (hasGithubIdentity && sameUser ? current : ''));
-      setUsername(hasGithubIdentity
-        ? user?.user_metadata?.user_name || user?.user_metadata?.preferred_username || user?.email?.split('@')[0] || ''
-        : '');
-      setAvatarUrl(hasGithubIdentity ? user?.user_metadata?.avatar_url || '' : '');
-    };
-
-    const initialize = async () => {
-      const client = await getOrInitSupabase();
-      if (!client) {
-        if (mounted) setErrorMsg('GitHub sign-in is unavailable because authentication is not configured for this deployment.');
-        return;
+    const loadStatus = async () => {
+      try {
+        const status = await githubService.getConnectionStatus();
+        if (mounted) setConnection(status);
+      } catch (err: any) {
+        console.error('[GitHub connection status]', err);
+        if (mounted) {
+          setConnection({ connected: false, login: null, avatarUrl: null, scopes: [] });
+          // 401 means the app session expired, not GitHub; stay quiet otherwise.
+          if (err?.status !== 401) {
+            setErrorMsg(err?.message || 'Could not read your GitHub connection status.');
+          }
+        }
+      } finally {
+        if (mounted) setConnectionLoading(false);
       }
-      const { data: { subscription } } = client.auth.onAuthStateChange((_event, session) => {
-        updateFromSession(session);
-      });
-      unsubscribe = () => subscription.unsubscribe();
-      const { data: { session } } = await client.auth.getSession();
-      updateFromSession(session);
     };
 
-    initialize().catch((error) => {
-      console.error('[GitHub OAuth session]', error);
-      if (mounted) setErrorMsg('Could not read your GitHub session. Please sign in again.');
-    });
+    const onConnectionChanged = () => {
+      if (mounted) loadStatus();
+    };
+    window.addEventListener(GITHUB_CONNECTION_EVENT, onConnectionChanged);
+    loadStatus();
 
     return () => {
       mounted = false;
-      unsubscribe?.();
+      window.removeEventListener(GITHUB_CONNECTION_EVENT, onConnectionChanged);
     };
   }, []);
 
@@ -140,6 +138,9 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     try {
       const client = await getOrInitSupabase();
       if (!client) throw new Error('Authentication is not configured for this deployment.');
+      // Full-page OAuth redirect. When GitHub sends the user back, App captures
+      // the provider token from the redirect session and posts it to the
+      // backend, which stores it encrypted for future visits.
       const { error } = await client.auth.signInWithOAuth({
         provider: 'github',
         options: {
@@ -155,9 +156,27 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     }
   };
 
+  const handleDisconnectGitHub = async () => {
+    setDisconnecting(true);
+    setErrorMsg(null);
+    try {
+      await githubService.disconnect();
+      setConnection({ connected: false, login: null, avatarUrl: null, scopes: [] });
+      setRepos([]);
+      setTokenScopes(null);
+      setSuccessNotice('GitHub disconnected. You can reconnect at any time.');
+      setTimeout(() => setSuccessNotice(null), 4000);
+    } catch (err: any) {
+      console.error('[GitHub disconnect]', err);
+      setErrorMsg(err?.message || 'Failed to disconnect GitHub.');
+    } finally {
+      setDisconnecting(false);
+    }
+  };
+
   // Load the connected account's repositories for the searchable picker.
   useEffect(() => {
-    if (!githubProviderToken) {
+    if (!githubConnected) {
       setRepos([]);
       setReposLoading(false);
       setReposError(null);
@@ -171,7 +190,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     setReposError(null);
 
     githubService
-      .listUserRepos(githubProviderToken, controller.signal)
+      .listUserRepos(controller.signal)
       .then((listing) => {
         if (controller.signal.aborted) return;
         setRepos(listing.repos);
@@ -194,9 +213,9 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
         console.error('[GitHub repositories]', err);
         setRepos([]);
         setReposTruncated(false);
-        if (err?.status === 401) {
-          // Revoked or expired authorization: fall back to the connect banner.
-          setGitHubProviderToken('');
+        if (err?.status === 401 || err?.status === 404 || err?.code === 'github_not_connected' || err?.code === 'github_reconnect_required') {
+          // Revoked, expired or missing authorization: fall back to the connect banner.
+          setConnection({ connected: false, login: null, avatarUrl: null, scopes: [] });
           setErrorMsg(err.message);
           return;
         }
@@ -209,7 +228,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
       });
 
     return () => controller.abort();
-  }, [githubProviderToken, repoReloadKey]);
+  }, [githubConnected, repoReloadKey]);
 
   const handleRepoSelect = (repo: GitHubRepoSummary) => {
     setRepoName(repo.fullName);
@@ -253,7 +272,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
   const handleVerify = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
-    if (!githubProviderToken) {
+    if (!githubConnected) {
       setErrorMsg('Connect with GitHub before verifying repository files.');
       return;
     }
@@ -284,12 +303,14 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     storageService.saveGitHubRepo(targetRepo);
 
     try {
-      const res = await githubService.verifyFiles(targetRepo, fileList, githubProviderToken, targetBranch);
-      const struct = await githubService.analyzeRepoStructure(targetRepo, githubProviderToken, targetBranch);
-      setResult(res);
-      setStructure(struct);
+      const res = await githubService.verifyFiles(targetRepo, fileList, targetBranch);
+      setResult(res.verification);
+      setStructure(res.structure);
     } catch (err: any) {
       console.error(err);
+      if (err?.status === 401 || err?.code === 'github_not_connected' || err?.code === 'github_reconnect_required') {
+        setConnection({ connected: false, login: null, avatarUrl: null, scopes: [] });
+      }
       setErrorMsg(err?.message || 'Failed to verify files against GitHub.');
     } finally {
       setLoading(false);
@@ -333,7 +354,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
               <FolderGit2 className="w-4 h-4 text-indigo-600" />
               Target Repository
             </h2>
-            {githubProviderToken && username && (
+            {githubConnected && (
               <span className="text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200 px-2 py-0.5 rounded-full font-semibold flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
                 OAuth Active
@@ -341,25 +362,39 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
             )}
           </div>
 
-          {/* 1-Click Connect Banner or Connected Account Header */}
-          {githubProviderToken && username ? (
-            <div className="p-3 bg-gradient-to-br from-slate-50 to-indigo-50/40 border border-indigo-100 rounded-xl flex items-center justify-between">
+          {/* Connection status: loading, connected account header, or connect banner */}
+          {connectionLoading ? (
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center gap-2 text-xs text-slate-500">
+              <RefreshCw className="w-3.5 h-3.5 animate-spin text-slate-400" />
+              <span>Checking GitHub connection...</span>
+            </div>
+          ) : githubConnected ? (
+            <div className="p-3 bg-gradient-to-br from-slate-50 to-indigo-50/40 border border-indigo-100 rounded-xl flex items-center justify-between gap-2">
               <div className="flex items-center gap-2.5 min-w-0">
                 {avatarUrl ? (
-                  <img src={avatarUrl} alt={username} className="w-8 h-8 rounded-full border border-indigo-200 shadow-2xs shrink-0" />
+                  <img src={avatarUrl} alt={username || 'GitHub account'} className="w-8 h-8 rounded-full border border-indigo-200 shadow-2xs shrink-0" />
                 ) : (
                   <div className="w-8 h-8 rounded-full bg-slate-900 text-white flex items-center justify-center font-bold text-xs shrink-0">
-                    {username.charAt(0).toUpperCase()}
+                    {(username || 'G').charAt(0).toUpperCase()}
                   </div>
                 )}
                 <div className="min-w-0">
                   <div className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
-                    <span className="truncate">@{username}</span>
+                    <span className="truncate">{username ? `@${username}` : 'GitHub account'}</span>
                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
                   </div>
                   <div className="text-[10px] text-slate-500">Connected via GitHub OAuth</div>
                 </div>
               </div>
+              <button
+                type="button"
+                onClick={handleDisconnectGitHub}
+                disabled={disconnecting}
+                title="Remove the stored GitHub authorization"
+                className="shrink-0 px-2 py-1 text-[10px] font-semibold text-slate-500 hover:text-rose-700 hover:bg-rose-50 border border-transparent hover:border-rose-200 rounded-md transition-colors disabled:opacity-50"
+              >
+                {disconnecting ? 'Disconnecting…' : 'Disconnect'}
+              </button>
             </div>
           ) : (
             <div className="p-3 bg-slate-900 text-white rounded-xl shadow-xs space-y-2.5">
@@ -405,9 +440,9 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                   htmlFor="verifier-repo-input"
                   className="block text-xs font-semibold text-slate-700 uppercase"
                 >
-                  {githubProviderToken ? 'Repository' : 'Repository (owner/repo)'}
+                  {githubConnected ? 'Repository' : 'Repository (owner/repo)'}
                 </label>
-                {githubProviderToken && (
+                {githubConnected && (
                   <button
                     type="button"
                     onClick={() => setManualEntry((manual) => !manual)}
@@ -418,7 +453,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 )}
               </div>
 
-              {githubProviderToken && !manualEntry ? (
+              {githubConnected && !manualEntry ? (
                 <RepoPicker
                   id="verifier-repo-input"
                   repos={repos}
@@ -449,14 +484,14 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 />
               )}
 
-              {githubProviderToken && manualEntry && (
+              {githubConnected && manualEntry && (
                 <p className="mt-1 text-[11px] text-slate-500">
                   Works for any public repository, including ones you don't own (e.g.{' '}
                   <span className="font-mono">facebook/react</span>).
                 </p>
               )}
 
-              {githubProviderToken && reposError && (
+              {githubConnected && reposError && (
                 <p className="mt-1 text-[11px] text-amber-700">
                   {reposError}{' '}
                   <button
@@ -470,7 +505,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 </p>
               )}
 
-              {githubProviderToken && !manualEntry && privateReposHidden && (
+              {githubConnected && !manualEntry && privateReposHidden && (
                 <p className="mt-1 text-[11px] text-slate-500">
                   Only public repositories are listed.{' '}
                   <button
@@ -525,7 +560,7 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
 
             <button
               type="submit"
-              disabled={loading || !repoName.trim() || !githubProviderToken}
+              disabled={loading || !repoName.trim() || !githubConnected}
               className="w-full py-2.5 px-4 bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 text-white font-semibold rounded-lg text-sm shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50"
             >
               {loading ? (

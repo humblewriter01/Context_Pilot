@@ -23,6 +23,7 @@ import {
   type RemoteAnalysisRecord,
 } from './services/supabase';
 import { readAuthRedirectError, clearAuthRedirectError } from './services/authErrors';
+import { captureGitHubProviderToken, resetGitHubTokenCapture } from './services/github';
 import ResetPasswordModal from './components/ResetPasswordModal';
 import { formatDisplayName } from './components/UserAvatar';
 import { UserProfile, UsageStats, AnalysisRecord, FeedbackRecord, SubscriptionTier } from './types';
@@ -158,7 +159,13 @@ export const App: React.FC = () => {
             setUser(null);
           }
         } else {
-          // Legitimate Supabase session verified
+          // Legitimate Supabase session verified.
+          // Right after a GitHub OAuth redirect the session still carries the
+          // provider token; hand it to the backend once so the connection
+          // survives refreshes and sign-outs. Never persisted in the browser.
+          captureGitHubProviderToken(session).catch((e) =>
+            console.warn('GitHub connection capture failed:', e?.message || e)
+          );
           const u = session.user;
           const cached = storageService.getUser();
           const verifiedUser: UserProfile = {
@@ -234,9 +241,19 @@ export const App: React.FC = () => {
           return;
         }
         if (event === 'SIGNED_OUT' || !session) {
+          resetGitHubTokenCapture();
           storageService.logoutUser();
           setUser(null);
-        } else if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+        } else if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') {
+          // Capture the GitHub provider token whenever Supabase hands us a
+          // fresh one (only right after the OAuth redirect). The backend
+          // stores it encrypted; the browser never keeps it.
+          if (session.provider_token) {
+            captureGitHubProviderToken(session).catch((e) =>
+              console.warn('GitHub connection capture failed:', e?.message || e)
+            );
+          }
+          if (event === 'INITIAL_SESSION') return; // handled by verifyInitialSession
           const u = session.user;
           const cached = storageService.getUser();
           const verifiedUser: UserProfile = {

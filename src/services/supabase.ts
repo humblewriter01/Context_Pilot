@@ -275,6 +275,49 @@ export async function fetchUserSync(): Promise<UserSyncSnapshot | null> {
 }
 
 /**
+ * Persists profile edits through the backend (POST /api/user/profile), which
+ * updates public.users — the table the UI actually reads from — and mirrors
+ * the change into auth metadata. Afterwards the Supabase session is refreshed
+ * so the global auth context reflects the new name immediately.
+ *
+ * Returns the saved display name. Throws with a user-safe message on failure.
+ */
+export async function updateUserProfile(displayName: string): Promise<string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(await getAuthHeaders()),
+  };
+
+  const res = await fetch('/api/user/profile', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ displayName }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || 'Failed to save your profile. Please try again.');
+  }
+
+  const data = await res.json();
+  const savedName: string = typeof data.displayName === 'string' && data.displayName
+    ? data.displayName
+    : displayName.trim();
+
+  // Refresh the session so auth metadata (updated server-side) propagates to
+  // every listener. A refresh failure must not fail the save: the database
+  // already holds the new name and the next hydration picks it up.
+  try {
+    const client = await getOrInitSupabase();
+    if (client) await client.auth.refreshSession();
+  } catch (e) {
+    console.warn('Session refresh after profile save failed:', e);
+  }
+
+  return savedName;
+}
+
+/**
  * Loads the signed-in user's persisted analysis history from Supabase.
  */
 export async function fetchAnalysisHistory(): Promise<RemoteAnalysisRecord[] | null> {
