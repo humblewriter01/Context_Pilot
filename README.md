@@ -73,14 +73,25 @@ The repository ships with a serverless-ready layout:
 | `PAYSTACK_PUBLIC_KEY` / `PAYSTACK_SECRET_KEY` | optional | Needed for live billing. |
 | `GEMINI_MODEL` | optional | Defaults to `gemini-2.5-flash`. |
 | `USD_NGN_RATE` | optional | Conversion used for fixed NGN promo discounts charged in USD (default `1500`). |
+| `GITHUB_TOKEN_ENCRYPTION_KEY` | optional | Dedicated AES-256 key (64 hex chars) for encrypting stored GitHub OAuth tokens. If omitted, a key is derived from `SUPABASE_SERVICE_ROLE_KEY`. Set one if you plan to rotate the service role key without disconnecting users. |
 
-Then run `supabase/schema.sql` in the Supabase SQL editor. GitHub verification uses the GitHub provider configured under Supabase Authentication → Providers. Add your app origin to the Supabase redirect URL allowlist. GitHub authorization is handled through the Supabase Auth session; the verifier does not add a separate credential store.
+Then run `supabase/schema.sql` in the Supabase SQL editor. GitHub verification uses the GitHub provider configured under Supabase Authentication → Providers. Add your app origin to the Supabase redirect URL allowlist.
+
+**GitHub connection persistence** — Supabase only exposes the GitHub OAuth `provider_token` once, right after the OAuth
+redirect. The frontend captures it in that moment (`onAuthStateChange` / initial session) and posts it to
+`POST /api/user/github-token`, which stores it **encrypted at rest** (AES-256-GCM) in `public.user_github_tokens`.
+The verifier then reads connection status from `GET /api/user/github-token` and every GitHub API call (repository list,
+file verification) is proxied by the backend (`GET /api/github/repos`, `POST /api/github/verify`). The raw token never
+returns to the browser, and the connection survives refreshes, sign-outs and serverless cold starts. Users can remove
+the stored authorization with the **Disconnect** button (`DELETE /api/user/github-token`); account deletion removes it too.
 
 **Upgrading an existing database** — run `supabase/migrations/link_profiles_by_email.sql` once in the Supabase SQL editor
 (it is safe to run again). It merges profiles that share an e-mail address, enforces one profile per address regardless of
 letter case, and updates the sign-up trigger so that a new sign-in method (for example GitHub after e-mail sign-up) is linked
 to the existing profile instead of creating a second one. New installations get the same behaviour from `supabase/schema.sql`.
 Linking is done by verified e-mail address, so keep **Confirm email** enabled under Supabase Authentication.
+Databases created before GitHub persistence also need `supabase/migrations/create_user_github_tokens.sql` (safe to run
+again; new installations get the table from `supabase/schema.sql`).
 
 **Database access from the browser** — the app reads and writes its tables only through the backend (service role). The two
 browser roles keep the bare minimum, and every privilege they keep is paired with a row level security policy:
@@ -92,11 +103,12 @@ browser roles keep the bare minimum, and every privilege they keep is paired wit
 | `analysis_history` | – | read and insert own rows |
 | `feedback` | – | insert own rows |
 | `transactions` | – | read own rows |
-| `user_usage`, `promo_codes` | – | – |
+| `user_usage`, `promo_codes`, `user_github_tokens` | – | – |
 
 So a plan, account status, quota or price can never be set from the browser, promo codes cannot be listed with the public key,
-and neither role holds UPDATE, DELETE or TRUNCATE on any table. Profile edits such as a display name belong in a backend
-endpoint. The keep-alive workflow relies on the visitor's read access to `system_settings`.
+GitHub OAuth tokens are invisible to the public data API, and neither role holds UPDATE, DELETE or TRUNCATE on any table.
+Profile edits such as a display name go through `POST /api/user/profile`, which updates `public.users` with the service
+role and mirrors the change into auth metadata. The keep-alive workflow relies on the visitor's read access to `system_settings`.
 
 Databases created before these rules must run three files from `supabase/migrations/` once in the Supabase SQL editor:
 `drop_users_update_policy.sql`, `drop_promo_codes_public_policy.sql` and `restrict_browser_privileges.sql`
@@ -107,9 +119,10 @@ re-running `supabase/schema.sql` applies all of them.
 visitor picks NGN. The selected currency is what Paystack is asked to charge (USD in cents, NGN in kobo), priced on the server.
 USD has to be enabled on the Paystack merchant account; until it is, USD checkouts are declined with a message that offers NGN.
 
-**GitHub repositories** — the verifier lists the connected account's repositories (most recently updated first). Sign-in asks
-GitHub for no repository scope, so only public repositories are listed until the user chooses *Include private repositories*,
-which requests the `repo` scope. Any public repository can still be entered manually as `owner/repo`.
+**GitHub repositories** — the verifier lists the connected account's repositories (most recently updated first) through the
+backend proxy. Sign-in asks GitHub for no repository scope, so only public repositories are listed until the user chooses
+*Include private repositories*, which requests the `repo` scope. Any public repository can still be entered manually as
+`owner/repo`.
 
 **Post-deploy verification**
 
@@ -141,6 +154,12 @@ Context Pilot includes a production `render.yaml` blueprint:
 | `POST /api/analyze-ticket` | Supabase JWT (optional, used for quota) | Gemini file-impact prediction + quota + history. |
 | `GET /api/history` | Supabase JWT | Server-side analysis history. |
 | `GET /api/user/sync` | Supabase JWT | Authoritative tier, status and monthly usage. |
+| `POST /api/user/profile` | Supabase JWT | Persist display-name edits to `public.users` + auth metadata. |
+| `POST /api/user/github-token` | Supabase JWT | One-time capture of the OAuth provider token (stored encrypted). |
+| `GET /api/user/github-token` | Supabase JWT | GitHub connection status only — never the token. |
+| `DELETE /api/user/github-token` | Supabase JWT | Disconnect GitHub (removes the stored token). |
+| `GET /api/github/repos` | Supabase JWT | Proxied GitHub repository list using the stored token. |
+| `POST /api/github/verify` | Supabase JWT | Proxied file-path verification + repo structure snapshot. |
 | `DELETE /api/history/:id` | Supabase JWT (owner only) | Delete one record (UUID or ticket key). |
 | `POST /api/feedback` / `GET /api/feedback` | Supabase JWT | Accuracy feedback, scoped to the caller. |
 | `POST /api/paystack/initialize` | public | Server-priced checkout (client amounts are ignored). |

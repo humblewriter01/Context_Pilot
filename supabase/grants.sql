@@ -29,7 +29,8 @@ grant all privileges on all sequences in schema public to service_role;
 -- only what a row level security policy can actually use.
 revoke all on
   public.users, public.user_usage, public.analysis_history, public.feedback,
-  public.transactions, public.promo_codes, public.system_settings
+  public.transactions, public.promo_codes, public.system_settings,
+  public.user_github_tokens
 from anon, authenticated;
 
 grant select on public.system_settings to anon, authenticated;    -- public prices (also the keep-alive ping)
@@ -37,7 +38,8 @@ grant select on public.users to authenticated;                     -- own profil
 grant select, insert on public.analysis_history to authenticated;  -- own analyses
 grant insert on public.feedback to authenticated;                  -- own feedback
 grant select on public.transactions to authenticated;              -- own receipts
--- public.user_usage and public.promo_codes: backend only, no browser access.
+-- public.user_usage, public.promo_codes and public.user_github_tokens:
+-- backend only, no browser access.
 
 -- 4. Future tables: the backend gets full access --------------------------
 alter default privileges in schema public grant all on tables to service_role;

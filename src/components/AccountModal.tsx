@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { UserProfile, UsageStats } from '../types';
 import { storageService } from '../services/storage';
+import { updateUserProfile } from '../services/supabase';
 import { UserAvatar, formatDisplayName } from './UserAvatar';
 import {
   X,
@@ -13,7 +14,8 @@ import {
   CheckCircle2,
   AlertTriangle,
   Save,
-  ArrowLeft
+  ArrowLeft,
+  RefreshCw
 } from 'lucide-react';
 
 interface AccountModalProps {
@@ -39,6 +41,8 @@ export const AccountModal: React.FC<AccountModalProps> = ({
   const cleanDisplayName = formatDisplayName(user.displayName, user.email);
   const [displayName, setDisplayName] = useState(cleanDisplayName);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   // Sync display name state if user prop changes
   useEffect(() => {
@@ -66,17 +70,32 @@ export const AccountModal: React.FC<AccountModalProps> = ({
 
   if (!isOpen) return null;
 
-  const handleSaveProfile = (e: React.FormEvent) => {
+  const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!displayName.trim()) return;
+    const trimmed = displayName.trim();
+    if (!trimmed || savingProfile) return;
 
-    const updated = storageService.updateProfile({
-      displayName: displayName.trim(),
-    });
-    if (updated) {
-      onUserUpdated(updated);
+    setSavingProfile(true);
+    setSaveError(null);
+    setSaveSuccess(false);
+    try {
+      // Persist to public.users through the backend (the browser cannot write
+      // that table directly), then refresh the Supabase session. Only a
+      // confirmed server save updates the local cache and shows success.
+      const savedName = await updateUserProfile(trimmed);
+      const updated = storageService.updateProfile({ displayName: savedName });
+      if (updated) {
+        onUserUpdated(updated);
+      } else {
+        onUserUpdated({ ...user, displayName: savedName });
+      }
+      setDisplayName(savedName);
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 2500);
+    } catch (err: any) {
+      setSaveError(err?.message || 'Failed to save your profile. Please try again.');
+    } finally {
+      setSavingProfile(false);
     }
   };
 
@@ -226,6 +245,13 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                   </div>
                 )}
 
+                {saveError && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-xs flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                    <span>{saveError}</span>
+                  </div>
+                )}
+
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
                     Display Name
@@ -235,8 +261,10 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                     value={displayName}
                     onChange={(e) => setDisplayName(e.target.value)}
                     required
+                    maxLength={80}
+                    disabled={savingProfile}
                     placeholder="e.g. ameenujaafar432"
-                    className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs sm:text-sm bg-white focus:outline-indigo-500"
+                    className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs sm:text-sm bg-white focus:outline-indigo-500 disabled:opacity-60"
                   />
                   <p className="text-[11px] text-slate-400 mt-1">
                     Used across analysis exports and audit log records.
@@ -261,10 +289,20 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                 <div className="pt-2 flex justify-end">
                   <button
                     type="submit"
-                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded-xl text-xs transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
+                    disabled={savingProfile || !displayName.trim()}
+                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded-xl text-xs transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                   >
-                    <Save className="w-3.5 h-3.5" />
-                    <span>Save Changes</span>
+                    {savingProfile ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        <span>Saving…</span>
+                      </>
+                    ) : (
+                      <>
+                        <Save className="w-3.5 h-3.5" />
+                        <span>Save Changes</span>
+                      </>
+                    )}
                   </button>
                 </div>
               </form>
@@ -315,7 +353,7 @@ export const AccountModal: React.FC<AccountModalProps> = ({
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-500 border-t border-slate-100 pt-3">
-                  GitHub authorization is tied to your current sign-in session. Use the GitHub Codebase Verifier to authorize repository access.
+                  GitHub authorization is stored securely on the server and stays connected across refreshes and sign-ins. Manage it from the GitHub Codebase Verifier.
                 </p>
               </div>
             </div>

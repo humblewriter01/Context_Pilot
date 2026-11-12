@@ -114,6 +114,32 @@ insert into public.system_settings (id, currency, pro_price_ngn, pro_price_usd, 
 values (1, 'NGN', 15000, 10.00, 75000, 50.00, 10, 150, false)
 on conflict (id) do nothing;
 
+-- 9. GitHub OAuth Tokens (Codebase Verifier, backend only)
+--
+-- Supabase only exposes session.provider_token right after the OAuth
+-- redirect, so the backend captures it once and stores it here encrypted
+-- (AES-256-GCM). Every GitHub API call is then proxied by the backend; the
+-- raw token never returns to the browser.
+--
+-- Deliberately NOT a column on public.users: the authenticated browser role
+-- can SELECT its own profile row there, which would expose the token through
+-- the public data API. This table has no browser grants and no policies.
+create table if not exists public.user_github_tokens (
+  user_email text primary key references public.users(email) on delete cascade,
+  auth_id uuid,
+  github_user_id bigint,
+  github_login text,
+  github_avatar_url text,
+  -- AES-256-GCM envelope: v1.<iv>.<ciphertext>.<authTag> (base64url parts).
+  token_encrypted text not null,
+  scopes text[] not null default '{}',
+  created_at timestamp with time zone not null default timezone('utc'::text, now()),
+  updated_at timestamp with time zone not null default timezone('utc'::text, now())
+);
+
+comment on table public.user_github_tokens is
+  'Encrypted GitHub OAuth tokens for the Codebase Verifier. Backend (service role) only; never exposed to browser roles or API responses.';
+
 
 -- ===================================================================
 -- ROW LEVEL SECURITY (RLS) SETUP
@@ -126,6 +152,8 @@ alter table public.feedback enable row level security;
 alter table public.transactions enable row level security;
 alter table public.promo_codes enable row level security;
 alter table public.system_settings enable row level security;
+-- No policies on purpose: the token table is invisible to the browser roles.
+alter table public.user_github_tokens enable row level security;
 
 -- Users RLS
 drop policy if exists "Allow users to read own profile" on public.users;
@@ -176,7 +204,8 @@ grant all privileges on all sequences in schema public to service_role;
 -- grant the few privileges that are needed.
 revoke all on
   public.users, public.user_usage, public.analysis_history, public.feedback,
-  public.transactions, public.promo_codes, public.system_settings
+  public.transactions, public.promo_codes, public.system_settings,
+  public.user_github_tokens
 from anon, authenticated;
 
 grant select on public.system_settings to anon, authenticated;    -- public prices (also the keep-alive ping)
@@ -184,8 +213,9 @@ grant select on public.users to authenticated;                     -- own profil
 grant select, insert on public.analysis_history to authenticated;  -- own analyses
 grant insert on public.feedback to authenticated;                  -- own feedback
 grant select on public.transactions to authenticated;              -- own receipts
--- No browser access at all: public.user_usage (quotas) and public.promo_codes
--- (discount codes). No UPDATE, DELETE or TRUNCATE on any table: profiles, plans
+-- No browser access at all: public.user_usage (quotas), public.promo_codes
+-- (discount codes) and public.user_github_tokens (encrypted OAuth tokens).
+-- No UPDATE, DELETE or TRUNCATE on any table: profiles, plans
 -- and quotas are written only by the backend, analyses are deleted through the
 -- API, and row level security does not cover TRUNCATE. A privilege that no
 -- policy uses only waits for a mistaken policy to make it dangerous.

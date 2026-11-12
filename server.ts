@@ -1859,6 +1859,8 @@ app.post('/api/auth/delete-account', authenticateUser, async (req: express.Reque
       await supabaseAdmin.from('analysis_history').delete().eq('user_email', userEmail);
       await supabaseAdmin.from('user_usage').delete().eq('user_email', userEmail);
       await supabaseAdmin.from('transactions').delete().eq('user_email', userEmail);
+      // Revoke the stored GitHub connection (also covered by the FK cascade).
+      await supabaseAdmin.from('user_github_tokens').delete().eq('user_email', userEmail);
       await supabaseAdmin.from('users').delete().eq('email', userEmail);
     }
 
@@ -2350,6 +2352,617 @@ app.get('/api/user/sync', authenticateUser, async (req: express.Request, res: ex
 });
 
 // ==========================================
+// User Profile Editing
+// ==========================================
+
+// POST /api/user/profile - Persist profile edits (display name) to public.users.
+// The browser roles hold no UPDATE privilege on public.users, so this is the
+// only way a signed-in user can change their profile. Auth metadata is kept in
+// sync too, so a refreshed Supabase session and the database agree.
+app.post('/api/user/profile', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+  const authUserId = (req as any).authUserId as string;
+
+  const rawName = typeof req.body?.displayName === 'string' ? req.body.displayName : '';
+  const displayName = rawName.trim().replace(/\s+/g, ' ');
+
+  if (!displayName) {
+    return res.status(400).json({ error: 'Display name is required.' });
+  }
+  if (displayName.length > 80) {
+    return res.status(400).json({ error: 'Display name must be 80 characters or fewer.' });
+  }
+  if (/[\u0000-\u001f\u007f]/.test(displayName)) {
+    return res.status(400).json({ error: 'Display name contains invalid characters.' });
+  }
+
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: 'The database service is not configured on the server.' });
+  }
+
+  try {
+    await ensureUserProfile(userEmail, authUserId);
+
+    const { data, error } = await supabaseAdmin
+      .from('users')
+      .update({ display_name: displayName })
+      .eq('email', userEmail)
+      .select('display_name')
+      .maybeSingle();
+
+    if (error) {
+      console.warn('[Profile Update Warning]:', error.message);
+      return res.status(500).json({ error: 'Failed to save your profile. Please try again.' });
+    }
+    if (!data) {
+      return res.status(404).json({ error: 'User profile not found.' });
+    }
+
+    // Mirror the change into auth metadata so the next session refresh carries
+    // the new name as well (the UI reads metadata before server hydration).
+    // A failure here must not fail the request: public.users is authoritative.
+    try {
+      const { data: authData } = await supabaseAdmin.auth.admin.getUserById(authUserId);
+      const existingMeta = authData?.user?.user_metadata || {};
+      const { error: metaError } = await supabaseAdmin.auth.admin.updateUserById(authUserId, {
+        user_metadata: { ...existingMeta, display_name: displayName, full_name: displayName },
+      });
+      if (metaError) console.warn('[Profile Metadata Sync Warning]:', metaError.message);
+    } catch (metaErr) {
+      console.warn('[Profile Metadata Sync Warning]:', metaErr);
+    }
+
+    return res.json({ success: true, displayName: data.display_name });
+  } catch (err: any) {
+    console.error('Profile update error:', err);
+    return res.status(500).json({ error: 'Failed to save your profile. Please try again.' });
+  }
+});
+
+// ==========================================
+// GitHub OAuth Connection (persistent, server-side)
+// ==========================================
+//
+// Supabase only exposes session.provider_token right after the GitHub OAuth
+// redirect. The frontend captures it once and posts it here; it is stored
+// encrypted in public.user_github_tokens (service role only) and every GitHub
+// API call is proxied by these endpoints. The raw token is NEVER included in
+// any response, log line, or browser-visible storage.
+
+const GITHUB_API = 'https://api.github.com';
+const GITHUB_MAX_VERIFY_FILES = 200;
+const GITHUB_VERIFY_CONCURRENCY = 6;
+const GITHUB_REPO_FULL_NAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
+
+/**
+ * Key for encrypting GitHub tokens at rest (AES-256-GCM).
+ * Prefer a dedicated GITHUB_TOKEN_ENCRYPTION_KEY; otherwise derive one from
+ * the server-only service role key so tokens are still encrypted at rest
+ * without extra configuration. Both inputs never reach the browser.
+ */
+let githubTokenKey: Buffer | null = null;
+function getGitHubTokenKey(): Buffer | null {
+  if (githubTokenKey) return githubTokenKey;
+  const explicit = (process.env.GITHUB_TOKEN_ENCRYPTION_KEY || '').trim();
+  if (explicit) {
+    if (/^[0-9a-f]{64}$/i.test(explicit)) {
+      githubTokenKey = Buffer.from(explicit, 'hex');
+    } else {
+      const decoded = Buffer.from(explicit, 'base64');
+      githubTokenKey = decoded.length === 32 ? decoded : crypto.createHash('sha256').update(explicit).digest();
+    }
+    return githubTokenKey;
+  }
+  if (supabaseServiceRoleKey) {
+    githubTokenKey = crypto.scryptSync(supabaseServiceRoleKey, 'context-pilot/github-token/v1', 32);
+    return githubTokenKey;
+  }
+  return null;
+}
+
+function encryptGitHubToken(token: string): string | null {
+  const key = getGitHubTokenKey();
+  if (!key) return null;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(token, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `v1.${iv.toString('base64url')}.${ciphertext.toString('base64url')}.${tag.toString('base64url')}`;
+}
+
+function decryptGitHubToken(envelope: string): string | null {
+  const key = getGitHubTokenKey();
+  if (!key || typeof envelope !== 'string') return null;
+  try {
+    const [version, ivPart, dataPart, tagPart] = envelope.split('.');
+    if (version !== 'v1' || !ivPart || !dataPart || !tagPart) return null;
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivPart, 'base64url'));
+    decipher.setAuthTag(Buffer.from(tagPart, 'base64url'));
+    const plaintext = Buffer.concat([decipher.update(Buffer.from(dataPart, 'base64url')), decipher.final()]);
+    return plaintext.toString('utf8');
+  } catch {
+    // Wrong key (rotation) or tampered ciphertext: treat as disconnected.
+    return null;
+  }
+}
+
+interface StoredGitHubConnection {
+  token: string;
+  login: string | null;
+  avatarUrl: string | null;
+  scopes: string[];
+  connectedAt: string | null;
+}
+
+/** Loads and decrypts the caller's stored GitHub connection, if any. */
+async function getStoredGitHubConnection(userEmail: string): Promise<StoredGitHubConnection | null> {
+  if (!supabaseAdmin) return null;
+  const { data, error } = await supabaseAdmin
+    .from('user_github_tokens')
+    .select('token_encrypted, github_login, github_avatar_url, scopes, created_at')
+    .eq('user_email', userEmail)
+    .maybeSingle();
+
+  if (error) {
+    console.warn('[GitHub Connection Lookup Warning]:', error.message);
+    return null;
+  }
+  if (!data) return null;
+
+  const token = decryptGitHubToken(data.token_encrypted);
+  if (!token) {
+    // Undecryptable (key rotation or corruption): drop it so the UI asks for
+    // a fresh connection instead of failing every call.
+    await supabaseAdmin.from('user_github_tokens').delete().eq('user_email', userEmail);
+    return null;
+  }
+
+  return {
+    token,
+    login: data.github_login || null,
+    avatarUrl: data.github_avatar_url || null,
+    scopes: Array.isArray(data.scopes) ? data.scopes : [],
+    connectedAt: data.created_at || null,
+  };
+}
+
+async function deleteStoredGitHubConnection(userEmail: string): Promise<void> {
+  if (!supabaseAdmin) return;
+  const { error } = await supabaseAdmin.from('user_github_tokens').delete().eq('user_email', userEmail);
+  if (error) console.warn('[GitHub Connection Delete Warning]:', error.message);
+}
+
+/** Server-side GitHub REST call using the stored token. */
+async function githubApiFetch(token: string, path: string): Promise<Response> {
+  return fetch(`${GITHUB_API}${path}`, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${token}`,
+      'User-Agent': 'context-pilot',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
+}
+
+/** Maps an upstream GitHub failure to a safe client response. */
+async function githubUpstreamError(res: Response, userEmail: string, action: string): Promise<{ status: number; body: Record<string, unknown> }> {
+  if (res.status === 401) {
+    // Revoked or expired authorization: forget it so the UI offers reconnect.
+    await deleteStoredGitHubConnection(userEmail);
+    return {
+      status: 401,
+      body: { error: 'Your GitHub authorization has expired. Reconnect GitHub to continue.', code: 'github_reconnect_required' },
+    };
+  }
+
+  const rateLimited = res.status === 429 || (res.status === 403 && res.headers.get('x-ratelimit-remaining') === '0');
+  if (rateLimited) {
+    const resetAt = Number(res.headers.get('x-ratelimit-reset'));
+    const when = Number.isFinite(resetAt) && resetAt > 0
+      ? ` Try again after ${new Date(resetAt * 1000).toISOString()}.`
+      : ' Please try again in a few minutes.';
+    return { status: 429, body: { error: `GitHub API rate limit reached.${when}`, code: 'github_rate_limited' } };
+  }
+
+  let detail = '';
+  try {
+    const body = await res.json();
+    if (typeof body?.message === 'string') detail = body.message;
+  } catch {
+    // Non-JSON error body
+  }
+  return {
+    status: 502,
+    body: { error: `GitHub could not ${action} (HTTP ${res.status}${detail ? `: ${detail}` : ''}).` },
+  };
+}
+
+// POST /api/user/github-token - Capture the OAuth provider token once.
+// Body: { providerToken: string }. Response carries connection status only.
+app.post('/api/user/github-token', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+  const authUserId = (req as any).authUserId as string;
+
+  const providerToken = typeof req.body?.providerToken === 'string' ? req.body.providerToken.trim() : '';
+  if (!providerToken || providerToken.length > 512 || /\s/.test(providerToken)) {
+    return res.status(400).json({ error: 'A valid GitHub provider token is required.' });
+  }
+
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: 'The database service is not configured on the server.' });
+  }
+  const encrypted = encryptGitHubToken(providerToken);
+  if (!encrypted) {
+    return res.status(503).json({ error: 'GitHub token storage is not configured on the server.' });
+  }
+
+  try {
+    // Validate the token against GitHub and capture account details + scopes.
+    let githubUserId: number | null = null;
+    let githubLogin: string | null = null;
+    let githubAvatarUrl: string | null = null;
+    let scopes: string[] = [];
+
+    let validation: Response;
+    try {
+      validation = await githubApiFetch(providerToken, '/user');
+    } catch (err) {
+      console.warn('[GitHub Token Validation Warning]: network error');
+      return res.status(502).json({ error: 'Could not reach GitHub to validate the connection. Please try again.' });
+    }
+
+    if (validation.status === 401) {
+      return res.status(400).json({ error: 'GitHub rejected this token. Please reconnect GitHub.' });
+    }
+
+    if (validation.ok) {
+      const profile = await validation.json();
+      githubUserId = typeof profile?.id === 'number' ? profile.id : null;
+      githubLogin = typeof profile?.login === 'string' ? profile.login : null;
+      githubAvatarUrl = typeof profile?.avatar_url === 'string' ? profile.avatar_url : null;
+      const scopeHeader = validation.headers.get('x-oauth-scopes');
+      if (scopeHeader !== null) {
+        scopes = scopeHeader.split(',').map((s) => s.trim()).filter(Boolean);
+      }
+    } else {
+      // Transient upstream problem (e.g. rate limit): the token came from
+      // Supabase OAuth, so store it anyway; the next proxied call re-validates.
+      console.warn(`[GitHub Token Validation Warning]: upstream HTTP ${validation.status}`);
+    }
+
+    await ensureUserProfile(userEmail, authUserId);
+
+    // Upsert without created_at: the column default applies on first connect,
+    // and ON CONFLICT only touches the payload columns, so the original
+    // connected-at timestamp survives re-captures. Also safe under races.
+    const { error } = await supabaseAdmin.from('user_github_tokens').upsert(
+      {
+        user_email: userEmail,
+        auth_id: authUserId,
+        github_user_id: githubUserId,
+        github_login: githubLogin,
+        github_avatar_url: githubAvatarUrl,
+        token_encrypted: encrypted,
+        scopes,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'user_email' }
+    );
+
+    if (error) {
+      console.warn('[GitHub Token Store Warning]:', error.message);
+      return res.status(500).json({ error: 'Failed to save the GitHub connection. Please try again.' });
+    }
+
+    // Never echo the token back.
+    return res.json({ connected: true, login: githubLogin, avatarUrl: githubAvatarUrl, scopes });
+  } catch (err) {
+    console.error('GitHub token store error:', err);
+    return res.status(500).json({ error: 'Failed to save the GitHub connection. Please try again.' });
+  }
+});
+
+// GET /api/user/github-token - Connection status only (never the token).
+app.get('/api/user/github-token', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: 'The database service is not configured on the server.' });
+  }
+
+  try {
+    const connection = await getStoredGitHubConnection(userEmail);
+    if (!connection) {
+      return res.json({ connected: false, login: null, avatarUrl: null, scopes: [] });
+    }
+    return res.json({
+      connected: true,
+      login: connection.login,
+      avatarUrl: connection.avatarUrl,
+      scopes: connection.scopes,
+      connectedAt: connection.connectedAt,
+    });
+  } catch (err) {
+    console.error('GitHub connection status error:', err);
+    return res.status(500).json({ error: 'Failed to read the GitHub connection status.' });
+  }
+});
+
+// DELETE /api/user/github-token - Disconnect (removes the stored token).
+app.delete('/api/user/github-token', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: 'The database service is not configured on the server.' });
+  }
+  try {
+    await deleteStoredGitHubConnection(userEmail);
+    return res.json({ connected: false });
+  } catch (err) {
+    console.error('GitHub disconnect error:', err);
+    return res.status(500).json({ error: 'Failed to disconnect GitHub.' });
+  }
+});
+
+// GET /api/github/repos - List the connected account's repositories.
+app.get('/api/github/repos', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+  const connection = await getStoredGitHubConnection(userEmail);
+  if (!connection) {
+    return res.status(404).json({ error: 'No GitHub account is connected. Connect GitHub to continue.', code: 'github_not_connected' });
+  }
+
+  try {
+    const byFullName = new Map<string, any>();
+    let scopes: string[] | null = null;
+    let truncated = false;
+    const perPage = 100;
+    const maxPages = 5;
+
+    for (let page = 1; page <= maxPages; page += 1) {
+      const upstream = await githubApiFetch(connection.token, `/user/repos?sort=updated&per_page=${perPage}&page=${page}`);
+      if (!upstream.ok) {
+        const failure = await githubUpstreamError(upstream, userEmail, 'list your repositories');
+        return res.status(failure.status).json(failure.body);
+      }
+
+      if (page === 1) {
+        const scopeHeader = upstream.headers.get('x-oauth-scopes');
+        if (scopeHeader !== null) {
+          scopes = scopeHeader.split(',').map((s) => s.trim()).filter(Boolean);
+        }
+      }
+
+      const batch = await upstream.json();
+      if (!Array.isArray(batch)) break;
+      for (const raw of batch) {
+        if (!raw || typeof raw.full_name !== 'string' || !raw.full_name.includes('/')) continue;
+        const key = raw.full_name.toLowerCase();
+        if (byFullName.has(key)) continue;
+        byFullName.set(key, {
+          id: typeof raw.id === 'number' ? raw.id : 0,
+          fullName: raw.full_name,
+          name: typeof raw.name === 'string' ? raw.name : raw.full_name.split('/')[1],
+          owner: typeof raw.owner?.login === 'string' ? raw.owner.login : raw.full_name.split('/')[0],
+          isPrivate: Boolean(raw.private),
+          defaultBranch: typeof raw.default_branch === 'string' && raw.default_branch ? raw.default_branch : 'main',
+          description: typeof raw.description === 'string' ? raw.description : '',
+          language: typeof raw.language === 'string' ? raw.language : '',
+          updatedAt: raw.pushed_at || raw.updated_at || '',
+          archived: Boolean(raw.archived),
+          fork: Boolean(raw.fork),
+        });
+      }
+
+      const link = upstream.headers.get('link');
+      const hasNextPage = link !== null ? /rel="next"/.test(link) : batch.length === perPage;
+      if (!hasNextPage) break;
+      if (page === maxPages) truncated = true;
+    }
+
+    return res.json({ repos: Array.from(byFullName.values()), truncated, scopes: scopes ?? connection.scopes });
+  } catch (err) {
+    console.error('GitHub repos proxy error:', err);
+    return res.status(502).json({ error: 'Could not reach GitHub to list your repositories. Please try again.' });
+  }
+});
+
+// POST /api/github/verify - Verify file paths (and repo structure) server-side.
+// Body: { repo: "owner/repo", branch?: string, files: string[] }
+app.post('/api/github/verify', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+
+  const repo = typeof req.body?.repo === 'string' ? req.body.repo.trim().replace(/^\/+|\/+$/g, '') : '';
+  const branch = typeof req.body?.branch === 'string' && req.body.branch.trim() ? req.body.branch.trim() : 'main';
+  const files: string[] = Array.isArray(req.body?.files)
+    ? req.body.files.filter((f: unknown): f is string => typeof f === 'string').map((f: string) => f.trim()).filter(Boolean)
+    : [];
+
+  if (!repo || !GITHUB_REPO_FULL_NAME_RE.test(repo) || /\/\.{1,2}$/.test(repo)) {
+    return res.status(400).json({ error: 'Invalid repository. Use the owner/repo format (e.g. facebook/react).' });
+  }
+  if (branch.length > 255 || /[\u0000-\u001f\u007f]/.test(branch)) {
+    return res.status(400).json({ error: 'Invalid branch name.' });
+  }
+  if (files.length === 0) {
+    return res.status(400).json({ error: 'Please enter at least one file path to verify.' });
+  }
+  if (files.length > GITHUB_MAX_VERIFY_FILES) {
+    return res.status(400).json({ error: `Too many file paths. Verify at most ${GITHUB_MAX_VERIFY_FILES} files at a time.` });
+  }
+
+  const connection = await getStoredGitHubConnection(userEmail);
+  if (!connection) {
+    return res.status(404).json({ error: 'No GitHub account is connected. Connect GitHub to continue.', code: 'github_not_connected' });
+  }
+
+  const [owner, repoName] = repo.split('/');
+  const encodedRepo = `${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`;
+  const encodedBranch = encodeURIComponent(branch);
+
+  try {
+    // Rate limit snapshot (best effort, mirrors the previous client behavior).
+    let rateLimitRemaining: number | undefined;
+    try {
+      const rateRes = await githubApiFetch(connection.token, '/rate_limit');
+      if (rateRes.ok) {
+        const rateData = await rateRes.json();
+        rateLimitRemaining = rateData.resources?.core?.remaining;
+      }
+    } catch {
+      // ignore
+    }
+
+    const verifiedFiles: any[] = [];
+    const missingFiles: any[] = [];
+    let authExpired = false;
+
+    const cleanPaths = Array.from(new Set(
+      files.map((f) => f.replace(/^\/+/, '').replace(/\/+$/, '')).filter(Boolean)
+    ));
+
+    // Bounded concurrency keeps large lists fast without hammering GitHub.
+    let cursor = 0;
+    async function worker() {
+      while (cursor < cleanPaths.length && !authExpired) {
+        const cleanPath = cleanPaths[cursor++];
+        const encodedPath = cleanPath
+          .split('/')
+          .filter((segment) => segment.length > 0)
+          .map((segment) => encodeURIComponent(segment))
+          .join('/');
+        if (!encodedPath) continue;
+
+        try {
+          const upstream = await githubApiFetch(
+            connection!.token,
+            `/repos/${encodedRepo}/contents/${encodedPath}?ref=${encodedBranch}`
+          );
+
+          if (upstream.ok) {
+            const data = await upstream.json();
+            verifiedFiles.push({
+              path: cleanPath,
+              exists: true,
+              url: data.html_url || `https://github.com/${repo}/blob/${encodedBranch}/${encodedPath}`,
+              size: data.size,
+              last_modified: new Date().toISOString(),
+            });
+          } else if (upstream.status === 401) {
+            authExpired = true;
+          } else if (upstream.status === 404) {
+            missingFiles.push({
+              path: cleanPath,
+              exists: false,
+              reason: `File not found in branch "${branch}"`,
+              suggestions: generateFileSuggestions(cleanPath),
+            });
+          } else if (upstream.status === 403 || upstream.status === 429) {
+            missingFiles.push({
+              path: cleanPath,
+              exists: false,
+              reason: 'GitHub API rate limit exceeded or access forbidden',
+            });
+          } else {
+            missingFiles.push({
+              path: cleanPath,
+              exists: false,
+              reason: `GitHub API error (HTTP ${upstream.status})`,
+            });
+          }
+        } catch {
+          missingFiles.push({
+            path: cleanPath,
+            exists: false,
+            reason: 'Network error verifying file. Please try again.',
+            suggestions: generateFileSuggestions(cleanPath),
+          });
+        }
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(GITHUB_VERIFY_CONCURRENCY, cleanPaths.length) }, () => worker())
+    );
+
+    if (authExpired) {
+      await deleteStoredGitHubConnection(userEmail);
+      return res.status(401).json({
+        error: 'Your GitHub authorization has expired. Reconnect GitHub to continue.',
+        code: 'github_reconnect_required',
+      });
+    }
+
+    // Repository structure snapshot (root contents), best effort.
+    const commonFiles = [
+      'package.json', 'tsconfig.json', 'requirements.txt', 'Dockerfile',
+      'docker-compose.yml', 'pom.xml', 'go.mod', 'Cargo.toml', 'README.md',
+    ];
+    const detectedFiles: string[] = [];
+    try {
+      const structureRes = await githubApiFetch(connection.token, `/repos/${encodedRepo}/contents?ref=${encodedBranch}`);
+      if (structureRes.ok) {
+        const contents = await structureRes.json();
+        if (Array.isArray(contents)) {
+          const names = new Set(contents.map((item: any) => item.name));
+          for (const cf of commonFiles) {
+            if (names.has(cf)) detectedFiles.push(cf);
+          }
+        }
+      }
+    } catch {
+      // Structure is supplementary; verification results still stand.
+    }
+
+    const hasPackageJson = detectedFiles.includes('package.json');
+    const hasPythonOrJava =
+      detectedFiles.includes('requirements.txt') ||
+      detectedFiles.includes('pom.xml') ||
+      detectedFiles.includes('go.mod');
+    const hasDocker = detectedFiles.includes('Dockerfile') || detectedFiles.includes('docker-compose.yml');
+
+    const total = verifiedFiles.length + missingFiles.length;
+    const verificationRate = total > 0 ? verifiedFiles.length / total : 0;
+
+    // Preserve input ordering for a stable, readable result list.
+    const order = new Map(cleanPaths.map((p, i) => [p, i]));
+    verifiedFiles.sort((a, b) => (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0));
+    missingFiles.sort((a, b) => (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0));
+
+    return res.json({
+      verification: {
+        repoName: repo,
+        branch,
+        verifiedFiles,
+        missingFiles,
+        verificationRate: Math.round(verificationRate * 100) / 100,
+        totalChecked: total,
+        rateLimitRemaining: rateLimitRemaining ?? 60,
+        checkedAt: new Date().toISOString(),
+      },
+      structure: {
+        likelyFrontend: hasPackageJson,
+        likelyBackend: hasPythonOrJava || (hasPackageJson && hasDocker),
+        likelyFullstack: hasPackageJson && (hasPythonOrJava || hasDocker),
+        detectedFiles,
+      },
+    });
+  } catch (err) {
+    console.error('GitHub verify proxy error:', err);
+    return res.status(502).json({ error: 'Could not reach GitHub to verify files. Please try again.' });
+  }
+});
+
+function generateFileSuggestions(filePath: string): string[] {
+  const parts = filePath.split('/');
+  const filename = parts[parts.length - 1];
+  const commonDirs = ['src', 'app', 'components', 'pages', 'api', 'services', 'models', 'utils'];
+  return commonDirs
+    .slice(0, 3)
+    .map((dir) => `${dir}/${filename}`)
+    .filter((s) => s !== filePath);
+}
+
+// ==========================================
 // Audit History Deletion Endpoints
 // ==========================================
 
@@ -2497,6 +3110,7 @@ app.get('/api/supabase/health', async (_req, res) => {
     'promo_codes',
     'transactions',
     'system_settings',
+    'user_github_tokens',
   ];
 
   if (!supabaseAdmin) {

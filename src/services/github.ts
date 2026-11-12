@@ -1,4 +1,5 @@
-import { GitHubVerificationResult, GitHubFileVerification } from '../types';
+import { GitHubVerificationResult } from '../types';
+import { getAuthHeaders } from './supabase';
 
 /** A repository the connected GitHub account can access. */
 export interface GitHubRepoSummary {
@@ -25,21 +26,39 @@ export interface GitHubRepoListing {
   scopes: string[] | null;
 }
 
-/** GitHub REST failure with the HTTP status preserved for the caller. */
+/** Persisted GitHub connection status. Never contains the OAuth token. */
+export interface GitHubConnectionStatus {
+  connected: boolean;
+  login: string | null;
+  avatarUrl: string | null;
+  scopes: string[];
+  connectedAt?: string | null;
+}
+
+export interface GitHubRepoStructure {
+  likelyFrontend: boolean;
+  likelyBackend: boolean;
+  likelyFullstack: boolean;
+  detectedFiles: string[];
+}
+
+export interface GitHubVerifyResponse {
+  verification: GitHubVerificationResult;
+  structure: GitHubRepoStructure;
+}
+
+/** Backend/GitHub failure with the HTTP status preserved for the caller. */
 export class GitHubApiError extends Error {
   readonly status: number;
+  readonly code?: string;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.name = 'GitHubApiError';
     this.status = status;
+    this.code = code;
   }
 }
-
-/** Repositories of the authenticated user, most recently updated first. */
-const USER_REPOS_ENDPOINT = 'https://api.github.com/user/repos?sort=updated';
-const REPOS_PER_PAGE = 100;
-const MAX_REPO_PAGES = 5;
 
 const REPO_FULL_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
 
@@ -66,282 +85,163 @@ export function normalizeRepoFullName(value: string): string {
   return isRepoFullName(fullName) ? fullName : '';
 }
 
-function toRepoSummary(raw: any): GitHubRepoSummary | null {
-  if (!raw || typeof raw.full_name !== 'string' || !raw.full_name.includes('/')) return null;
-  return {
-    id: typeof raw.id === 'number' ? raw.id : 0,
-    fullName: raw.full_name,
-    name: typeof raw.name === 'string' ? raw.name : raw.full_name.split('/')[1],
-    owner: typeof raw.owner?.login === 'string' ? raw.owner.login : raw.full_name.split('/')[0],
-    isPrivate: Boolean(raw.private),
-    defaultBranch: typeof raw.default_branch === 'string' && raw.default_branch ? raw.default_branch : 'main',
-    description: typeof raw.description === 'string' ? raw.description : '',
-    language: typeof raw.language === 'string' ? raw.language : '',
-    updatedAt: raw.pushed_at || raw.updated_at || '',
-    archived: Boolean(raw.archived),
-    fork: Boolean(raw.fork),
-  };
-}
-
-async function toGitHubApiError(res: Response, action: string): Promise<GitHubApiError> {
-  if (res.status === 401) {
-    return new GitHubApiError(401, 'Your GitHub authorization has expired. Reconnect GitHub to continue.');
-  }
-
-  const rateLimited =
-    res.status === 429 || (res.status === 403 && res.headers.get('x-ratelimit-remaining') === '0');
-  if (rateLimited) {
-    const resetAt = Number(res.headers.get('x-ratelimit-reset'));
-    const when = Number.isFinite(resetAt) && resetAt > 0
-      ? ` Try again after ${new Date(resetAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`
-      : ' Please try again in a few minutes.';
-    return new GitHubApiError(res.status, `GitHub API rate limit reached.${when}`);
-  }
-
-  let detail = '';
+/** Reads a backend error body into a GitHubApiError, preserving status/code. */
+async function toApiError(res: Response, fallback: string): Promise<GitHubApiError> {
+  let message = fallback;
+  let code: string | undefined;
   try {
     const body = await res.json();
-    if (typeof body?.message === 'string') detail = body.message;
+    if (typeof body?.error === 'string' && body.error) message = body.error;
+    if (typeof body?.code === 'string') code = body.code;
   } catch {
     // Non-JSON error body
   }
-  return new GitHubApiError(
-    res.status,
-    `GitHub could not ${action} (HTTP ${res.status}${detail ? `: ${detail}` : ''}).`
+  return new GitHubApiError(res.status, message, code);
+}
+
+async function authorizedFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers: Record<string, string> = {
+    ...(await getAuthHeaders()),
+    ...(init.headers as Record<string, string> | undefined),
+  };
+  if (init.body) headers['Content-Type'] = 'application/json';
+  return fetch(path, { ...init, headers });
+}
+
+// ---------------------------------------------------------------------------
+// One-time capture of the Supabase OAuth provider token.
+//
+// Supabase only exposes session.provider_token right after the GitHub OAuth
+// redirect (SIGNED_IN / INITIAL_SESSION). It must be handed to the backend in
+// that moment; afterwards the backend stores it encrypted and proxies every
+// GitHub API call. The token is never written to localStorage, sessionStorage,
+// or any long-lived frontend state, and never logged.
+// ---------------------------------------------------------------------------
+
+// De-duplication fingerprint (SHA-256) of the last captured token — never the
+// token itself. Memory-only, cleared on sign-out, never persisted or logged.
+let lastCapturedFingerprint: string | null = null;
+let captureInFlight: Promise<GitHubConnectionStatus | null> | null = null;
+
+/** Notifies listeners (e.g. the verifier) that the connection status changed. */
+export const GITHUB_CONNECTION_EVENT = 'cp:github-connection-changed';
+
+function notifyConnectionChanged(): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(GITHUB_CONNECTION_EVENT));
+  }
+}
+
+async function fingerprintToken(token: string): Promise<string | null> {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.subtle) {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+      return Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+  } catch {
+    // Insecure context: skip de-duplication rather than keep the raw token.
+  }
+  return null;
+}
+
+/**
+ * Posts a freshly issued GitHub provider token to the backend so the
+ * connection survives refreshes and sign-outs. Safe to call repeatedly:
+ * identical consecutive tokens are only sent once per page load.
+ * Returns the connection status, or null when there was nothing to capture.
+ */
+export async function captureGitHubProviderToken(session: {
+  access_token?: string;
+  provider_token?: string | null;
+  user?: { id?: string; identities?: Array<{ provider?: string }> | null };
+} | null | undefined): Promise<GitHubConnectionStatus | null> {
+  const providerToken = typeof session?.provider_token === 'string' ? session.provider_token : '';
+  const accessToken = typeof session?.access_token === 'string' ? session.access_token : '';
+  const hasGithubIdentity = Boolean(
+    session?.user?.identities?.some((identity) => identity?.provider === 'github')
   );
+  if (!providerToken || !accessToken || !hasGithubIdentity) return null;
+
+  // De-duplicate: auth listeners and the initial session check can both fire
+  // for the same redirect. Only a SHA-256 fingerprint is kept in memory —
+  // never the raw token — and it is cleared on sign-out.
+  if (captureInFlight) return captureInFlight;
+  const fingerprint = await fingerprintToken(providerToken);
+  // Re-check after the async fingerprint: another caller may have started or
+  // completed the same capture while this one was hashing.
+  if (captureInFlight) return captureInFlight;
+  if (fingerprint && fingerprint === lastCapturedFingerprint) return null;
+
+  captureInFlight = (async () => {
+    try {
+      const res = await fetch('/api/user/github-token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({ providerToken }),
+      });
+      if (!res.ok) throw await toApiError(res, 'Failed to save the GitHub connection.');
+      lastCapturedFingerprint = fingerprint;
+      const status = (await res.json()) as GitHubConnectionStatus;
+      notifyConnectionChanged();
+      return status;
+    } finally {
+      captureInFlight = null;
+    }
+  })();
+
+  return captureInFlight;
+}
+
+/** Clears the capture de-duplication state on sign-out. */
+export function resetGitHubTokenCapture(): void {
+  lastCapturedFingerprint = null;
 }
 
 export const githubService = {
-  /**
-   * Lists the repositories the connected account can access, most recently
-   * updated first (GET /user/repos?sort=updated), following pagination up to
-   * MAX_REPO_PAGES pages.
-   */
-  async listUserRepos(oauthAccessToken: string, signal?: AbortSignal): Promise<GitHubRepoListing> {
-    const token = oauthAccessToken.trim();
-    if (!token) throw new Error('Connect your GitHub account before loading repositories.');
-
-    const headers: Record<string, string> = {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${token}`,
-    };
-
-    const byFullName = new Map<string, GitHubRepoSummary>();
-    let scopes: string[] | null = null;
-    let truncated = false;
-
-    for (let page = 1; page <= MAX_REPO_PAGES; page += 1) {
-      const res = await fetch(`${USER_REPOS_ENDPOINT}&per_page=${REPOS_PER_PAGE}&page=${page}`, {
-        headers,
-        signal,
-      });
-      if (!res.ok) throw await toGitHubApiError(res, 'list your repositories');
-
-      if (page === 1) {
-        const scopeHeader = res.headers.get('x-oauth-scopes');
-        if (scopeHeader !== null) {
-          scopes = scopeHeader.split(',').map((scope) => scope.trim()).filter(Boolean);
-        }
-      }
-
-      const batch = await res.json();
-      if (!Array.isArray(batch)) break;
-      for (const raw of batch) {
-        const repo = toRepoSummary(raw);
-        if (repo && !byFullName.has(repo.fullName.toLowerCase())) {
-          byFullName.set(repo.fullName.toLowerCase(), repo);
-        }
-      }
-
-      const link = res.headers.get('link');
-      const hasNextPage = link !== null ? /rel="next"/.test(link) : batch.length === REPOS_PER_PAGE;
-      if (!hasNextPage) break;
-      if (page === MAX_REPO_PAGES) truncated = true;
-    }
-
-    return { repos: Array.from(byFullName.values()), truncated, scopes };
+  /** Connection status from the backend (never includes the token). */
+  async getConnectionStatus(): Promise<GitHubConnectionStatus> {
+    const res = await authorizedFetch('/api/user/github-token');
+    if (!res.ok) throw await toApiError(res, 'Could not read your GitHub connection status.');
+    return (await res.json()) as GitHubConnectionStatus;
   },
 
+  /** Removes the stored token server-side. */
+  async disconnect(): Promise<void> {
+    const res = await authorizedFetch('/api/user/github-token', { method: 'DELETE' });
+    if (!res.ok) throw await toApiError(res, 'Failed to disconnect GitHub.');
+    resetGitHubTokenCapture();
+    notifyConnectionChanged();
+  },
+
+  /**
+   * Lists the repositories the connected account can access through the
+   * backend proxy (GET /api/github/repos), most recently updated first.
+   */
+  async listUserRepos(signal?: AbortSignal): Promise<GitHubRepoListing> {
+    const res = await authorizedFetch('/api/github/repos', { signal });
+    if (!res.ok) throw await toApiError(res, 'Could not load your repositories from GitHub.');
+    return (await res.json()) as GitHubRepoListing;
+  },
+
+  /**
+   * Verifies file paths and reads the repository structure through the backend
+   * proxy (POST /api/github/verify). The GitHub token stays on the server.
+   */
   async verifyFiles(
     repoName: string,
     filePaths: string[],
-    oauthAccessToken: string,
     branch: string = 'main'
-  ): Promise<GitHubVerificationResult> {
-    const verifiedFiles: GitHubFileVerification[] = [];
-    const missingFiles: GitHubFileVerification[] = [];
-
-    const headers: Record<string, string> = {
-      Accept: 'application/vnd.github.v3+json',
-    };
-    if (!oauthAccessToken.trim()) throw new Error('Connect your GitHub account with OAuth before verifying repositories.');
-    headers['Authorization'] = `Bearer ${oauthAccessToken.trim()}`;
-
-    let rateLimitRemaining: number | undefined = undefined;
-
-    // Check rate limit first
-    try {
-      const rateRes = await fetch('https://api.github.com/rate_limit', { headers });
-      if (rateRes.ok) {
-        const rateData = await rateRes.json();
-        rateLimitRemaining = rateData.resources?.core?.remaining;
-      }
-    } catch {
-      // ignore network errors on rate limit endpoint
-    }
-
-    const cleanRepo = repoName.trim();
-    const [owner, repo] = cleanRepo.split('/');
-
-    if (!owner || !repo) {
-      throw new Error(`Invalid repository format "${repoName}". Expected "owner/repo" (e.g. facebook/react)`);
-    }
-
-    // Verify each file against real GitHub REST API
-    for (const filePath of filePaths) {
-      const cleanPath = filePath.trim().replace(/^\/+/, '').replace(/\/+$/, '');
-      if (!cleanPath) continue;
-
-      // Encode each path segment so spaces, "#" and unicode characters are safe.
-      const encodedPath = cleanPath
-        .split('/')
-        .filter((segment) => segment.length > 0)
-        .map((segment) => encodeURIComponent(segment))
-        .join('/');
-
-      try {
-        const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedPath}?ref=${encodeURIComponent(branch)}`;
-        const res = await fetch(url, { headers });
-
-        if (res.ok) {
-          const data = await res.json();
-          verifiedFiles.push({
-            path: cleanPath,
-            exists: true,
-            url: data.html_url || `https://github.com/${cleanRepo}/blob/${encodeURIComponent(branch)}/${encodedPath}`,
-            size: data.size,
-            last_modified: new Date().toISOString(),
-          });
-        } else if (res.status === 404) {
-          const suggestions = generateSuggestions(cleanPath);
-          missingFiles.push({
-            path: cleanPath,
-            exists: false,
-            reason: `File not found in branch "${branch}"`,
-            suggestions,
-          });
-        } else if (res.status === 403 || res.status === 429) {
-          missingFiles.push({
-            path: cleanPath,
-            exists: false,
-            reason: 'GitHub API rate limit exceeded or access forbidden',
-          });
-        } else {
-          missingFiles.push({
-            path: cleanPath,
-            exists: false,
-            reason: `GitHub API error (HTTP ${res.status})`,
-          });
-        }
-      } catch (err: any) {
-        missingFiles.push({
-          path: cleanPath,
-          exists: false,
-          reason: `Network error verifying file: ${err?.message || 'Failed to fetch'}`,
-          suggestions: generateSuggestions(cleanPath),
-        });
-      }
-    }
-
-    const total = verifiedFiles.length + missingFiles.length;
-    const verificationRate = total > 0 ? verifiedFiles.length / total : 0;
-
-    return {
-      repoName: cleanRepo,
-      branch,
-      verifiedFiles,
-      missingFiles,
-      verificationRate: Math.round(verificationRate * 100) / 100,
-      totalChecked: total,
-      rateLimitRemaining: rateLimitRemaining ?? 60,
-      checkedAt: new Date().toISOString(),
-    };
-  },
-
-  async analyzeRepoStructure(repoName: string, oauthAccessToken: string, branch: string = 'main') {
-    const cleanRepo = repoName.trim();
-    const [owner, repo] = cleanRepo.split('/');
-    if (!owner || !repo) {
-      return {
-        likelyFrontend: false,
-        likelyBackend: false,
-        likelyFullstack: false,
-        detectedFiles: [],
-      };
-    }
-
-    const headers: Record<string, string> = {
-      Accept: 'application/vnd.github.v3+json',
-    };
-    if (!oauthAccessToken.trim()) throw new Error('Connect your GitHub account with OAuth before verifying repositories.');
-    headers['Authorization'] = `Bearer ${oauthAccessToken.trim()}`;
-
-    const commonFiles = [
-      'package.json',
-      'tsconfig.json',
-      'requirements.txt',
-      'Dockerfile',
-      'docker-compose.yml',
-      'pom.xml',
-      'go.mod',
-      'Cargo.toml',
-      'README.md',
-    ];
-
-    const detectedFiles: string[] = [];
-
-    // Query real repository contents from GitHub
-    try {
-      const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents?ref=${encodeURIComponent(branch)}`;
-      const res = await fetch(url, { headers });
-      if (res.ok) {
-        const contents = await res.json();
-        if (Array.isArray(contents)) {
-          const names = new Set(contents.map((item: any) => item.name));
-          for (const cf of commonFiles) {
-            if (names.has(cf)) {
-              detectedFiles.push(cf);
-            }
-          }
-        }
-      }
-    } catch {
-      // fallback
-    }
-
-    const hasPackageJson = detectedFiles.includes('package.json');
-    const hasPythonOrJava =
-      detectedFiles.includes('requirements.txt') ||
-      detectedFiles.includes('pom.xml') ||
-      detectedFiles.includes('go.mod');
-    const hasDocker = detectedFiles.includes('Dockerfile') || detectedFiles.includes('docker-compose.yml');
-
-    return {
-      likelyFrontend: hasPackageJson,
-      likelyBackend: hasPythonOrJava || (hasPackageJson && hasDocker),
-      likelyFullstack: hasPackageJson && (hasPythonOrJava || hasDocker),
-      detectedFiles,
-    };
+  ): Promise<GitHubVerifyResponse> {
+    const res = await authorizedFetch('/api/github/verify', {
+      method: 'POST',
+      body: JSON.stringify({ repo: repoName, branch, files: filePaths }),
+    });
+    if (!res.ok) throw await toApiError(res, 'Failed to verify files against GitHub.');
+    return (await res.json()) as GitHubVerifyResponse;
   },
 };
-
-function generateSuggestions(filePath: string): string[] {
-  const parts = filePath.split('/');
-  const filename = parts[parts.length - 1];
-  const commonDirs = ['src', 'app', 'components', 'pages', 'api', 'services', 'models', 'utils'];
-
-  return commonDirs
-    .slice(0, 3)
-    .map((dir) => `${dir}/${filename}`)
-    .filter((s) => s !== filePath);
-}
