@@ -24,7 +24,9 @@ import {
   Sparkles,
   Inbox,
   Copy,
-  Check
+  Check,
+  Zap,
+  X
 } from 'lucide-react';
 
 interface GitHubVerifierViewProps {
@@ -87,6 +89,76 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
   // Search filter and copy states for verified files
   const [verifiedSearchTerm, setVerifiedSearchTerm] = useState('');
   const [copiedFilePath, setCopiedFilePath] = useState<string | null>(null);
+
+  // Per-"Potential Path" verification state, keyed by the suggested path
+  const [suggestionVerification, setSuggestionVerification] = useState<
+    Record<string, { status: 'verifying' | 'verified' | 'not-found'; url?: string }>
+  >({});
+  // Clean, auto-dismissing toast (e.g. "Path not found in repository.")
+  const [toast, setToast] = useState<{ text: string } | null>(null);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 4500);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  /**
+   * Verifies a single suggested path (from "Potential paths") against the
+   * repository currently configured in the form. On success the pill turns
+   * green with a checkmark and becomes a link to the file; otherwise a toast
+   * explains the outcome.
+   */
+  const handleVerifySuggestion = async (suggestion: string) => {
+    if (suggestionVerification[suggestion]?.status === 'verifying') return;
+    if (!githubConnected) {
+      setToast({ text: 'Connect with GitHub before verifying a path.' });
+      return;
+    }
+    const targetRepo = normalizeRepoFullName(repoName);
+    if (!targetRepo) {
+      setToast({ text: 'Select a valid repository (owner/repo) before verifying a path.' });
+      return;
+    }
+    const targetBranch = branch.trim() || 'main';
+    setSuggestionVerification((prev) => ({ ...prev, [suggestion]: { status: 'verifying' } }));
+
+    try {
+      const res = await githubService.verifyFiles(targetRepo, [suggestion], targetBranch);
+      const hit =
+        res.verification.verifiedFiles.find((f) => f.path === suggestion) ??
+        res.verification.verifiedFiles[0];
+
+      if (hit?.exists) {
+        const encodedPath = suggestion
+          .replace(/^\/+|\/+$/g, '')
+          .split('/')
+          .map((segment) => encodeURIComponent(segment))
+          .join('/');
+        const fallbackUrl = `https://github.com/${targetRepo}/blob/${encodeURIComponent(targetBranch)}/${encodedPath}`;
+        setSuggestionVerification((prev) => ({
+          ...prev,
+          [suggestion]: { status: 'verified', url: hit.url || fallbackUrl },
+        }));
+      } else {
+        setSuggestionVerification((prev) => ({ ...prev, [suggestion]: { status: 'not-found' } }));
+        setToast({ text: 'Path not found in repository.' });
+      }
+    } catch (err: any) {
+      console.error('[Suggestion verify]', err);
+      setSuggestionVerification((prev) => {
+        const next = { ...prev };
+        delete next[suggestion];
+        return next;
+      });
+      if (err?.status === 401 || err?.code === 'github_not_connected' || err?.code === 'github_reconnect_required') {
+        setConnection({ connected: false, login: null, avatarUrl: null, scopes: [] });
+        setToast({ text: 'GitHub authorization expired. Reconnect GitHub to verify paths.' });
+      } else {
+        setToast({ text: err?.message || 'Could not verify the path. Please try again.' });
+      }
+    }
+  };
 
   const handleCopyPath = (path: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
@@ -805,22 +877,75 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                               <Sparkles className="w-3 h-3" /> Potential paths:
                             </span>
                             <div className="flex flex-wrap gap-1.5 min-w-0">
-                              {missing.suggestions.map((sug) => (
-                                <button
-                                  key={sug}
-                                  type="button"
-                                  onClick={(e) => handleCopyPath(sug, e)}
-                                  title={`Click to copy: ${sug}`}
-                                  className="inline-flex items-center gap-1 max-w-[220px] sm:max-w-xs md:max-w-md truncate px-2 py-0.5 rounded-md bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-mono text-[11px] border border-indigo-200/60 transition-colors text-left"
-                                >
-                                  {copiedFilePath === sug ? (
-                                    <Check className="w-2.5 h-2.5 text-emerald-600 shrink-0" />
-                                  ) : (
-                                    <Copy className="w-2.5 h-2.5 text-indigo-400 shrink-0" />
-                                  )}
-                                  <span className="truncate">{sug}</span>
-                                </button>
-                              ))}
+                              {missing.suggestions.map((sug) => {
+                                const sv = suggestionVerification[sug];
+                                const isVerified = sv?.status === 'verified';
+                                const isVerifying = sv?.status === 'verifying';
+                                const isNotFound = sv?.status === 'not-found';
+
+                                /* Verified: green pill, checkmark, opens the file on GitHub */
+                                if (isVerified) {
+                                  return (
+                                    <a
+                                      key={sug}
+                                      href={sv.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      title={`Open ${sug} on GitHub`}
+                                      className="inline-flex items-center gap-1.5 max-w-[240px] sm:max-w-xs md:max-w-md truncate px-2 py-0.5 rounded-md bg-emerald-50 hover:bg-emerald-100 text-emerald-800 font-mono text-[11px] border border-emerald-300 transition-colors text-left"
+                                    >
+                                      <Check className="w-3 h-3 text-emerald-600 shrink-0" />
+                                      <span className="truncate">{sug}</span>
+                                      <ExternalLink className="w-2.5 h-2.5 text-emerald-500 shrink-0" />
+                                    </a>
+                                  );
+                                }
+
+                                /* Pending / not-found: pill with copy segment + 1-click Verify action */
+                                return (
+                                  <span
+                                    key={sug}
+                                    className={`inline-flex items-stretch max-w-[240px] sm:max-w-xs md:max-w-md rounded-md border font-mono text-[11px] overflow-hidden transition-colors ${
+                                      isNotFound
+                                        ? 'bg-rose-50 text-rose-800 border-rose-300'
+                                        : 'bg-indigo-50 text-indigo-700 border-indigo-200/60'
+                                    }`}
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={(e) => handleCopyPath(sug, e)}
+                                      title={`Click to copy: ${sug}`}
+                                      className={`flex items-center gap-1 min-w-0 truncate pl-2 pr-1.5 py-0.5 transition-colors text-left ${
+                                        isNotFound ? 'hover:bg-rose-100' : 'hover:bg-indigo-100'
+                                      }`}
+                                    >
+                                      {copiedFilePath === sug ? (
+                                        <Check className="w-2.5 h-2.5 text-emerald-600 shrink-0" />
+                                      ) : (
+                                        <Copy className={`w-2.5 h-2.5 shrink-0 ${isNotFound ? 'text-rose-400' : 'text-indigo-400'}`} />
+                                      )}
+                                      <span className="truncate">{sug}</span>
+                                    </button>
+                                    <span aria-hidden="true" className={`w-px ${isNotFound ? 'bg-rose-200' : 'bg-indigo-200/70'}`} />
+                                    <button
+                                      type="button"
+                                      onClick={() => handleVerifySuggestion(sug)}
+                                      disabled={isVerifying}
+                                      title={isVerifying ? `Verifying ${sug}…` : `Verify ${sug} against the repository`}
+                                      aria-label={`Verify ${sug} against the repository`}
+                                      className={`shrink-0 px-1.5 flex items-center justify-center transition-colors disabled:opacity-60 ${
+                                        isNotFound ? 'text-rose-500 hover:bg-rose-100' : 'text-indigo-500 hover:bg-indigo-100'
+                                      }`}
+                                    >
+                                      {isVerifying ? (
+                                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                      ) : (
+                                        <Zap className="w-3.5 h-3.5" />
+                                      )}
+                                    </button>
+                                  </span>
+                                );
+                              })}
                             </div>
                           </div>
                         )}
@@ -843,6 +968,25 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
           )}
         </div>
       </div>
+
+      {/* Red toast — e.g. a suggested path that does not exist in the repository */}
+      {toast && (
+        <div
+          role="alert"
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] flex items-center gap-3 w-[min(92vw,26rem)] rounded-xl border border-rose-800 bg-rose-950/95 backdrop-blur px-4 py-3 shadow-2xl animate-in fade-in"
+        >
+          <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
+          <span className="flex-1 text-xs leading-snug text-rose-100 break-words">{toast.text}</span>
+          <button
+            type="button"
+            onClick={() => setToast(null)}
+            aria-label="Dismiss notification"
+            className="shrink-0 text-rose-300 hover:text-white transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
     </div>
   );
 };
