@@ -1,0 +1,50 @@
+Copyright (c) 2026 Ameenu Jaafar. All Rights Reserved.
+
+PROPRIETARY AND CONFIDENTIAL
+
+This software and associated documentation files (the "Software") are the
+exclusive property of the copyright holder.
+
+1. RESTRICTIONS ON USE BY THIRD PARTIES
+
+No part of this Software may be reproduced, distributed, modified, merged,
+published, sublicensed, sold, or used to create derivative works by any third
+party without the express prior written permission of the copyright holder.
+Any unauthorized use, copying, or distribution of this Software is strictly
+prohibited and will be pursued to the fullest extent of the law.
+
+2. RIGHTS OF THE COPYRIGHT HOLDER
+
+The copyright holder (Ameenu Jaafar) retains the exclusive, unrestricted, and
+perpetual right to use, modify, distribute, sublicense, and incorporate any
+portion of this Software into any other projects, platforms, or applications
+(whether commercial or personal) without any restrictions or obligations.
+
+3. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+4. DEVELOPER TOOL DISCLAIMER
+
+This Software is a tool for predicting codebase impact and providing architectural insights.
+
+It does not guarantee the accuracy of its predictions. The copyright holder is not liable for
+
+any code changes, broken deployments, security vulnerabilities, or system failures incurred
+
+through the use of this Software's predictions. Users are solely responsible for reviewing
+
+and testing all AI-generated suggestions before committing code to production.
+
+5. THIRD-PARTY DEPENDENCIES
+
+This license applies solely to the original source code created by the copyright holder.
+Open-source libraries, frameworks, and dependencies used by this Software retain their
+respective original licenses (e.g., MIT, Apache 2.0) and are not covered by this
+proprietary license.
