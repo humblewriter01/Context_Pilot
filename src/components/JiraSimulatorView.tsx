@@ -76,6 +76,12 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
   const [quotaExceeded, setQuotaExceeded] = useState(false);
   const [activeAnalysisTicketKey, setActiveAnalysisTicketKey] = useState<string>('');
 
+  // Stale error banners should never linger: any user edit (or a fresh Analyze
+  // attempt, which already calls setAnalysisError(null)) clears the banner.
+  const clearAnalysisError = () => {
+    setAnalysisError(null);
+  };
+
   const handleAnalyze = async () => {
     setAnalysisError(null);
 
@@ -235,14 +241,14 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                   type="text"
                   placeholder="Ticket key"
                   value={ticketKey}
-                  onChange={(e) => setTicketKey(e.target.value)}
+                  onChange={(e) => { setTicketKey(e.target.value); clearAnalysisError(); }}
                   className="w-full sm:w-36 px-3 py-1.5 border border-slate-300 rounded-lg text-sm font-bold text-slate-900 font-mono bg-white focus:outline-indigo-500"
                 />
                 <input
                   type="text"
                   placeholder="Issue summary"
                   value={ticketTitle}
-                  onChange={(e) => setTicketTitle(e.target.value)}
+                  onChange={(e) => { setTicketTitle(e.target.value); clearAnalysisError(); }}
                   className="flex-1 px-3 py-1.5 border border-slate-300 rounded-lg text-sm sm:text-base font-bold text-slate-900 bg-white focus:outline-indigo-500"
                 />
               </div>
@@ -286,7 +292,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                 rows={9}
                 placeholder="Paste or describe the issue requirements, expected behavior, or bug details here..."
                 value={ticketDescription}
-                onChange={(e) => setTicketDescription(e.target.value)}
+                onChange={(e) => { setTicketDescription(e.target.value); clearAnalysisError(); }}
                 className="w-full p-4 border border-slate-300 rounded-xl text-xs sm:text-sm font-normal text-slate-800 bg-slate-50/50 focus:bg-white focus:outline-indigo-500 leading-relaxed font-mono"
               />
             </div>
@@ -343,6 +349,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                 onChange={(e) => {
                   const value = e.target.value;
                   setTechStack(value);
+                  clearAnalysisError();
                   try {
                     localStorage.setItem(TECH_STACK_STORAGE_KEY, value);
                   } catch {
@@ -379,7 +386,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
               <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Status</label>
               <select
                 value={status}
-                onChange={(e: any) => setStatus(e.target.value)}
+                onChange={(e: any) => { setStatus(e.target.value); clearAnalysisError(); }}
                 className="w-full px-3 py-2 bg-blue-50 border border-blue-200 text-blue-700 rounded-lg font-semibold text-xs focus:outline-blue-500"
               >
                 <option value="" disabled>Select status</option>
@@ -395,7 +402,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
               <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Priority</label>
               <select
                 value={priority}
-                onChange={(e: any) => setPriority(e.target.value)}
+                onChange={(e: any) => { setPriority(e.target.value); clearAnalysisError(); }}
                 className="w-full px-3 py-2 bg-slate-50 border border-slate-300 text-slate-800 rounded-lg font-semibold text-xs focus:outline-indigo-500"
               >
                 <option value="" disabled>Select priority</option>
@@ -412,7 +419,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
               <input
                 type="text"
                 value={componentsList}
-                onChange={(e) => setComponentsList(e.target.value)}
+                onChange={(e) => { setComponentsList(e.target.value); clearAnalysisError(); }}
                 placeholder="Components (comma-separated)"
                 className="w-full px-3 py-2 bg-white border border-slate-300 text-slate-800 rounded-lg text-xs font-mono focus:outline-indigo-500"
               />

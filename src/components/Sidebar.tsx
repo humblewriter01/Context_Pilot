@@ -16,7 +16,8 @@ import {
   Pin,
   ExternalLink,
   X,
-  LifeBuoy
+  LifeBuoy,
+  ArrowUpRight
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -293,13 +294,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </div>
             </div>
 
-            {/* Contact Support — pinned above the profile / sign-out block */}
+            {/* Contact Support — featured link, pinned above the profile / sign-out block */}
             <a
               href="mailto:support.contextpilot@gmail.com?subject=Support%20Request%20-%20Context%20Pilot"
-              className="flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-semibold text-slate-600 hover:text-slate-900 hover:bg-slate-100/70 border border-transparent transition-all group"
+              className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-bold text-indigo-700 bg-indigo-50 border border-indigo-100 shadow-2xs hover:bg-indigo-100 hover:border-indigo-200 hover:text-indigo-800 transition-all group"
             >
-              <LifeBuoy className="w-4 h-4 shrink-0 text-slate-400 group-hover:text-slate-600 transition-colors" />
+              <LifeBuoy className="w-4 h-4 shrink-0 text-indigo-500 group-hover:text-indigo-600 group-hover:-rotate-12 transition-all duration-300" />
               <span className="truncate">Contact Support</span>
+              <ArrowUpRight className="ml-auto w-3.5 h-3.5 text-indigo-400 group-hover:text-indigo-600 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-all duration-300" />
             </a>
 
             {/* User Profile or Sign In CTA */}
