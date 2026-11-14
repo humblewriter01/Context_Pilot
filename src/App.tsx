@@ -25,6 +25,8 @@ import {
 import { readAuthRedirectError, clearAuthRedirectError } from './services/authErrors';
 import { captureGitHubProviderToken, resetGitHubTokenCapture } from './services/github';
 import ResetPasswordModal from './components/ResetPasswordModal';
+import { PrivacyPolicy } from './components/PrivacyPolicy';
+import { TermsOfService } from './components/TermsOfService';
 import { formatDisplayName } from './components/UserAvatar';
 import { getImpersonation, stopImpersonation, type ImpersonationInfo } from './services/impersonation';
 import { Eye, LogOut } from 'lucide-react';
@@ -164,7 +166,7 @@ export const App: React.FC = () => {
     }
   };
 
-  // URL route handling for /admin
+  // URL route handling for /admin and public legal pages
   const checkIsAdmin = () => {
     const path = window.location.pathname.toLowerCase();
     const hash = window.location.hash.toLowerCase();
@@ -172,6 +174,16 @@ export const App: React.FC = () => {
   };
 
   const [isAdminRoute, setIsAdminRoute] = useState(checkIsAdmin);
+
+  const checkLegalRoute = (): 'privacy' | 'terms' | null => {
+    const path = window.location.pathname.toLowerCase();
+    const hash = window.location.hash.toLowerCase();
+    if (path === '/privacy' || path.startsWith('/privacy/') || hash === '#/privacy' || hash === '#privacy') return 'privacy';
+    if (path === '/terms' || path.startsWith('/terms/') || hash === '#/terms' || hash === '#terms') return 'terms';
+    return null;
+  };
+
+  const [legalRoute, setLegalRoute] = useState<'privacy' | 'terms' | null>(checkLegalRoute);
 
   // Verify real Supabase session on app load
   useEffect(() => {
@@ -324,6 +336,7 @@ export const App: React.FC = () => {
   useEffect(() => {
     const handleLocationChange = () => {
       setIsAdminRoute(checkIsAdmin());
+      setLegalRoute(checkLegalRoute());
       const hash = window.location.hash.replace('#', '').toLowerCase();
       if (['jira', 'dashboard', 'github', 'history', 'subscription', 'extension'].includes(hash)) {
         setActiveTab(hash);
@@ -342,6 +355,7 @@ export const App: React.FC = () => {
     window.history.pushState({}, '', '/');
     window.location.hash = '';
     setIsAdminRoute(false);
+    setLegalRoute(null);
   };
 
   const refreshAllData = async () => {
@@ -448,6 +462,14 @@ export const App: React.FC = () => {
       </button>
     </div>
   ) : null;
+
+  // Public legal pages — no authentication required
+  if (legalRoute === 'privacy') {
+    return <PrivacyPolicy onBackToHome={navigateToApp} />;
+  }
+  if (legalRoute === 'terms') {
+    return <TermsOfService onBackToHome={navigateToApp} />;
+  }
 
   // If path is /admin or #/admin, render protected Enterprise Admin Portal
   if (isAdminRoute) {
