@@ -1884,8 +1884,301 @@ app.post('/api/auth/delete-account', authenticateUser, async (req: express.Reque
 // 3. AI Analysis endpoint with robust fallback
 // ==========================================
 
-function heuristicAnalyzeTicket(ticketText: string, ticketKey: string) {
+const MAX_TECH_STACK_LENGTH = 120;
+const TECH_STACK_WARNING =
+  'No tech stack was provided. Predictions defaulted to general software architecture — provide your project\'s tech stack (e.g. "C++ / Vulkan", "React / Node") to significantly increase accuracy.';
+
+/**
+ * Normalises the free-form "Tech Stack / Project Type" value supplied by the client.
+ * Trims, strips control characters/newlines (so the value can be embedded in a prompt
+ * safely), collapses runs of spaces and caps the length.
+ */
+function sanitizeTechStack(input: unknown): string {
+  if (typeof input !== 'string') return '';
+  return input
+    .replace(/[\u0000-\u001F\u007F]+/g, ' ')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim()
+    .slice(0, MAX_TECH_STACK_LENGTH);
+}
+
+const snakeCase = (value: string): string =>
+  value
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[\s\-/]+/g, '_')
+    .toLowerCase();
+
+interface HeuristicStackProfile {
+  /** True for JS/TS web ecosystems where the legacy web heuristics capture more detail. */
+  isWeb: boolean;
+  /** UI/frontend-layer paths for a PascalCase module name. */
+  view: (name: string) => string[];
+  /** Backend-layer paths for a path area and PascalCase module name. */
+  service: (area: string, name: string) => string[];
+  /** Database-layer paths for a snake_case-ish area and PascalCase module name. */
+  repository: (area: string, name: string) => string[];
+  /** Test file path for an area and PascalCase module name. */
+  test: (area: string, name: string) => string;
+  /** Build/config files that make sense for the stack. */
+  buildFiles: string[];
+}
+
+interface ProfileOptions {
+  ext: string;
+  headerExt?: string;
+  style?: 'pascal' | 'snake';
+  srcRoot?: string;
+  isWeb?: boolean;
+  testPath: (area: string, snakeName: string, pascalName: string) => string;
+  buildFiles: string[];
+}
+
+/** Factory producing conventional per-stack paths for the heuristic fallback engine. */
+function makeStackProfile({ ext, headerExt = '', style = 'pascal', srcRoot = 'src', isWeb = false, testPath, buildFiles }: ProfileOptions): HeuristicStackProfile {
+  const fmt = (name: string) => (style === 'snake' ? snakeCase(name) : name);
+  const pair = (area: string, name: string): string[] => {
+    const base = `${srcRoot}/${area}/${fmt(name)}${ext}`;
+    return headerExt ? [base, `${srcRoot}/${area}/${fmt(name)}${headerExt}`] : [base];
+  };
+  return {
+    isWeb,
+    view: (name) => pair('ui', name),
+    service: (area, name) => pair(area, name),
+    repository: (_area, name) => pair('db', name),
+    test: (area, name) => testPath(area, snakeCase(name), name),
+    buildFiles,
+  };
+}
+
+const GENERIC_STACK_PROFILE: HeuristicStackProfile = makeStackProfile({
+  ext: '',
+  style: 'snake',
+  srcRoot: 'src',
+  testPath: (area, sn) => `tests/test_${sn}`,
+  buildFiles: ['.env.example'],
+});
+
+/**
+ * Detector table for the heuristic fallback. Each detector pairs a pattern matching
+ * stack keywords with the profile to use. When the free-form string mentions several
+ * ecosystems, the one mentioned FIRST wins — e.g. "React / Node" is web, while
+ * "C++ / Vulkan (replacing our React prototype)" stays C++.
+ */
+const STACK_DETECTORS: Array<{ pattern: RegExp; build: (s: string) => HeuristicStackProfile }> = [
+  {
+    // JavaScript / TypeScript web ecosystems — legacy web heuristics apply.
+    pattern: /(react|next\.?js|vue|nuxt|angular|svelte|astro|gatsby|remix|solid\.?js|qwik|nest\.?js|express|fastify|node\.?js|javascript|typescript|jsx|tsx|\bjs\b|\bts\b)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.ts',
+        srcRoot: 'src',
+        isWeb: true,
+        testPath: (_area, sn) => `tests/${sn}.test.ts`,
+        buildFiles: ['package.json', '.env.example'],
+      }),
+  },
+  {
+    // C / C++ (Vulkan, Qt, CMake, game engines, embedded)
+    pattern: /(c\+\+|cpp|vulkan|cmake|\bqt\b|unreal|imgui)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.cpp',
+        headerExt: '.h',
+        style: 'pascal',
+        srcRoot: 'src',
+        testPath: (_area, sn) => `tests/test_${sn}.cpp`,
+        buildFiles: ['CMakeLists.txt', '.env.example'],
+      }),
+  },
+  {
+    // C# / .NET
+    pattern: /(c#|\.net|dotnet|asp\.net|blazor)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.cs',
+        style: 'pascal',
+        srcRoot: 'src',
+        testPath: (_area, _sn, pascal) => `tests/${pascal}Tests.cs`,
+        buildFiles: ['ContextPilot.sln', 'src/App.csproj', 'appsettings.json', '.env.example'],
+      }),
+  },
+  {
+    // Python (Django, Flask, FastAPI)
+    pattern: /(python|django|flask|fastapi|pandas|numpy)/,
+    build: (s) =>
+      makeStackProfile({
+        ext: '.py',
+        style: 'snake',
+        srcRoot: 'src',
+        testPath: (_area, sn) => `tests/test_${sn}.py`,
+        buildFiles: s.includes('django')
+          ? ['manage.py', 'requirements.txt', '.env.example']
+          : ['pyproject.toml', 'requirements.txt', '.env.example'],
+      }),
+  },
+  {
+    // Java / Spring
+    pattern: /(java|spring|maven|gradle)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.java',
+        style: 'pascal',
+        srcRoot: 'src/main/java',
+        testPath: (area, _sn, pascal) => `src/test/java/${area}/${pascal}Test.java`,
+        buildFiles: ['pom.xml', '.env.example'],
+      }),
+  },
+  {
+    // Kotlin / Android
+    pattern: /(kotlin|android|kts)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.kt',
+        style: 'pascal',
+        srcRoot: 'app/src/main/java',
+        testPath: (area, _sn, pascal) => `app/src/test/java/${area}/${pascal}Test.kt`,
+        buildFiles: ['build.gradle.kts', 'settings.gradle.kts', '.env.example'],
+      }),
+  },
+  {
+    // Go
+    pattern: /(golang|\bgo\b)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.go',
+        style: 'snake',
+        srcRoot: 'internal',
+        testPath: (area, sn) => `internal/${area}/${sn}_test.go`,
+        buildFiles: ['go.mod', '.env.example'],
+      }),
+  },
+  {
+    // Rust
+    pattern: /(rust|cargo)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.rs',
+        style: 'snake',
+        srcRoot: 'src',
+        testPath: (_area, sn) => `tests/${sn}.rs`,
+        buildFiles: ['Cargo.toml', '.env.example'],
+      }),
+  },
+  {
+    // PHP (Laravel, Symfony)
+    pattern: /(php|laravel|symfony|composer)/,
+    build: (s) => {
+      const laravel = s.includes('laravel');
+      return makeStackProfile({
+        ext: '.php',
+        style: 'pascal',
+        srcRoot: laravel ? 'app' : 'src',
+        testPath: (_area, _sn, pascal) => (laravel ? `tests/Feature/${pascal}Test.php` : `tests/${pascal}Test.php`),
+        buildFiles: ['composer.json', '.env.example'],
+      });
+    },
+  },
+  {
+    // Ruby (Rails)
+    pattern: /(ruby|rails|sinatra|rspec)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.rb',
+        style: 'snake',
+        srcRoot: 'app',
+        testPath: (area, sn) => `spec/${area}/${sn}_spec.rb`,
+        buildFiles: ['Gemfile', 'config/routes.rb', '.env.example'],
+      }),
+  },
+  {
+    // Swift / Objective-C (iOS / macOS)
+    pattern: /(swift|swiftui|ios|macos|objective.?c)/,
+    build: (s) => {
+      const ext = /objective.?c/.test(s) ? '.m' : '.swift';
+      return makeStackProfile({
+        ext,
+        style: 'pascal',
+        srcRoot: 'Sources',
+        testPath: (_area, _sn, pascal) => `Tests/${pascal}Tests${ext}`,
+        buildFiles: ['Package.swift', '.env.example'],
+      });
+    },
+  },
+  {
+    // Flutter / Dart
+    pattern: /(flutter|dart)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.dart',
+        style: 'snake',
+        srcRoot: 'lib',
+        testPath: (_area, sn) => `test/${sn}_test.dart`,
+        buildFiles: ['pubspec.yaml', '.env.example'],
+      }),
+  },
+  {
+    // Elixir (Phoenix)
+    pattern: /(elixir|phoenix|erlang)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.ex',
+        style: 'snake',
+        srcRoot: 'lib',
+        testPath: (_area, sn) => `test/${sn}_test.exs`,
+        buildFiles: ['mix.exs', '.env.example'],
+      }),
+  },
+  {
+    // Scala
+    pattern: /(scala|sbt)/,
+    build: () =>
+      makeStackProfile({
+        ext: '.scala',
+        style: 'pascal',
+        srcRoot: 'src/main/scala',
+        testPath: (area, _sn, pascal) => `src/test/scala/${area}/${pascal}Spec.scala`,
+        buildFiles: ['build.sbt', '.env.example'],
+      }),
+  },
+];
+
+/**
+ * Maps a free-form tech stack string to conventional file paths for the heuristic
+ * fallback. Returns null when the input is empty. JavaScript/TypeScript web stacks
+ * resolve to a profile whose paths mirror the legacy web heuristics; every other
+ * recognised (or unrecognised) stack resolves to a non-web profile so the heuristic
+ * never emits .tsx/Node paths for a native codebase (e.g. C++ / Vulkan).
+ *
+ * When the string mentions several ecosystems, the one appearing FIRST in the
+ * string wins.
+ */
+function detectStackProfile(techStack: string): HeuristicStackProfile | null {
+  const s = techStack.toLowerCase();
+  if (!s.trim()) return null;
+
+  const matches: Array<{ index: number; order: number; build: () => HeuristicStackProfile }> = [];
+  for (const [order, detector] of STACK_DETECTORS.entries()) {
+    const m = detector.pattern.exec(s);
+    if (m) matches.push({ index: m.index, order, build: () => detector.build(s) });
+  }
+  if (matches.length === 0) {
+    // Any other tech stack: stay non-web and stack-agnostic rather than emitting
+    // web/Node paths by accident.
+    return GENERIC_STACK_PROFILE;
+  }
+  matches.sort((a, b) => a.index - b.index || a.order - b.order);
+  return matches[0].build();
+}
+
+/** Dedupes file lists while preserving order. */
+const uniquePaths = (paths: string[]): string[] => Array.from(new Set(paths));
+
+function heuristicAnalyzeTicket(ticketText: string, ticketKey: string, techStack?: string) {
   const lower = ticketText.toLowerCase();
+  const stack = sanitizeTechStack(techStack);
+  // No tech stack (or a JS/TS web stack) keeps the historical web heuristics.
+  const profile = stack ? detectStackProfile(stack) : null;
+  const isWeb = !profile || profile.isWeb;
 
   const frontend: string[] = [];
   const backend: string[] = [];
@@ -1895,60 +2188,116 @@ function heuristicAnalyzeTicket(ticketText: string, ticketKey: string) {
 
   // Match keyword patterns
   if (lower.includes('auth') || lower.includes('oauth') || lower.includes('login') || lower.includes('jwt')) {
-    frontend.push('src/components/AuthModal.tsx', 'src/context/AuthContext.tsx');
-    backend.push('src/middleware/auth.ts', 'src/controllers/authController.ts', 'src/services/tokenService.ts');
-    database.push('src/db/migrations/001_create_users.sql', 'src/db/schema/users.ts');
-    config.push('.env.example');
-    tests.push('tests/auth.test.ts', 'tests/jwt.test.ts');
+    if (isWeb) {
+      frontend.push('src/components/AuthModal.tsx', 'src/context/AuthContext.tsx');
+      backend.push('src/middleware/auth.ts', 'src/controllers/authController.ts', 'src/services/tokenService.ts');
+      database.push('src/db/migrations/001_create_users.sql', 'src/db/schema/users.ts');
+      config.push('.env.example');
+      tests.push('tests/auth.test.ts', 'tests/jwt.test.ts');
+    } else {
+      frontend.push(...profile!.view('LoginView'), ...profile!.view('AuthView'));
+      backend.push(...profile!.service('auth', 'AuthService'), ...profile!.service('auth', 'AuthController'), ...profile!.service('auth', 'TokenService'));
+      database.push('db/migrations/001_create_users.sql', ...profile!.repository('db', 'UserRepository'));
+      config.push(...profile!.buildFiles);
+      tests.push(profile!.test('auth', 'Auth'), profile!.test('auth', 'Jwt'));
+    }
   }
 
   if (lower.includes('pay') || lower.includes('stripe') || lower.includes('paystack') || lower.includes('billing') || lower.includes('checkout') || lower.includes('webhook')) {
-    frontend.push('src/components/SubscriptionPlansView.tsx', 'src/components/PaymentModal.tsx');
-    backend.push('src/services/paystack.ts', 'src/routes/paymentRoutes.ts', 'src/controllers/webhookController.ts');
-    database.push('src/db/migrations/002_transactions.sql', 'src/db/schema/transactions.ts');
-    config.push('config/payment.config.ts');
-    tests.push('tests/paystack.test.ts', 'tests/webhooks.test.ts');
+    if (isWeb) {
+      frontend.push('src/components/SubscriptionPlansView.tsx', 'src/components/PaymentModal.tsx');
+      backend.push('src/services/paystack.ts', 'src/routes/paymentRoutes.ts', 'src/controllers/webhookController.ts');
+      database.push('src/db/migrations/002_transactions.sql', 'src/db/schema/transactions.ts');
+      config.push('config/payment.config.ts');
+      tests.push('tests/paystack.test.ts', 'tests/webhooks.test.ts');
+    } else {
+      frontend.push(...profile!.view('PaymentView'), ...profile!.view('CheckoutView'));
+      backend.push(...profile!.service('payments', 'PaymentService'), ...profile!.service('payments', 'PaymentController'), ...profile!.service('payments', 'WebhookController'));
+      database.push('db/migrations/002_transactions.sql', ...profile!.repository('db', 'TransactionRepository'));
+      config.push(...profile!.buildFiles);
+      tests.push(profile!.test('payments', 'Payment'), profile!.test('payments', 'Webhook'));
+    }
   }
 
   if (lower.includes('dark') || lower.includes('theme') || lower.includes('ui') || lower.includes('navbar') || lower.includes('sidebar') || lower.includes('responsive')) {
-    frontend.push('src/components/Navbar.tsx', 'src/components/ThemeToggle.tsx', 'src/index.css');
-    config.push('tailwind.config.ts');
-    tests.push('tests/ui-theme.test.tsx');
+    if (isWeb) {
+      frontend.push('src/components/Navbar.tsx', 'src/components/ThemeToggle.tsx', 'src/index.css');
+      config.push('tailwind.config.ts');
+      tests.push('tests/ui-theme.test.tsx');
+    } else {
+      frontend.push(...profile!.view('ThemeManager'), ...profile!.view('MainView'));
+      config.push(...profile!.buildFiles);
+      tests.push(profile!.test('ui', 'Theme'));
+    }
   }
 
   if (lower.includes('github') || lower.includes('repo') || lower.includes('git')) {
-    frontend.push('src/components/GitHubVerifierView.tsx');
-    backend.push('src/services/githubService.ts', 'src/routes/githubRoutes.ts');
-    tests.push('tests/github-verifier.test.ts');
+    if (isWeb) {
+      frontend.push('src/components/GitHubVerifierView.tsx');
+      backend.push('src/services/githubService.ts', 'src/routes/githubRoutes.ts');
+      tests.push('tests/github-verifier.test.ts');
+    } else {
+      frontend.push(...profile!.view('RepoBrowserView'));
+      backend.push(...profile!.service('git', 'GitService'), ...profile!.service('git', 'GitHubClient'));
+      tests.push(profile!.test('git', 'GitHub'));
+    }
   }
 
   // Fallback defaults if few matched
   if (frontend.length === 0) {
-    frontend.push('src/components/MainView.tsx', 'src/hooks/useData.ts');
+    if (isWeb) {
+      frontend.push('src/components/MainView.tsx', 'src/hooks/useData.ts');
+    } else {
+      frontend.push(...profile!.view('MainView'));
+    }
   }
   if (backend.length === 0) {
-    backend.push('src/controllers/apiController.ts', 'src/routes/api.ts');
+    if (isWeb) {
+      backend.push('src/controllers/apiController.ts', 'src/routes/api.ts');
+    } else {
+      backend.push(...profile!.service('core', 'ApiController'));
+    }
   }
   if (database.length === 0) {
-    database.push('src/db/schema.ts');
+    if (isWeb) {
+      database.push('src/db/schema.ts');
+    } else {
+      database.push('db/schema.sql');
+    }
   }
   if (config.length === 0) {
-    config.push('package.json');
+    if (isWeb) {
+      config.push('package.json');
+    } else {
+      config.push(...profile!.buildFiles);
+    }
   }
   if (tests.length === 0) {
-    tests.push(`tests/${ticketKey.toLowerCase()}.test.ts`);
+    if (isWeb) {
+      tests.push(`tests/${ticketKey.toLowerCase()}.test.ts`);
+    } else {
+      tests.push(profile!.test('ticket', ticketKey.toLowerCase().replace(/[^a-z0-9]+/g, '_')));
+    }
   }
 
-  const total = frontend.length + backend.length + database.length + config.length + tests.length;
+  const uniqueFrontend = uniquePaths(frontend);
+  const uniqueBackend = uniquePaths(backend);
+  const uniqueDatabase = uniquePaths(database);
+  const uniqueConfig = uniquePaths(config);
+  const uniqueTests = uniquePaths(tests);
+
+  const total = uniqueFrontend.length + uniqueBackend.length + uniqueDatabase.length + uniqueConfig.length + uniqueTests.length;
 
   return {
-    frontend_files: frontend,
-    backend_files: backend,
-    database_files: database,
-    config_files: config,
-    test_files: tests,
+    frontend_files: uniqueFrontend,
+    backend_files: uniqueBackend,
+    database_files: uniqueDatabase,
+    config_files: uniqueConfig,
+    test_files: uniqueTests,
     confidence_score: 0.92,
-    reasoning: `Identified ${total} impacted components across UI, backend services, schema migrations, and test coverage based on technical specifications in ${ticketKey}.`,
+    reasoning: stack
+      ? `Identified ${total} impacted components across UI, backend services, schema migrations, and test coverage based on technical specifications in ${ticketKey}. Predictions targeted at the ${stack} tech stack.`
+      : `Identified ${total} impacted components across UI, backend services, schema migrations, and test coverage based on technical specifications in ${ticketKey}. No tech stack was provided, so general software architecture was assumed — providing the project's tech stack increases accuracy.`,
     total_files: total,
     processingTimeMs: 180,
     ticket_key: ticketKey,
@@ -1961,7 +2310,8 @@ function heuristicAnalyzeTicket(ticketText: string, ticketKey: string) {
 // ==========================================
 async function handleTicketAnalysis(req: express.Request, res: express.Response) {
   const startTime = Date.now();
-  const { ticket_text, ticket_key, user_email, ticket_title } = req.body;
+  const { ticket_text, ticket_key, user_email, ticket_title, tech_stack } = req.body;
+  const stack = sanitizeTechStack(tech_stack);
 
   if (!ticket_text || typeof ticket_text !== 'string' || ticket_text.trim().length < 5) {
     return res.status(400).json({ error: 'Missing or insufficient ticket_text for analysis' });
@@ -2074,27 +2424,35 @@ async function handleTicketAnalysis(req: express.Request, res: express.Response)
 
   if (ai) {
     try {
+      const stackContext = stack
+        ? `Tech Stack / Project Type: ${stack}
+The user's project is written in ${stack}. Only predict files that match this tech stack. Use the languages, file extensions, directory conventions, package managers, and build systems that are native to ${stack}. Do NOT predict files from unrelated ecosystems — for example, never output .tsx/.jsx, package.json, or Node.js paths for a C++ codebase. If a category genuinely has no impacted files in this stack, return an empty array for it rather than inventing files from another ecosystem.`
+        : `Tech Stack / Project Type: Not specified (default to general software architecture)
+No tech stack was provided for this project. Stay deliberately tech-stack agnostic: reason from general software architecture principles and avoid assuming a specific ecosystem. In your reasoning, note that providing the project's tech stack would increase prediction accuracy.`;
+
       const prompt = `Act as a senior software architect and tech lead. Analyze this Jira ticket carefully and predict all codebase files, components, and endpoints that will need to be added or modified.
+
+${stackContext}
 
 Ticket Key: ${key}
 Ticket Content:
 ${ticket_text}
 
 Categorize files into:
-- frontend_files: UI components, pages, custom hooks, styles, view templates
-- backend_files: API routes, controllers, middleware, business services
+- frontend_files: UI components, pages, custom hooks, styles, view templates${stack ? ` (all native to ${stack})` : ''}
+- backend_files: API routes, controllers, middleware, business services${stack ? ` (all native to ${stack})` : ''}
 - database_files: ORM models, migration SQL, schemas, seeds
 - config_files: env files, dockerfiles, build/package configs
 - test_files: unit tests, integration tests, end-to-end tests
 
-Be realistic, precise, and practical for production codebases.`;
+Be realistic, precise, and practical for production codebases. ${stack ? `Every predicted path must be valid for ${stack}.` : ''}`;
 
       const response = await ai.models.generateContent({
         model: GEMINI_MODEL,
         contents: prompt,
         config: {
           systemInstruction:
-            'You are a senior full-stack software engineer. Return structured JSON predicting impacted files for software tickets.',
+            'You are a senior software engineer. Return structured JSON predicting impacted files for software tickets. When a tech stack is provided, only predict files that are native to that tech stack — never invent files from a different ecosystem.',
           temperature: 0.2,
           responseMimeType: 'application/json',
           responseSchema: {
@@ -2155,7 +2513,13 @@ Be realistic, precise, and practical for production codebases.`;
 
   // Fallback to heuristic engine if Gemini unavailable or failed
   if (!analysisResult) {
-    analysisResult = heuristicAnalyzeTicket(ticket_text, key);
+    analysisResult = heuristicAnalyzeTicket(ticket_text, key, stack);
+  }
+
+  // Surface the tech-stack context (and the fallback warning) to the client.
+  analysisResult.tech_stack = stack || undefined;
+  if (!stack) {
+    analysisResult.tech_stack_warning = TECH_STACK_WARNING;
   }
 
   const processingTimeMs = Date.now() - startTime;

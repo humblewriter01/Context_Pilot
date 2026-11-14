@@ -5,6 +5,8 @@ import { getAuthHeaders } from './supabase';
 export interface AnalysisResponse extends CategorizedFiles {
   historyId?: string;
   processingTimeMs?: number;
+  tech_stack?: string;
+  tech_stack_warning?: string;
   usage?: {
     ticketsProcessed: number;
     monthlyLimit: number;
@@ -16,14 +18,21 @@ export interface AnalysisResponse extends CategorizedFiles {
  * Analyzes a Jira ticket via the server-side Gemini API route (/api/analyze-ticket).
  * Sends the Supabase session token so the server can verify the caller,
  * enforce quota, and persist history under the verified identity.
+ *
+ * `techStack` is an optional free-form description of the project's tech stack
+ * (e.g. "C++ / Vulkan", "React / Node", "Python / Django"). When provided, the
+ * model is instructed to only predict files native to that stack; when omitted,
+ * the server falls back to general software architecture.
  */
 export async function analyzeTicket(
   ticketText: string,
   ticketKey: string,
   userEmail?: string,
-  ticketTitle?: string
+  ticketTitle?: string,
+  techStack?: string
 ): Promise<AnalysisResponse> {
   const email = userEmail || storageService.getUser()?.email || '';
+  const stack = (techStack || '').trim();
   const authHeaders = await getAuthHeaders();
 
   const response = await fetch('/api/analyze-ticket', {
@@ -38,6 +47,7 @@ export async function analyzeTicket(
       ticket_key: ticketKey,
       ticket_title: ticketTitle,
       user_email: email,
+      ...(stack ? { tech_stack: stack } : {}),
     }),
   });
 
@@ -81,6 +91,8 @@ export async function analyzeTicket(
     total_files,
     historyId: typeof result.historyId === 'string' ? result.historyId : undefined,
     processingTimeMs: result.processingTimeMs,
+    tech_stack: typeof result.tech_stack === 'string' ? result.tech_stack : (stack || undefined),
+    tech_stack_warning: typeof result.tech_stack_warning === 'string' ? result.tech_stack_warning : undefined,
     usage: result.usage,
   };
 }
