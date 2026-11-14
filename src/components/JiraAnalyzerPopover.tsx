@@ -186,6 +186,19 @@ export const JiraAnalyzerPopover: React.FC<JiraAnalyzerPopoverProps> = ({
           </div>
         </div>
 
+        {/* Tech stack context used for this prediction */}
+        {data.tech_stack ? (
+          <div className="flex items-center gap-2 text-[11px] text-slate-500">
+            <Layers className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+            <span>Predicted for tech stack: <span className="font-semibold text-slate-700">{data.tech_stack}</span></span>
+          </div>
+        ) : data.tech_stack_warning ? (
+          <div className="flex items-start gap-2 text-[11px] leading-snug text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            <Layers className="w-3.5 h-3.5 mt-0.5 shrink-0 text-amber-500" />
+            <span>{data.tech_stack_warning}</span>
+          </div>
+        ) : null}
+
         {/* Reasoning Section */}
         {data.reasoning && (
           <div className="p-3.5 rounded-lg bg-indigo-50/60 border border-indigo-100/80 text-xs sm:text-sm text-slate-700 space-y-1">

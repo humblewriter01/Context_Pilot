@@ -10,7 +10,7 @@ Powered by **Google Gemini (`gemini-2.5-flash`)** with **Paystack Payment Gatewa
 
 ### 1. Modern Collapsible Sidebar & Navigation
 - Collapsible sidebar with labels for all major sections:
-  - **Jira Issue Analyzer**: Live interactive ticket analysis.
+  - **Jira Issue Analyzer**: Live interactive ticket analysis. Includes an optional **Tech Stack / Project Type** field (e.g. `C++ / Vulkan`, `React / Node`, `Python / Django`) that is forwarded to the model so predictions only include files native to that stack. When omitted, the analyzer falls back to general software architecture and warns that providing a stack increases accuracy.
   - **Dashboard & Stats**: Real-time telemetry & audit charts.
   - **GitHub Verifier**: Codebase existence verification.
   - **Audit History**: Historical prediction log and feedback ratings.
@@ -151,7 +151,7 @@ Context Pilot includes a production `render.yaml` blueprint:
 
 | Endpoint | Auth | Purpose |
 | --- | --- | --- |
-| `POST /api/analyze-ticket` | Supabase JWT (optional, used for quota) | Gemini file-impact prediction + quota + history. |
+| `POST /api/analyze-ticket` | Supabase JWT (optional, used for quota) | Gemini file-impact prediction + quota + history. Accepts an optional `tech_stack` string (e.g. `"C++ / Vulkan"`); the prompt is then constrained to files native to that stack, and the response echoes `tech_stack` or a `tech_stack_warning` when it was omitted. |
 | `GET /api/history` | Supabase JWT | Server-side analysis history. |
 | `GET /api/user/sync` | Supabase JWT | Authoritative tier, status and monthly usage. |
 | `POST /api/user/profile` | Supabase JWT | Persist display-name edits to `public.users` + auth metadata. |

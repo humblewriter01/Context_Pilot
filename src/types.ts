@@ -46,6 +46,10 @@ export interface CategorizedFiles {
   confidence_score: number;
   reasoning: string;
   total_files: number;
+  /** Tech stack the prediction was generated for (empty when not provided). */
+  tech_stack?: string;
+  /** Present when no tech stack was supplied and the server fell back to general software architecture. */
+  tech_stack_warning?: string;
 }
 
 export interface AnalysisRecord extends CategorizedFiles {

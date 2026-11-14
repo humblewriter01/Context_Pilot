@@ -24,6 +24,35 @@ interface JiraSimulatorViewProps {
   onNavigateToPlans: () => void;
 }
 
+const TECH_STACK_STORAGE_KEY = 'context_pilot_tech_stack';
+
+const TECH_STACK_PRESETS = [
+  'C++ / Vulkan',
+  'C++ / Qt',
+  'Unreal Engine / C++',
+  'React / Node',
+  'Next.js / TypeScript',
+  'Python / Django',
+  'Python / FastAPI',
+  'Java / Spring Boot',
+  'Go / gRPC',
+  'Rust',
+  '.NET / C#',
+  'Ruby on Rails',
+  'PHP / Laravel',
+  'Swift / iOS',
+  'Kotlin / Android',
+  'Flutter / Dart',
+];
+
+const loadStoredTechStack = (): string => {
+  try {
+    return localStorage.getItem(TECH_STACK_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+};
+
 export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
   usage,
   onUsageUpdated,
@@ -36,6 +65,8 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
   const [priority, setPriority] = useState<'Highest' | 'High' | 'Medium' | 'Low' | ''>('');
   const [status, setStatus] = useState<'To Do' | 'In Progress' | 'In Review' | 'Done' | ''>('');
   const [componentsList, setComponentsList] = useState<string>('');
+  const [techStack, setTechStack] = useState<string>(loadStoredTechStack);
+  const [activeTechStack, setActiveTechStack] = useState<string>('');
 
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<
@@ -63,6 +94,8 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
       return;
     }
 
+    const trimmedTechStack = techStack.trim();
+
     setQuotaExceeded(false);
     setAnalyzing(true);
     const startTime = Date.now();
@@ -74,7 +107,8 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
         fullText,
         ticketKey.trim(),
         currentUser?.email,
-        ticketTitle.trim() || ticketKey.trim()
+        ticketTitle.trim() || ticketKey.trim(),
+        trimmedTechStack
       );
       const processingTime = Date.now() - startTime;
 
@@ -99,6 +133,7 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
       onUsageUpdated(updatedUsage);
 
       setActiveAnalysisTicketKey(ticketKey.trim());
+      setActiveTechStack(trimmedTechStack);
       setAnalysisResult({
         ...result,
         processingTimeMs: processingTime,
@@ -259,14 +294,27 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
             {/* Inline Popover Presentation when Analyzed */}
             {analysisResult && (
               <div className="mt-8 pt-4 border-t border-slate-200">
-                <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
                   <div className="flex items-center gap-2">
                     <CheckCircle2 className="w-5 h-5 text-emerald-600" />
                     <h3 className="font-bold text-slate-900 text-base">
                       Predicted File Impact for {activeAnalysisTicketKey}
                     </h3>
                   </div>
+                  {activeTechStack && (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-700 text-[10px] font-semibold">
+                      <FileCode2 className="w-3 h-3" />
+                      {activeTechStack}
+                    </span>
+                  )}
                 </div>
+
+                {analysisResult.tech_stack_warning && (
+                  <div className="mb-3 p-3 rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-[11px] flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-amber-500" />
+                    <span>{analysisResult.tech_stack_warning}</span>
+                  </div>
+                )}
 
                 <JiraAnalyzerPopover
                   data={analysisResult}
@@ -280,6 +328,52 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
 
           {/* Right Sidebar: Jira Details */}
           <div className="space-y-6 lg:border-l lg:border-slate-200 lg:pl-8">
+            {/* Tech Stack / Project Type — drives the analyzer's file predictions */}
+            <div className="space-y-1.5">
+              <label htmlFor="tech-stack-input" className="text-xs font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
+                <FileCode2 className="w-3.5 h-3.5 text-indigo-500" />
+                Tech Stack / Project Type
+                <span className="text-[10px] font-medium normal-case tracking-normal text-slate-400">(optional)</span>
+              </label>
+              <input
+                id="tech-stack-input"
+                type="text"
+                list="tech-stack-presets"
+                value={techStack}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setTechStack(value);
+                  try {
+                    localStorage.setItem(TECH_STACK_STORAGE_KEY, value);
+                  } catch {
+                    // localStorage unavailable (e.g. private mode) — keep in-memory state only
+                  }
+                }}
+                placeholder='e.g. "C++ / Vulkan", "React / Node"'
+                maxLength={120}
+                className="w-full px-3 py-2 bg-white border border-indigo-200 text-slate-800 rounded-lg text-xs font-medium placeholder:text-slate-400 placeholder:font-normal focus:outline-indigo-500 focus:border-indigo-400"
+              />
+              <datalist id="tech-stack-presets">
+                {TECH_STACK_PRESETS.map((preset) => (
+                  <option key={preset} value={preset} />
+                ))}
+              </datalist>
+              {techStack.trim() ? (
+                <p className="text-[10px] leading-snug text-emerald-700 flex items-start gap-1 pt-0.5">
+                  <CheckCircle2 className="w-3 h-3 mt-0.5 shrink-0" />
+                  <span>Predictions will be limited to files native to <strong>{techStack.trim()}</strong>.</span>
+                </p>
+              ) : (
+                <p className="text-[10px] leading-snug text-amber-700 flex items-start gap-1 pt-0.5" role="status">
+                  <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                  <span>
+                    No tech stack provided — the analyzer will default to general software architecture.
+                    Providing your stack (e.g. <em>C++ / Vulkan</em>) significantly increases accuracy.
+                  </span>
+                </p>
+              )}
+            </div>
+
             {/* Status Dropdown */}
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Status</label>
