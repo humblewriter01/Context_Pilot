@@ -278,4 +278,66 @@ export const adminService = {
     if (!res.ok) throw new Error(data.error || 'Failed to update settings');
     return data;
   },
+
+  /**
+   * Mints a single-use magic-link sign-in for a target user (admin support flow).
+   * The caller opens the returned action_link in a new tab.
+   */
+  async impersonateUser(userEmail: string): Promise<{ action_link: string; email: string; message?: string }> {
+    const token = await this.getToken();
+    const res = await fetch('/api/admin/impersonate', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ user_email: userEmail }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (res.status === 403) {
+        this.logout();
+        throw new Error('Forbidden. Administrator authorization required.');
+      }
+      throw new Error(data.error || 'Failed to generate an impersonation link');
+    }
+    return data;
+  },
+
+  /**
+   * Sends an announcement email to the selected audience via the server-side
+   * Resend integration. Returns a delivery summary from the server.
+   */
+  async sendBroadcast(payload: {
+    audience: 'all' | 'free' | 'pro';
+    subject: string;
+    message: string;
+  }): Promise<{
+    success: boolean;
+    audience: string;
+    recipients: number;
+    sent: number;
+    failed: number;
+    failures?: string[];
+    message?: string;
+  }> {
+    const token = await this.getToken();
+    const res = await fetch('/api/admin/broadcast', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (res.status === 403) {
+        this.logout();
+        throw new Error('Forbidden. Administrator authorization required.');
+      }
+      throw new Error(data.error || 'Failed to send the broadcast');
+    }
+    return data;
+  },
 };

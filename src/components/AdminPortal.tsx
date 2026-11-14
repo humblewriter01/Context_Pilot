@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { adminService } from '../services/admin';
+import { startImpersonation } from '../services/impersonation';
 import { AdminProfile, AdminSystemSettings, PromoCode } from '../types';
 import {
   ShieldCheck,
@@ -11,6 +12,7 @@ import {
   Cpu,
   Server,
   CheckCircle2,
+  AlertCircle,
   AlertTriangle,
   LogOut,
   ArrowLeft,
@@ -42,6 +44,9 @@ import {
   Star,
   ThumbsUp,
   ThumbsDown,
+  Megaphone,
+  Send,
+  X,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -73,7 +78,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
   const [authLoading, setAuthLoading] = useState(false);
 
   // Admin Dashboard State
-  const [activeTab, setActiveTab] = useState<'overview' | 'analytics' | 'pricing' | 'promos' | 'users' | 'feedback' | 'transactions' | 'gateway'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'analytics' | 'pricing' | 'promos' | 'users' | 'broadcast' | 'feedback' | 'transactions' | 'gateway'>('overview');
   const [overview, setOverview] = useState<any>(null);
   const [analytics, setAnalytics] = useState<any>(null);
   const [analyticsDays, setAnalyticsDays] = useState<number>(14);
@@ -117,6 +122,19 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
   const [promoNotice, setPromoNotice] = useState<string | null>(null);
 
   const [saveSuccess, setSaveSuccess] = useState(false);
+
+  // Broadcast state
+  const [broadcastAudience, setBroadcastAudience] = useState<'all' | 'free' | 'pro'>('all');
+  const [broadcastSubject, setBroadcastSubject] = useState('');
+  const [broadcastMessage, setBroadcastMessage] = useState('');
+  const [broadcastSending, setBroadcastSending] = useState(false);
+  const [broadcastToast, setBroadcastToast] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
+
+  useEffect(() => {
+    if (!broadcastToast) return;
+    const timer = setTimeout(() => setBroadcastToast(null), 5000);
+    return () => clearTimeout(timer);
+  }, [broadcastToast]);
 
   const fetchAdminData = async () => {
     setLoadingData(true);
@@ -361,6 +379,61 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
     }
   };
 
+  const handleImpersonate = async (userEmail: string) => {
+    const targetEmail = (userEmail || '').trim().toLowerCase();
+    if (!targetEmail) return;
+    try {
+      const result = await adminService.impersonateUser(targetEmail);
+      // Mark the session as impersonating so the app shows the warning banner.
+      startImpersonation(targetEmail);
+      window.open(result.action_link, '_blank', 'noopener,noreferrer');
+      setBroadcastToast({
+        kind: 'success',
+        text: `Secure sign-in link opened in a new tab for ${targetEmail}.`,
+      });
+    } catch (err: any) {
+      setBroadcastToast({
+        kind: 'error',
+        text: err?.message || 'Failed to generate an impersonation link.',
+      });
+    }
+  };
+
+  const handleSendBroadcast = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const subject = broadcastSubject.trim();
+    const message = broadcastMessage.trim();
+    if (!subject || !message || broadcastSending) return;
+
+    setBroadcastSending(true);
+    try {
+      const result = await adminService.sendBroadcast({
+        audience: broadcastAudience,
+        subject,
+        message,
+      });
+      setBroadcastToast({
+        kind: result.failed > 0 ? 'error' : 'success',
+        text:
+          result.message ||
+          (result.failed > 0
+            ? `Broadcast partially delivered: ${result.sent} sent, ${result.failed} failed.`
+            : `Broadcast delivered to ${result.sent} recipient${result.sent === 1 ? '' : 's'}.`),
+      });
+      if (result.failed === 0) {
+        setBroadcastSubject('');
+        setBroadcastMessage('');
+      }
+    } catch (err: any) {
+      setBroadcastToast({
+        kind: 'error',
+        text: err?.message || 'Failed to send the broadcast. Please try again.',
+      });
+    } finally {
+      setBroadcastSending(false);
+    }
+  };
+
   // 1. If not authenticated, render the Enterprise Admin Login screen
   if (!profile) {
     return (
@@ -555,6 +628,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
             { id: 'pricing' as const, label: 'Pricing & Limits', icon: DollarSign },
             { id: 'promos' as const, label: 'Promo Codes & Discounts', icon: Tag },
             { id: 'users' as const, label: 'User Directory', icon: Users },
+            { id: 'broadcast' as const, label: 'Broadcast', icon: Megaphone },
             { id: 'feedback' as const, label: feedbackList.length > 0 ? `User Feedback (${feedbackList.length})` : 'User Feedback', icon: MessageSquare },
             { id: 'transactions' as const, label: 'Paystack Ledger', icon: CreditCard },
             { id: 'gateway' as const, label: 'Gateway & Security', icon: Key },
@@ -1497,6 +1571,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                       </td>
                       <td className="p-3 text-right space-x-1.5">
                         <button
+                          onClick={() => handleImpersonate(u.email)}
+                          disabled={profile?.email?.toLowerCase() === (u.email || '').toLowerCase()}
+                          className="p-1 rounded bg-indigo-500/20 hover:bg-indigo-500/35 text-indigo-300 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                          title={profile?.email?.toLowerCase() === (u.email || '').toLowerCase() ? 'You are already on this account' : `Impersonate ${u.email}`}
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                        </button>
+                        <button
                           onClick={() => handleResetUserQuota(u.id)}
                           className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
                           title="Reset monthly quota to 0"
@@ -1527,6 +1609,108 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
         )}
 
         {/* 5. PAYSTACK TRANSACTIONS LEDGER */}
+        {/* BROADCAST TAB — email all / free / pro users via Resend */}
+        {activeTab === 'broadcast' && (
+          <div className="max-w-3xl mx-auto bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-lg">
+            <div className="p-5 border-b border-slate-800 flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#667eea] to-[#764ba2] flex items-center justify-center text-white shrink-0">
+                <Megaphone className="w-5 h-5" />
+              </div>
+              <div>
+                <h2 className="font-bold text-sm text-white tracking-tight">Email Broadcast</h2>
+                <p className="text-[11px] text-slate-400">
+                  Send an announcement to active accounts via the Resend API. Suspended users are excluded.
+                </p>
+              </div>
+            </div>
+
+            <form onSubmit={handleSendBroadcast} className="p-6 space-y-5">
+              {/* Audience */}
+              <div className="space-y-1.5">
+                <label htmlFor="broadcast-audience" className="block text-xs font-semibold text-slate-300">
+                  Audience
+                </label>
+                <select
+                  id="broadcast-audience"
+                  value={broadcastAudience}
+                  onChange={(e) => setBroadcastAudience(e.target.value as 'all' | 'free' | 'pro')}
+                  disabled={broadcastSending}
+                  className="w-full sm:w-64 px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white focus:outline-indigo-500"
+                >
+                  <option value="all">All users</option>
+                  <option value="free">Free tier only</option>
+                  <option value="pro">Pro tier only</option>
+                </select>
+                <p className="text-[10px] text-slate-500">
+                  “Free tier only” targets <code className="text-slate-400">subscription_tier = 'free'</code>; “Pro tier only” targets <code className="text-slate-400">subscription_tier = 'pro'</code>.
+                </p>
+              </div>
+
+              {/* Subject */}
+              <div className="space-y-1.5">
+                <label htmlFor="broadcast-subject" className="block text-xs font-semibold text-slate-300">
+                  Subject
+                </label>
+                <input
+                  id="broadcast-subject"
+                  type="text"
+                  value={broadcastSubject}
+                  onChange={(e) => setBroadcastSubject(e.target.value)}
+                  placeholder="e.g. Context Pilot v3.1 — Tech Stack-aware predictions"
+                  maxLength={200}
+                  disabled={broadcastSending}
+                  required
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white placeholder-slate-600 focus:outline-indigo-500"
+                />
+                <div className="flex justify-end text-[10px] text-slate-500">{broadcastSubject.length}/200</div>
+              </div>
+
+              {/* Message */}
+              <div className="space-y-1.5">
+                <label htmlFor="broadcast-message" className="block text-xs font-semibold text-slate-300">
+                  Message
+                </label>
+                <textarea
+                  id="broadcast-message"
+                  rows={7}
+                  value={broadcastMessage}
+                  onChange={(e) => setBroadcastMessage(e.target.value)}
+                  placeholder={'Write your announcement here…\n\nLine breaks are preserved in the delivered email.'}
+                  maxLength={10000}
+                  disabled={broadcastSending}
+                  required
+                  className="w-full px-3 py-2.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white placeholder-slate-600 focus:outline-indigo-500 leading-relaxed resize-y"
+                />
+                <div className="flex justify-end text-[10px] text-slate-500">{broadcastMessage.length}/10000</div>
+              </div>
+
+              {/* Footer / send */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1 border-t border-slate-800">
+                <p className="text-[10px] text-slate-500 max-w-xs">
+                  Delivery uses <code className="text-slate-400">RESEND_API_KEY</code> on the server. If it is not configured, the send will fail with a clear error.
+                </p>
+                <button
+                  type="submit"
+                  disabled={broadcastSending || !broadcastSubject.trim() || !broadcastMessage.trim()}
+                  className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-[#667eea] to-[#764ba2] hover:opacity-95 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-bold transition-opacity shrink-0"
+                >
+                  {broadcastSending ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      Sending…
+                    </>
+                  ) : (
+                    <>
+                      <Send className="w-4 h-4" />
+                      Send Broadcast
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
         {activeTab === 'transactions' && (
           <div className="p-6 bg-slate-900 border border-slate-800 rounded-2xl space-y-4">
             <div>
@@ -1774,6 +1958,33 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
           <span>© {new Date().getFullYear()} Hausa Cybertech • All rights reserved.</span>
         </footer>
       </div>
+
+      {/* Action toast (impersonation / broadcast feedback) */}
+      {broadcastToast && (
+        <div
+          role="status"
+          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] flex items-start gap-3 max-w-md w-[min(92vw,28rem)] rounded-xl border px-4 py-3 shadow-2xl backdrop-blur transition-all ${
+            broadcastToast.kind === 'success'
+              ? 'bg-emerald-950/95 border-emerald-800 text-emerald-200'
+              : 'bg-rose-950/95 border-rose-800 text-rose-200'
+          }`}
+        >
+          {broadcastToast.kind === 'success' ? (
+            <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-emerald-400" />
+          ) : (
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-rose-400" />
+          )}
+          <div className="text-xs leading-snug flex-1 break-words">{broadcastToast.text}</div>
+          <button
+            type="button"
+            onClick={() => setBroadcastToast(null)}
+            className="text-slate-400 hover:text-white transition-colors shrink-0"
+            aria-label="Dismiss notification"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
     </div>
   );
 };

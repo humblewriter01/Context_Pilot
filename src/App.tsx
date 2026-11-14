@@ -26,6 +26,8 @@ import { readAuthRedirectError, clearAuthRedirectError } from './services/authEr
 import { captureGitHubProviderToken, resetGitHubTokenCapture } from './services/github';
 import ResetPasswordModal from './components/ResetPasswordModal';
 import { formatDisplayName } from './components/UserAvatar';
+import { getImpersonation, stopImpersonation, type ImpersonationInfo } from './services/impersonation';
+import { Eye, LogOut } from 'lucide-react';
 import { UserProfile, UsageStats, AnalysisRecord, FeedbackRecord, SubscriptionTier } from './types';
 
 export const App: React.FC = () => {
@@ -47,6 +49,7 @@ export const App: React.FC = () => {
     return 'jira';
   });
   const [gitHubFiles, setGitHubFiles] = useState<string[]>([]);
+  const [impersonation, setImpersonation] = useState<ImpersonationInfo | null>(() => getImpersonation());
   // Responsive sidebar open state: open by default on desktop (>=768px), closed on mobile
   const [sidebarOpen, setSidebarOpen] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -67,6 +70,31 @@ export const App: React.FC = () => {
     // Once somebody is signed in the old failure is no longer relevant.
     if (user) setAuthRedirectError(null);
   }, [user]);
+
+  // Keep the impersonation banner in sync across tabs: the marker lives in
+  // localStorage, so a Stop click in one tab (or a manual sign-out) clears it here too.
+  useEffect(() => {
+    const syncImpersonation = () => setImpersonation(getImpersonation());
+    window.addEventListener('focus', syncImpersonation);
+    window.addEventListener('storage', syncImpersonation);
+    return () => {
+      window.removeEventListener('focus', syncImpersonation);
+      window.removeEventListener('storage', syncImpersonation);
+    };
+  }, []);
+
+  const handleStopImpersonating = async () => {
+    stopImpersonation();
+    setImpersonation(null);
+    try {
+      await signOut();
+    } catch (e) {
+      console.warn('Sign out error:', e);
+    }
+    storageService.logoutUser();
+    setUser(null);
+    setUsage(storageService.getUsage());
+  };
 
   // Password recovery (Supabase link -> update password)
   const [isRecoveryMode, setIsRecoveryMode] = useState(() => {
@@ -242,6 +270,8 @@ export const App: React.FC = () => {
         }
         if (event === 'SIGNED_OUT' || !session) {
           resetGitHubTokenCapture();
+          stopImpersonation();
+          setImpersonation(null);
           storageService.logoutUser();
           setUser(null);
         } else if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') {
@@ -357,6 +387,8 @@ export const App: React.FC = () => {
     } catch (e) {
       console.warn('Sign out error:', e);
     }
+    stopImpersonation();
+    setImpersonation(null);
     storageService.logoutUser();
     setUser(null);
     setUsage(storageService.getUsage());
@@ -387,9 +419,45 @@ export const App: React.FC = () => {
     setActiveTab('github');
   };
 
+  // The marker lives in localStorage (shared across same-origin tabs by design), but
+  // the warning only belongs in the tab that is actually signed in as the target
+  // user. The admin tab that opened the impersonation link keeps its own session,
+  // so comparing emails avoids showing a misleading banner there.
+  const activeImpersonation =
+    impersonation && user?.email && user.email.trim().toLowerCase() === impersonation.email
+      ? impersonation
+      : null;
+
+  // Persistent warning shown while the app session is impersonating a user.
+  const impersonationBanner = activeImpersonation ? (
+    <div
+      role="alert"
+      className="fixed top-0 inset-x-0 z-[100] flex flex-wrap items-center justify-center gap-x-3 gap-y-1 bg-amber-400 text-amber-950 px-4 py-2 text-xs shadow-md"
+    >
+      <Eye className="w-4 h-4 shrink-0" />
+      <span className="font-semibold text-center">
+        You are viewing as <span className="font-extrabold">{activeImpersonation.email}</span>.
+      </span>
+      <button
+        type="button"
+        onClick={handleStopImpersonating}
+        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-950 text-amber-50 text-[11px] font-bold uppercase tracking-wide hover:bg-amber-900 transition-colors"
+      >
+        <LogOut className="w-3.5 h-3.5" />
+        Stop Impersonating
+      </button>
+    </div>
+  ) : null;
+
   // If path is /admin or #/admin, render protected Enterprise Admin Portal
   if (isAdminRoute) {
-    return <AdminPortal onBackToApp={navigateToApp} />;
+    return (
+      <div className="bg-slate-950 min-h-screen">
+        {impersonationBanner}
+        {activeImpersonation && <div className="h-9" aria-hidden="true" />}
+        <AdminPortal onBackToApp={navigateToApp} />
+      </div>
+    );
   }
 
   // Session verification loading screen on app load
@@ -440,7 +508,8 @@ export const App: React.FC = () => {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 flex text-slate-900 font-sans relative overflow-x-hidden">
+    <div className={`min-h-screen bg-slate-50 flex text-slate-900 font-sans relative overflow-x-hidden ${activeImpersonation ? 'pt-9' : ''}`}>
+      {impersonationBanner}
       {/* Responsive Left Sidebar */}
       <Sidebar
         user={user}

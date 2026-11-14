@@ -6,6 +6,7 @@ import fs from "fs";
 import crypto from "crypto";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createClient } from "@supabase/supabase-js";
+import { Resend } from "resend";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -1008,9 +1009,18 @@ app.get("/api/admin/users", requireAdmin, async (_req, res) => {
       const { data: dbUsers, error } = await supabaseServer.from("users").select("*").order("created_at", { ascending: false });
       if (!error && dbUsers) {
         const currentMonth = getCurrentMonthYear();
-        const { data: usageData } = await supabaseServer.from("user_usage").select("user_email, tickets_processed").eq("month_year", currentMonth);
+        const userEmails = dbUsers.map((u) => (u.email || "").toLowerCase()).filter((e) => Boolean(e));
+        let usageData = [];
+        if (userEmails.length > 0) {
+          const { data, error: usageError } = await supabaseServer.from("user_usage").select("user_email, tickets_processed").eq("month_year", currentMonth).in("user_email", userEmails);
+          if (usageError) {
+            console.warn("[Admin Users Usage Query Warning]:", usageError.message);
+          } else {
+            usageData = data || [];
+          }
+        }
         const usageMap = new Map(
-          (usageData || []).map((u) => [u.user_email?.toLowerCase(), u.tickets_processed])
+          usageData.map((u) => [(u.user_email || "").toLowerCase(), Number(u.tickets_processed) || 0])
         );
         const formatted = dbUsers.map((u) => ({
           id: u.id,
@@ -1397,6 +1407,176 @@ app.post("/api/admin/settings", requireAdmin, async (req, res) => {
     persisted: Boolean(supabaseAdmin)
   });
 });
+app.post("/api/admin/impersonate", requireAdmin, async (req, res) => {
+  const { user_email } = req.body || {};
+  const targetEmail = normalizeEmail(user_email);
+  if (!targetEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(targetEmail)) {
+    return res.status(400).json({ error: "A valid user_email is required for impersonation." });
+  }
+  const adminUser = req.adminUser;
+  const adminEmail = normalizeEmail(adminUser?.email);
+  if (adminEmail && targetEmail === adminEmail) {
+    return res.status(400).json({ error: "You are already signed in as the administrator." });
+  }
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "The database service is not configured on the server." });
+  }
+  try {
+    const { data: targetRow, error: lookupError } = await supabaseAdmin.from("users").select("email").eq("email", targetEmail).maybeSingle();
+    if (lookupError) {
+      console.warn("[Admin Impersonate Lookup Warning]:", lookupError.message);
+      return res.status(500).json({ error: "Could not verify the target user. Please try again." });
+    }
+    if (!targetRow) {
+      return res.status(404).json({ error: `No user found with email ${targetEmail}.` });
+    }
+    const { data, error } = await supabaseAdmin.auth.admin.generateLink({
+      type: "magiclink",
+      email: targetEmail
+    });
+    if (error) {
+      console.warn("[Admin Impersonate Generate Link Error]:", error.message);
+      return res.status(500).json({ error: error.message || "Failed to generate an impersonation link." });
+    }
+    const actionLink = data?.properties?.action_link;
+    if (!actionLink) {
+      return res.status(500).json({ error: "The impersonation link could not be generated." });
+    }
+    console.log(`[Admin Impersonate] ${adminEmail || "admin"} generated an impersonation link for ${targetEmail} at ${(/* @__PURE__ */ new Date()).toISOString()}`);
+    return res.json({
+      action_link: actionLink,
+      email: targetEmail,
+      message: "Impersonation link generated. It signs in as the target user and expires shortly."
+    });
+  } catch (err) {
+    console.error("[Admin Impersonate Exception]:", err?.message || err);
+    return res.status(500).json({ error: "Failed to generate an impersonation link." });
+  }
+});
+var escapeHtml = (value) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+var BROADCAST_BATCH_SIZE = 100;
+app.post("/api/admin/broadcast", requireAdmin, async (req, res) => {
+  const { audience, subject, message } = req.body || {};
+  const normalizedAudience = typeof audience === "string" ? audience.trim().toLowerCase() : "";
+  const cleanSubject = typeof subject === "string" ? subject.trim() : "";
+  const cleanMessage = typeof message === "string" ? message.trim() : "";
+  if (!["all", "free", "pro"].includes(normalizedAudience)) {
+    return res.status(400).json({ error: "audience must be one of 'all', 'free', or 'pro'." });
+  }
+  if (!cleanSubject || cleanSubject.length > 200) {
+    return res.status(400).json({ error: "subject is required (max 200 characters)." });
+  }
+  if (!cleanMessage || cleanMessage.length > 1e4) {
+    return res.status(400).json({ error: "message is required (max 10,000 characters)." });
+  }
+  const resendKey = (process.env.RESEND_API_KEY || "").trim();
+  if (!resendKey) {
+    return res.status(503).json({ error: "Email broadcast is not configured on the server. Set RESEND_API_KEY to enable it." });
+  }
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "The database service is not configured on the server." });
+  }
+  const adminUser = req.adminUser;
+  const adminEmail = normalizeEmail(adminUser?.email);
+  try {
+    let recipientsQuery = supabaseAdmin.from("users").select("email, subscription_tier, status").order("created_at", { ascending: true });
+    if (normalizedAudience !== "all") {
+      recipientsQuery = recipientsQuery.eq("subscription_tier", normalizedAudience);
+    }
+    const dbRecipients = await fetchAllQueryRows(recipientsQuery);
+    const recipients = Array.from(
+      new Set(
+        dbRecipients.filter((row) => (row.status ?? "active") === "active").map((row) => normalizeEmail(row.email)).filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+      )
+    );
+    if (recipients.length === 0) {
+      return res.json({
+        success: true,
+        audience: normalizedAudience,
+        recipients: 0,
+        sent: 0,
+        failed: 0,
+        message: "No active recipients matched the selected audience."
+      });
+    }
+    const from = (process.env.RESEND_FROM_EMAIL || "Context Pilot <onboarding@resend.dev>").trim();
+    const replyTo = (process.env.SUPPORT_REPLY_TO_EMAIL || "support.contextpilot@gmail.com").trim();
+    const resend = new Resend(resendKey);
+    const htmlBody = escapeHtml(cleanMessage).replace(/\n/g, "<br>");
+    const html = `<!doctype html>
+<html>
+  <body style="margin:0;padding:24px;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+    <div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0;">
+      <div style="background:linear-gradient(135deg,#667eea,#764ba2);padding:18px 24px;">
+        <span style="color:#ffffff;font-size:17px;font-weight:800;letter-spacing:-0.02em;">Context Pilot</span>
+      </div>
+      <div style="padding:22px 24px;color:#0f172a;font-size:14px;line-height:1.65;">
+        ${htmlBody}
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0 12px;" />
+        <p style="margin:0;color:#64748b;font-size:12px;">You are receiving this because you have a Context Pilot account. Reply to this email to reach our support team.</p>
+      </div>
+    </div>
+  </body>
+</html>`;
+    const text = cleanMessage;
+    let sent = 0;
+    let failed = 0;
+    const failureSamples = [];
+    for (let offset = 0; offset < recipients.length; offset += BROADCAST_BATCH_SIZE) {
+      const chunk = recipients.slice(offset, offset + BROADCAST_BATCH_SIZE);
+      const batch = chunk.map((email) => ({
+        from,
+        to: email,
+        subject: cleanSubject,
+        html,
+        text,
+        replyTo
+      }));
+      try {
+        const { data: batchData, error: batchError } = await resend.batch.send(batch, {
+          batchValidation: "permissive"
+        });
+        if (batchError) {
+          failed += chunk.length;
+          if (failureSamples.length < 5) failureSamples.push(...chunk.slice(0, 5 - failureSamples.length));
+          console.warn("[Admin Broadcast Batch Error]:", batchError.message || batchError);
+          continue;
+        }
+        const created = Array.isArray(batchData?.data) ? batchData.data.length : 0;
+        const perItemErrors = Array.isArray(batchData?.errors) ? batchData.errors : [];
+        sent += created;
+        failed += perItemErrors.length;
+        if (perItemErrors.length > 0 && failureSamples.length < 5) {
+          for (const item of perItemErrors) {
+            const failedEmail = chunk[item.index];
+            if (failedEmail) failureSamples.push(failedEmail);
+            if (failureSamples.length >= 5) break;
+          }
+        }
+      } catch (batchErr) {
+        failed += chunk.length;
+        if (failureSamples.length < 5) failureSamples.push(...chunk.slice(0, 5 - failureSamples.length));
+        console.warn("[Admin Broadcast Batch Exception]:", batchErr?.message || batchErr);
+      }
+    }
+    console.log(
+      `[Admin Broadcast] audience=${normalizedAudience} recipients=${recipients.length} sent=${sent} failed=${failed} by=${adminEmail || "admin"} at ${(/* @__PURE__ */ new Date()).toISOString()}`
+    );
+    const success = failed === 0;
+    return res.json({
+      success,
+      audience: normalizedAudience,
+      recipients: recipients.length,
+      sent,
+      failed,
+      failures: failureSamples,
+      message: success ? `Broadcast delivered to ${sent} recipient${sent === 1 ? "" : "s"}.` : `Broadcast partially delivered: ${sent} sent, ${failed} failed.`
+    });
+  } catch (err) {
+    console.error("[Admin Broadcast Exception]:", err?.message || err);
+    return res.status(500).json({ error: err?.message || "Failed to send the broadcast. Please try again." });
+  }
+});
 app.post("/api/auth/delete-account", authenticateUser, async (req, res) => {
   const userEmail = req.userEmail;
   const authUserId = req.authUserId;
@@ -1765,6 +1945,7 @@ async function handleTicketAnalysis(req, res) {
   let userTier = "free";
   let monthlyLimit = SERVER_STORE.settings.freeLimit || 10;
   let ticketsProcessed = 0;
+  let usageReadFailed = false;
   if (email) {
     await ensureUserProfile(email, auth.user?.id);
     if (supabaseAdmin) {
@@ -1777,7 +1958,11 @@ async function handleTicketAnalysis(req, res) {
           userTier = userData.subscription_tier || "free";
         }
         monthlyLimit = userTier === "enterprise" ? -1 : userTier === "pro" ? SERVER_STORE.settings.proLimit || 150 : SERVER_STORE.settings.freeLimit || 10;
-        const { data: usageData } = await supabaseAdmin.from("user_usage").select("tickets_processed, monthly_limit").eq("user_email", email).eq("month_year", currentMonth).maybeSingle();
+        const { data: usageData, error: usageReadError } = await supabaseAdmin.from("user_usage").select("tickets_processed, monthly_limit").eq("user_email", email).eq("month_year", currentMonth).maybeSingle();
+        if (usageReadError) {
+          console.warn("[User Usage Read Warning]:", usageReadError.message);
+          usageReadFailed = true;
+        }
         if (usageData) {
           ticketsProcessed = usageData.tickets_processed || 0;
           if (typeof usageData.monthly_limit === "number") {
@@ -1901,9 +2086,11 @@ Be realistic, precise, and practical for production codebases. ${stack ? `Every 
   analysisResult.processingTimeMs = processingTimeMs;
   if (email) {
     const updatedCount = ticketsProcessed + 1;
-    if (supabaseAdmin) {
+    if (supabaseAdmin && usageReadFailed) {
+      console.warn("[Quota Update Skipped]: user_usage could not be read earlier this request; skipping the write to avoid corrupting the counter. See the User Usage Read Warning above.");
+    } else if (supabaseAdmin) {
       try {
-        await supabaseAdmin.from("user_usage").upsert(
+        const { error: usageUpsertError } = await supabaseAdmin.from("user_usage").upsert(
           {
             user_email: email,
             month_year: currentMonth,
@@ -1913,6 +2100,26 @@ Be realistic, precise, and practical for production codebases. ${stack ? `Every 
           },
           { onConflict: "user_email,month_year" }
         );
+        if (usageUpsertError) {
+          console.warn("[User Usage Upsert Warning]:", usageUpsertError.message);
+          const { data: updatedRows, error: updateError } = await supabaseAdmin.from("user_usage").update({
+            tickets_processed: updatedCount,
+            monthly_limit: monthlyLimit,
+            updated_at: (/* @__PURE__ */ new Date()).toISOString()
+          }).eq("user_email", email).eq("month_year", currentMonth).select("tickets_processed");
+          if (updateError) {
+            console.warn("[User Usage Update Fallback Warning]:", updateError.message);
+          } else if (!updatedRows || updatedRows.length === 0) {
+            const { error: insertError } = await supabaseAdmin.from("user_usage").insert({
+              user_email: email,
+              month_year: currentMonth,
+              tickets_processed: updatedCount,
+              monthly_limit: monthlyLimit,
+              updated_at: (/* @__PURE__ */ new Date()).toISOString()
+            });
+            if (insertError) console.warn("[User Usage Insert Fallback Warning]:", insertError.message);
+          }
+        }
         const { data: historyRow, error: historyErr } = await supabaseAdmin.from("analysis_history").insert({
           user_email: email,
           ticket_key: key,
