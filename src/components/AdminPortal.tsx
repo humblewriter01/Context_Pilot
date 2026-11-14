@@ -124,7 +124,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
   const [saveSuccess, setSaveSuccess] = useState(false);
 
   // Broadcast state
-  const [broadcastAudience, setBroadcastAudience] = useState<'all' | 'free' | 'pro'>('all');
+  const [broadcastAudience, setBroadcastAudience] = useState<'all' | 'free' | 'pro' | 'enterprise'>('all');
   const [broadcastSubject, setBroadcastSubject] = useState('');
   const [broadcastMessage, setBroadcastMessage] = useState('');
   const [broadcastSending, setBroadcastSending] = useState(false);
@@ -1633,16 +1633,17 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToApp }) => {
                 <select
                   id="broadcast-audience"
                   value={broadcastAudience}
-                  onChange={(e) => setBroadcastAudience(e.target.value as 'all' | 'free' | 'pro')}
+                  onChange={(e) => setBroadcastAudience(e.target.value as 'all' | 'free' | 'pro' | 'enterprise')}
                   disabled={broadcastSending}
                   className="w-full sm:w-64 px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white focus:outline-indigo-500"
                 >
                   <option value="all">All users</option>
                   <option value="free">Free tier only</option>
                   <option value="pro">Pro tier only</option>
+                  <option value="enterprise">Enterprise Users</option>
                 </select>
                 <p className="text-[10px] text-slate-500">
-                  “Free tier only” targets <code className="text-slate-400">subscription_tier = 'free'</code>; “Pro tier only” targets <code className="text-slate-400">subscription_tier = 'pro'</code>.
+                  “Free tier only” targets <code className="text-slate-400">subscription_tier = 'free'</code>; “Pro tier only” targets <code className="text-slate-400">'pro'</code>; “Enterprise Users” targets <code className="text-slate-400">'enterprise'</code>.
                 </p>
               </div>
 

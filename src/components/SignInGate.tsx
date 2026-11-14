@@ -479,21 +479,67 @@ export const SignInGate: React.FC<SignInGateProps> = ({ onAuthSuccess, initialEr
         </div>
       </main>
 
-      {/* Footer */}
-      <footer className="border-t border-slate-800/80 py-4 text-xs text-slate-500 bg-slate-950/80">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-center sm:text-left">
-          <div className="flex items-center gap-2">
-            <span className="font-semibold text-slate-400">Context Pilot</span>
-            <span>•</span>
-            <span>Jira Ticket Codebase Impact Engine</span>
+      {/* Footer — professional public footer for the landing page */}
+      <footer className="border-t border-slate-800/80 bg-slate-950/80 text-xs text-slate-500">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-8">
+            {/* Brand block */}
+            <div className="space-y-2 max-w-xs">
+              <div className="flex items-center gap-2">
+                <div className="w-6 h-6 rounded-md bg-gradient-to-br from-[#667eea] to-[#764ba2] flex items-center justify-center text-white text-[10px] font-black">
+                  CP
+                </div>
+                <span className="font-bold text-sm text-slate-200 tracking-tight">Context Pilot</span>
+              </div>
+              <p className="text-[11px] leading-relaxed text-slate-500">
+                Jira Ticket Codebase Impact Engine — predict which frontend, backend, database, and configuration files a ticket will touch before a line of code is written.
+              </p>
+            </div>
+
+            {/* Link columns */}
+            <nav aria-label="Footer navigation" className="grid grid-cols-2 sm:flex sm:flex-row gap-8 sm:gap-16">
+              <div className="space-y-2.5">
+                <h4 className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-400">Support</h4>
+                <ul className="space-y-1.5">
+                  <li>
+                    <a
+                      href="mailto:support.contextpilot@gmail.com?subject=Support%20Request%20-%20Context%20Pilot"
+                      className="text-slate-500 hover:text-white transition-colors"
+                    >
+                      Contact Support
+                    </a>
+                  </li>
+                </ul>
+              </div>
+
+              <div className="space-y-2.5">
+                <h4 className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-400">Legal</h4>
+                <ul className="space-y-1.5">
+                  <li>
+                    <a href="/privacy" className="text-slate-500 hover:text-white transition-colors">
+                      Privacy Policy
+                    </a>
+                  </li>
+                  <li>
+                    <a href="/terms" className="text-slate-500 hover:text-white transition-colors">
+                      Terms of Service
+                    </a>
+                  </li>
+                </ul>
+              </div>
+            </nav>
           </div>
 
-          <div className="flex items-center gap-4 text-slate-500">
-            <span>Secure Authentication</span>
-            <span>•</span>
-            <span>Paystack Billing</span>
-            <span>•</span>
-            <span>© {new Date().getFullYear()} Hausa Cybertech</span>
+          {/* Bottom bar */}
+          <div className="mt-8 pt-4 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 text-center sm:text-left">
+            <p className="text-slate-500">© {new Date().getFullYear()} Hausa Cybertech. All rights reserved.</p>
+            <div className="flex flex-wrap items-center justify-center sm:justify-end gap-x-4 gap-y-1 text-slate-600">
+              <span>Secure Authentication</span>
+              <span aria-hidden="true">•</span>
+              <span>Paystack Billing</span>
+              <span aria-hidden="true">•</span>
+              <span>Enterprise Ready</span>
+            </div>
           </div>
         </div>
       </footer>

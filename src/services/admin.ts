@@ -309,7 +309,7 @@ export const adminService = {
    * Resend integration. Returns a delivery summary from the server.
    */
   async sendBroadcast(payload: {
-    audience: 'all' | 'free' | 'pro';
+    audience: 'all' | 'free' | 'pro' | 'enterprise';
     subject: string;
     message: string;
   }): Promise<{
