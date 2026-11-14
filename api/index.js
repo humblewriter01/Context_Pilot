@@ -1460,8 +1460,8 @@ app.post("/api/admin/broadcast", requireAdmin, async (req, res) => {
   const normalizedAudience = typeof audience === "string" ? audience.trim().toLowerCase() : "";
   const cleanSubject = typeof subject === "string" ? subject.trim() : "";
   const cleanMessage = typeof message === "string" ? message.trim() : "";
-  if (!["all", "free", "pro"].includes(normalizedAudience)) {
-    return res.status(400).json({ error: "audience must be one of 'all', 'free', or 'pro'." });
+  if (!["all", "free", "pro", "enterprise"].includes(normalizedAudience)) {
+    return res.status(400).json({ error: "audience must be one of 'all', 'free', 'pro', or 'enterprise'." });
   }
   if (!cleanSubject || cleanSubject.length > 200) {
     return res.status(400).json({ error: "subject is required (max 200 characters)." });
