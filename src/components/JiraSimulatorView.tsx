@@ -25,23 +25,21 @@ interface JiraSimulatorViewProps {
 }
 
 const TECH_STACK_STORAGE_KEY = 'context_pilot_tech_stack';
+const OTHER_TECH_STACK_OPTION = 'Other (Type manually)';
 
-const TECH_STACK_PRESETS = [
-  'C++ / Vulkan',
-  'C++ / Qt',
-  'Unreal Engine / C++',
-  'React / Node',
+// Curated list shown in the dropdown. Stored/passed values are the label text verbatim.
+const TECH_STACK_OPTIONS = [
+  'React / Node.js',
   'Next.js / TypeScript',
   'Python / Django',
   'Python / FastAPI',
-  'Java / Spring Boot',
+  'C++ / Vulkan',
+  'C# / .NET',
   'Go / gRPC',
   'Rust',
-  '.NET / C#',
-  'Ruby on Rails',
+  'Java / Spring Boot',
   'PHP / Laravel',
-  'Swift / iOS',
-  'Kotlin / Android',
+  'Ruby on Rails',
   'Flutter / Dart',
 ];
 
@@ -51,6 +49,13 @@ const loadStoredTechStack = (): string => {
   } catch {
     return '';
   }
+};
+
+/** Restores the dropdown selection from the stored final string. */
+const restoreTechStackSelection = (stored: string): { choice: string; custom: string } => {
+  if (!stored) return { choice: '', custom: '' };
+  if (TECH_STACK_OPTIONS.includes(stored)) return { choice: stored, custom: '' };
+  return { choice: OTHER_TECH_STACK_OPTION, custom: stored };
 };
 
 export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
@@ -65,8 +70,20 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
   const [priority, setPriority] = useState<'Highest' | 'High' | 'Medium' | 'Low' | ''>('');
   const [status, setStatus] = useState<'To Do' | 'In Progress' | 'In Review' | 'Done' | ''>('');
   const [componentsList, setComponentsList] = useState<string>('');
-  const [techStack, setTechStack] = useState<string>(loadStoredTechStack);
+  const [initialTechStack] = useState<string>(loadStoredTechStack);
+  const [techStackChoice, setTechStackChoice] = useState<string>(() => restoreTechStackSelection(initialTechStack).choice);
+  const [customTechStack, setCustomTechStack] = useState<string>(() => restoreTechStackSelection(initialTechStack).custom);
+  // Final string passed to the analyzer and persisted in localStorage, exactly as before.
+  const techStack = techStackChoice === OTHER_TECH_STACK_OPTION ? customTechStack : techStackChoice;
   const [activeTechStack, setActiveTechStack] = useState<string>('');
+
+  const persistTechStack = (value: string) => {
+    try {
+      localStorage.setItem(TECH_STACK_STORAGE_KEY, value);
+    } catch {
+      // localStorage unavailable (e.g. private mode) — keep in-memory state only
+    }
+  };
 
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<
@@ -341,30 +358,40 @@ export const JiraSimulatorView: React.FC<JiraSimulatorViewProps> = ({
                 Tech Stack / Project Type
                 <span className="text-[10px] font-medium normal-case tracking-normal text-slate-400">(optional)</span>
               </label>
-              <input
+              <select
                 id="tech-stack-input"
-                type="text"
-                list="tech-stack-presets"
-                value={techStack}
+                value={techStackChoice}
                 onChange={(e) => {
                   const value = e.target.value;
-                  setTechStack(value);
+                  setTechStackChoice(value);
                   clearAnalysisError();
-                  try {
-                    localStorage.setItem(TECH_STACK_STORAGE_KEY, value);
-                  } catch {
-                    // localStorage unavailable (e.g. private mode) — keep in-memory state only
-                  }
+                  persistTechStack(value === OTHER_TECH_STACK_OPTION ? customTechStack : value);
                 }}
-                placeholder='e.g. "C++ / Vulkan", "React / Node"'
-                maxLength={120}
-                className="w-full px-3 py-2 bg-white border border-indigo-200 text-slate-800 rounded-lg text-xs font-medium placeholder:text-slate-400 placeholder:font-normal focus:outline-indigo-500 focus:border-indigo-400"
-              />
-              <datalist id="tech-stack-presets">
-                {TECH_STACK_PRESETS.map((preset) => (
-                  <option key={preset} value={preset} />
+                className="w-full px-3 py-2 bg-slate-50 border border-slate-300 text-slate-800 rounded-lg font-semibold text-xs focus:outline-indigo-500"
+              >
+                <option value="">-- Select Tech Stack --</option>
+                {TECH_STACK_OPTIONS.map((option) => (
+                  <option key={option} value={option}>{option}</option>
                 ))}
-              </datalist>
+                <option value={OTHER_TECH_STACK_OPTION}>{OTHER_TECH_STACK_OPTION}</option>
+              </select>
+              {techStackChoice === OTHER_TECH_STACK_OPTION && (
+                <input
+                  id="tech-stack-custom"
+                  type="text"
+                  value={customTechStack}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setCustomTechStack(value);
+                    clearAnalysisError();
+                    persistTechStack(value);
+                  }}
+                  placeholder='Type your custom stack (e.g. "C++ / Qt")'
+                  maxLength={120}
+                  autoFocus
+                  className="w-full px-3 py-2 bg-white border border-indigo-200 text-slate-800 rounded-lg text-xs font-medium placeholder:text-slate-400 placeholder:font-normal focus:outline-indigo-500 focus:border-indigo-400"
+                />
+              )}
               {techStack.trim() ? (
                 <p className="text-[10px] leading-snug text-emerald-700 flex items-start gap-1 pt-0.5">
                   <CheckCircle2 className="w-3 h-3 mt-0.5 shrink-0" />
