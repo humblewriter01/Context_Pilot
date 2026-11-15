@@ -42,6 +42,36 @@ export interface GitHubRepoStructure {
   detectedFiles: string[];
 }
 
+export type DependencyEcosystem =
+  | 'node'
+  | 'python'
+  | 'rust'
+  | 'go'
+  | 'php'
+  | 'ruby'
+  | 'java'
+  | 'csharp'
+  | 'cpp'
+  | 'unknown';
+
+/** Result of POST /api/github/analyze-dependencies (Universal Dependency Verification). */
+export interface GitHubDependencyAnalysis {
+  ecosystem: DependencyEcosystem;
+  ecosystemLabel?: string;
+  /** False for ecosystems with no in-scope package manager (e.g. C++, C#). */
+  supported: boolean;
+  /** False when no manifest file exists in the repository root. */
+  manifestFound: boolean;
+  /** Manifest files that were found and parsed. */
+  manifestFiles: string[];
+  scannedFiles: number;
+  checkedImports: number;
+  /** Third-party packages that are imported but not declared in the manifest. */
+  missingPackages: string[];
+  /** Present when the analysis could not run (unsupported ecosystem / missing manifest). */
+  message?: string;
+}
+
 export interface GitHubVerifyResponse {
   verification: GitHubVerificationResult;
   structure: GitHubRepoStructure;
@@ -226,6 +256,24 @@ export const githubService = {
     const res = await authorizedFetch('/api/github/repos', { signal });
     if (!res.ok) throw await toApiError(res, 'Could not load your repositories from GitHub.');
     return (await res.json()) as GitHubRepoListing;
+  },
+
+  /**
+   * Analyzes the dependency manifest for the repository and reports imported
+   * third-party packages that are not declared (POST /api/github/analyze-dependencies).
+   * Supports Node.js, Python, Rust, Go, PHP, Ruby, and Java.
+   */
+  async analyzeDependencies(
+    repoName: string,
+    filePaths: string[],
+    branch: string = 'main'
+  ): Promise<GitHubDependencyAnalysis> {
+    const res = await authorizedFetch('/api/github/analyze-dependencies', {
+      method: 'POST',
+      body: JSON.stringify({ repo: repoName, branch, filePaths }),
+    });
+    if (!res.ok) throw await toApiError(res, 'Failed to analyze dependencies.');
+    return (await res.json()) as GitHubDependencyAnalysis;
   },
 
   /**
