@@ -3601,6 +3601,707 @@ app.post('/api/github/verify', authenticateUser, async (req: express.Request, re
   }
 });
 
+// ==========================================
+// Universal Polyglot Dependency Verification
+// POST /api/github/analyze-dependencies
+// Body: { repo: "owner/repo", branch?: string, filePaths: string[] }
+// Detects the primary ecosystem from file extensions, fetches the matching
+// manifest file(s) from the repository root, extracts third-party imports
+// from the source files, and reports which ones are not declared.
+// ==========================================
+
+type DependencyEcosystem =
+  | 'node'
+  | 'python'
+  | 'rust'
+  | 'go'
+  | 'php'
+  | 'ruby'
+  | 'java'
+  | 'csharp'
+  | 'cpp'
+  | 'unknown';
+
+const ECOSYSTEM_FILE_EXTENSIONS: Record<string, DependencyEcosystem> = {
+  '.ts': 'node', '.tsx': 'node', '.js': 'node', '.jsx': 'node', '.mjs': 'node', '.cjs': 'node',
+  '.py': 'python', '.pyw': 'python',
+  '.rs': 'rust',
+  '.go': 'go',
+  '.php': 'php', '.phtml': 'php',
+  '.rb': 'ruby',
+  '.java': 'java', '.kt': 'java', '.kts': 'java', '.scala': 'java',
+  '.cs': 'csharp',
+  '.c': 'cpp', '.cc': 'cpp', '.cpp': 'cpp', '.cxx': 'cpp', '.h': 'cpp', '.hh': 'cpp', '.hpp': 'cpp',
+};
+const ECOSYSTEM_PRIORITY: DependencyEcosystem[] = ['node', 'python', 'rust', 'go', 'php', 'ruby', 'java', 'csharp', 'cpp'];
+
+function detectEcosystem(filePaths: string[]): DependencyEcosystem {
+  const counts = new Map<DependencyEcosystem, number>();
+  for (const raw of filePaths) {
+    const m = /\.[A-Za-z0-9]+$/.exec((raw || '').trim());
+    if (!m) continue;
+    const eco = ECOSYSTEM_FILE_EXTENSIONS[m[0].toLowerCase()];
+    if (eco) counts.set(eco, (counts.get(eco) || 0) + 1);
+  }
+  if (counts.size === 0) return 'unknown';
+  let best: DependencyEcosystem | null = null;
+  for (const eco of ECOSYSTEM_PRIORITY) {
+    const count = counts.get(eco) || 0;
+    if (count === 0) continue;
+    if (!best || count > (counts.get(best) || 0)) best = eco;
+  }
+  return best || 'unknown';
+}
+
+const ECOSYSTEM_LABELS: Record<DependencyEcosystem, string> = {
+  node: 'Node.js',
+  python: 'Python',
+  rust: 'Rust',
+  go: 'Go',
+  php: 'PHP',
+  ruby: 'Ruby',
+  java: 'Java',
+  csharp: 'C#',
+  cpp: 'C/C++',
+  unknown: 'Unknown',
+};
+
+const ECOSYSTEM_MANIFESTS: Partial<Record<DependencyEcosystem, string[]>> = {
+  node: ['package.json', 'package-lock.json'],
+  python: ['requirements.txt', 'pyproject.toml', 'Pipfile'],
+  rust: ['Cargo.toml'],
+  go: ['go.mod'],
+  php: ['composer.json'],
+  ruby: ['Gemfile'],
+  java: ['pom.xml', 'build.gradle'],
+};
+
+const DEPENDENCY_MAX_SCAN_FILES = 30;
+const DEPENDENCY_MAX_FILE_BYTES = 512 * 1024;
+const DEPENDENCY_FETCH_CONCURRENCY = 4;
+
+/** Canonical key so import names and manifest names compare across separators and scopes. */
+function dependencyKey(name: string): string {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/^@/, '')
+    .replace(/[._]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-/]+|[-/]+$/g, '');
+}
+
+function decodeGitHubFileContent(data: any): string | null {
+  if (!data || typeof data !== 'object') return null;
+  if (typeof data.content === 'string') {
+    try {
+      // The Contents API returns base64 with embedded newlines.
+      return Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf8');
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+interface DeclaredDependencies {
+  keys: Set<string>;
+  modulePath?: string;
+}
+
+function extractDeclaredDependencies(
+  ecosystem: DependencyEcosystem,
+  files: Map<string, string>
+): DeclaredDependencies {
+  const keys = new Set<string>();
+  let modulePath: string | undefined;
+  const add = (raw: string | undefined | null) => {
+    if (!raw) return;
+    const key = dependencyKey(raw);
+    if (key) keys.add(key);
+  };
+
+  if (ecosystem === 'node') {
+    const pkgRaw = files.get('package.json');
+    if (pkgRaw) {
+      try {
+        const pkg = JSON.parse(pkgRaw);
+        for (const section of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+          const table = pkg?.[section];
+          if (table && typeof table === 'object') {
+            for (const name of Object.keys(table)) add(name);
+          }
+        }
+      } catch {
+        console.warn('[Dependency Analysis] package.json could not be parsed');
+      }
+    }
+    const lockRaw = files.get('package-lock.json');
+    if (lockRaw) {
+      try {
+        const lock = JSON.parse(lockRaw);
+        // lockfileVersion 2/3: "packages" with keys like "node_modules/@scope/name"
+        if (lock?.packages && typeof lock.packages === 'object') {
+          for (const key of Object.keys(lock.packages)) {
+            const m = /(?:^|\/)node_modules\/(@[^/]+\/[^/]+|[^/]+)$/.exec(key);
+            if (m) add(m[1]);
+          }
+        }
+        // lockfileVersion 1: nested "dependencies" tree
+        const walk = (tree: any) => {
+          if (!tree || typeof tree !== 'object') return;
+          for (const [name, meta] of Object.entries(tree)) {
+            add(name);
+            walk((meta as any)?.dependencies);
+          }
+        };
+        walk(lock?.dependencies);
+      } catch {
+        console.warn('[Dependency Analysis] package-lock.json could not be parsed');
+      }
+    }
+  }
+
+  if (ecosystem === 'python') {
+    const req = files.get('requirements.txt');
+    if (req) {
+      for (const line of req.split('\n')) {
+        const trimmed = line.split('#')[0].trim();
+        if (!trimmed || trimmed.startsWith('-')) continue;
+        const m = /^([A-Za-z0-9_.\-]+)/.exec(trimmed);
+        if (m) add(m[1]);
+      }
+    }
+    const pyproject = files.get('pyproject.toml');
+    if (pyproject) {
+      const projectBlock = /\[project\]([\s\S]*?)(?:\n\[|\s*$)/.exec(pyproject)?.[1] || '';
+      const depArray = /dependencies\s*=\s*\[([\s\S]*?)\]/.exec(projectBlock)?.[1] || '';
+      for (const m of depArray.matchAll(/"([^"]+)"/g)) {
+        const m2 = /^([A-Za-z0-9_.\-]+)/.exec(m[1].trim());
+        if (m2) add(m2[1]);
+      }
+      const optionalBlock = /optional-dependencies([\s\S]*?)(?:\n\[|$)/.exec(projectBlock);
+      if (optionalBlock) {
+        for (const m of optionalBlock[1].matchAll(/"([^"]+)"/g)) {
+          const m2 = /^([A-Za-z0-9_.\-]+)/.exec(m[1].trim());
+          if (m2) add(m2[1]);
+        }
+      }
+      // Poetry / dependency-groups dependency tables
+      const tableHeaders = pyproject.matchAll(/\[([A-Za-z0-9._\-]*(?:dependencies|dependency-groups)[A-Za-z0-9._\-]*)\]([\s\S]*?)(?:\n\[|$)/g);
+      for (const sec of tableHeaders) {
+        for (const line of sec[2].split('\n')) {
+          const m = /^([A-Za-z0-9_.\-]+)\s*(?:=|\.)/.exec(line.trim());
+          if (m && m[1].toLowerCase() !== 'python') add(m[1]);
+        }
+      }
+    }
+    const pipfile = files.get('Pipfile');
+    if (pipfile) {
+      for (const section of ['packages', 'dev-packages']) {
+        const re = new RegExp(`\\[${section}\\]([\\s\\S]*?)(?:\\n\\[|$)`, 'g');
+        for (const sec of pipfile.matchAll(re)) {
+          for (const line of sec[1].split('\n')) {
+            const m = /^([A-Za-z0-9_.\-]+)\s*=/.exec(line.trim());
+            if (m) add(m[1]);
+          }
+        }
+      }
+    }
+  }
+
+  if (ecosystem === 'rust') {
+    const cargo = files.get('Cargo.toml');
+    if (cargo) {
+      const sectionNames = ['dependencies', 'dev-dependencies', 'build-dependencies', 'workspace.dependencies'];
+      for (const section of sectionNames) {
+        const re = new RegExp(`\\[${section.replace('.', '\\.')}\\]([\\s\\S]*?)(?:\\n\\[|$)`, 'g');
+        for (const sec of cargo.matchAll(re)) {
+          for (const line of sec[1].split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const m = /^([A-Za-z0-9_.\-]+)\s*(?:=|\.)/.exec(trimmed);
+            if (m) add(m[1]);
+          }
+        }
+      }
+    }
+  }
+
+  if (ecosystem === 'go') {
+    const gomod = files.get('go.mod');
+    if (gomod) {
+      modulePath = /^module\s+([^\s]+)/m.exec(gomod)?.[1]?.trim().toLowerCase();
+      for (const block of gomod.matchAll(/require\s*\(([\s\S]*?)\)/g)) {
+        for (const line of block[1].split('\n')) {
+          const trimmed = line.split('//')[0].trim();
+          const m = /^([^\s]+)/.exec(trimmed);
+          if (m) add(m[1]);
+        }
+      }
+      for (const m of gomod.matchAll(/^require\s+([^\s(]+)/gm)) {
+        add(m[1]);
+      }
+    }
+  }
+
+  if (ecosystem === 'php') {
+    const composer = files.get('composer.json');
+    if (composer) {
+      try {
+        const json = JSON.parse(composer);
+        for (const section of ['require', 'require-dev']) {
+          const table = json?.[section];
+          if (!table || typeof table !== 'object') continue;
+          for (const name of Object.keys(table)) {
+            if (name === 'php' || name.startsWith('ext-') || name.startsWith('lib-')) continue;
+            add(name);
+          }
+        }
+      } catch {
+        console.warn('[Dependency Analysis] composer.json could not be parsed');
+      }
+    }
+  }
+
+  if (ecosystem === 'ruby') {
+    const gemfile = files.get('Gemfile');
+    if (gemfile) {
+      for (const m of gemfile.matchAll(/^\s*gem\s+['"]([^'"]+)['"]/gm)) add(m[1]);
+    }
+  }
+
+  if (ecosystem === 'java') {
+    const pom = files.get('pom.xml');
+    if (pom) {
+      for (const m of pom.matchAll(/<dependency>([\s\S]*?)<\/dependency>/g)) {
+        const groupId = /<groupId>([^<]+)<\/groupId>/.exec(m[1])?.[1]?.trim();
+        const artifactId = /<artifactId>([^<]+)<\/artifactId>/.exec(m[1])?.[1]?.trim();
+        add(groupId);
+        add(artifactId);
+      }
+    }
+    const gradle = files.get('build.gradle');
+    if (gradle) {
+      for (const m of gradle.matchAll(/(?:implementation|api|compileOnly|runtimeOnly|testImplementation|testRuntimeOnly|compile|testCompile|annotationProcessor)\s*\(?\s*['"]([^'"]+)['"]/g)) {
+        const coords = m[1].split(':');
+        if (coords[0]) add(coords[0].trim());
+        if (coords[1]) add(coords[1].trim());
+      }
+    }
+  }
+
+  return { keys, modulePath };
+}
+
+const JS_BUILTINS = new Set([
+  'assert', 'async_hooks', 'buffer', 'child_process', 'cluster', 'console', 'constants', 'crypto',
+  'dgram', 'dns', 'domain', 'events', 'fs', 'http', 'http2', 'https', 'module', 'net', 'os', 'path',
+  'perf_hooks', 'process', 'punycode', 'querystring', 'readline', 'repl', 'stream', 'string_decoder',
+  'sys', 'timers', 'tls', 'tty', 'url', 'util', 'v8', 'vm', 'wasi', 'worker_threads', 'zlib',
+]);
+
+const PYTHON_STDLIB = new Set([
+  'abc', 'argparse', 'array', 'ast', 'asyncio', 'atexit', 'base64', 'binascii', 'bisect', 'builtins',
+  'calendar', 'cmath', 'collections', 'concurrent', 'configparser', 'contextlib', 'copy', 'copyreg', 'csv',
+  'ctypes', 'dataclasses', 'datetime', 'decimal', 'dis', 'email', 'enum', 'errno', 'faulthandler',
+  'fcntl', 'filecmp', 'fileinput', 'fnmatch', 'fractions', 'ftplib', 'functools', 'gc', 'getopt',
+  'getpass', 'gettext', 'glob', 'gzip', 'hashlib', 'heapq', 'hmac', 'html', 'http', 'imaplib',
+  'importlib', 'inspect', 'io', 'ipaddress', 'itertools', 'json', 'keyword', 'linecache', 'locale',
+  'logging', 'lzma', 'mailbox', 'math', 'mimetypes', 'multiprocessing', 'numbers', 'operator', 'os',
+  'pathlib', 'pdb', 'pickle', 'pkgutil', 'platform', 'pprint', 'profile', 'pstats', 'queue', 'random',
+  're', 'readline', 'select', 'selectors', 'shelve', 'shlex', 'shutil', 'signal', 'site', 'socket',
+  'sqlite3', 'ssl', 'stat', 'statistics', 'string', 'struct', 'subprocess', 'sys', 'tarfile', 'tempfile',
+  'textwrap', 'threading', 'time', 'timeit', 'traceback', 'types', 'typing', 'unicodedata', 'unittest',
+  'urllib', 'uuid', 'venv', 'warnings', 'weakref', 'xml', 'xmlrpc', 'zipfile', 'zipimport', 'zlib', 'zoneinfo',
+]);
+
+// Common import root -> pip package name mismatches
+const PYTHON_IMPORT_TO_PACKAGE: Record<string, string> = {
+  yaml: 'pyyaml',
+  pil: 'pillow',
+  bs4: 'beautifulsoup4',
+  cv2: 'opencv-python',
+  dateutil: 'python-dateutil',
+  dotenv: 'python-dotenv',
+  jwt: 'pyjwt',
+  sklearn: 'scikit-learn',
+  slugify: 'python-slugify',
+  rest_framework: 'djangorestframework',
+  ruamel: 'ruamel.yaml',
+  attr: 'attrs',
+  six: 'six',
+};
+
+// Common PHP namespace roots -> composer package (best effort)
+const PHP_NAMESPACE_ALIASES: Record<string, string> = {
+  illuminate: 'laravel/framework',
+  guzzlehttp: 'guzzlehttp/guzzle',
+  carbon: 'nesbot/carbon',
+  monolog: 'monolog/monolog',
+  phpunit: 'phpunit/phpunit',
+  ramsey: 'ramsey/uuid',
+  symfony: '', // handled specially below (symfony/component-x)
+  doctrine: '', // handled specially below (doctrine/x)
+};
+
+function kebabCase(input: string): string {
+  return input
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/([A-Z])([A-Z][a-z])/g, '$1-$2')
+    .toLowerCase();
+}
+
+/** Resolves a PHP `use` statement to its Composer package name (vendor/package). */
+function resolvePhpPackage(useStatement: string): string | null {
+  const parts = useStatement.replace(/^\\+/, '').split('\\').filter(Boolean);
+  if (parts.length < 2) return null;
+  const vendor = parts[0].toLowerCase();
+  const projectRoots = new Set(['app', 'tests', 'database', 'config', 'psr', 'closure', 'laravel', 'generated']);
+  if (projectRoots.has(vendor)) return null;
+  if (vendor === 'symfony' && parts[1] && parts[1].toLowerCase() === 'component' && parts[2]) {
+    return `symfony/${kebabCase(parts[2])}`;
+  }
+  if (vendor === 'doctrine' && parts[1]) {
+    return `doctrine/${kebabCase(parts[1])}`;
+  }
+  const alias = PHP_NAMESPACE_ALIASES[vendor];
+  if (alias) return alias;
+  return `${vendor}/${kebabCase(parts[1])}`;
+}
+
+/** Extracts third-party import identifiers from a source file for the ecosystem. */
+function extractImports(ecosystem: DependencyEcosystem, content: string): string[] {
+  const imports = new Set<string>();
+  const add = (name?: string | null) => {
+    const trimmed = name?.trim();
+    if (trimmed) imports.add(trimmed);
+  };
+
+  switch (ecosystem) {
+    case 'node': {
+      const re = /(?:import\s+(?:[\s\S]*?\sfrom\s*)?|export\s+[\s\S]*?\sfrom\s*|require\s*\(\s*|import\s*\(\s*)['"]([^'"]+)['"]/g;
+      for (const m of content.matchAll(re)) {
+        let spec = m[1];
+        if (spec.startsWith('node:')) spec = spec.slice(5);
+        if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('#')) continue;
+        const top = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0];
+        if (!top || JS_BUILTINS.has(top)) continue;
+        add(top);
+      }
+      break;
+    }
+    case 'python': {
+      for (const m of content.matchAll(/^\s*from\s+([A-Za-z_][\w.]*)\s+import/gm)) {
+        const root = m[1].split('.')[0];
+        if (PYTHON_STDLIB.has(root)) continue;
+        add(PYTHON_IMPORT_TO_PACKAGE[root] || root);
+      }
+      for (const m of content.matchAll(/^[ \t]*import[ \t]+([A-Za-z_][\w., \t]*)/gm)) {
+        for (const part of m[1].split(',')) {
+          const root = part.trim().split(/\s+as\s+/)[0].trim().split('.')[0];
+          if (root && !PYTHON_STDLIB.has(root)) add(PYTHON_IMPORT_TO_PACKAGE[root] || root);
+        }
+      }
+      break;
+    }
+    case 'rust': {
+      for (const m of content.matchAll(/^\s*(?:pub\s+)?use\s+([A-Za-z_][\w]*)/gm)) {
+        const root = m[1];
+        if (['std', 'core', 'alloc', 'crate', 'self', 'super'].includes(root)) continue;
+        add(root);
+      }
+      for (const m of content.matchAll(/^\s*extern\s+crate\s+([A-Za-z_][\w]*)/gm)) add(m[1]);
+      break;
+    }
+    case 'go': {
+      // Extract quoted import paths (single and grouped imports); filtering by
+      // stdlib/internal happens in computeMissing (it needs the module path).
+      // Grouped imports: capture everything between import ( ... ) then take
+      // each quoted path line (optionally preceded by an alias).
+      for (const m of content.matchAll(/import\s*\(([^)]*)\)/g)) {
+        for (const q of m[1].matchAll(/^[ \t]*(?:[A-Za-z_.][\w.]*|_|\.)?[ \t]*"([^"]+)"/gm)) add(q[1]);
+      }
+      // Single-line imports: import "path" or import alias "path"
+      for (const m of content.matchAll(/\bimport[ \t]+(?:[A-Za-z_.][\w.]*|_|\.)?[ \t]*"([^"]+)"/g)) {
+        add(m[1]);
+      }
+      break;
+    }
+    case 'php': {
+      for (const m of content.matchAll(/^\s*use\s+([A-Za-z_][\w\\]*)\s*;/gm)) {
+        const pkg = resolvePhpPackage(m[1]);
+        if (pkg) add(pkg);
+      }
+      for (const m of content.matchAll(/^\s*(?:require|require_once|include|include_once)\s*\(?\s*['"]([^'"]+)['"]\s*\)?/gm)) {
+        const spec = m[1];
+        if (spec.startsWith('.') || spec.startsWith('/')) continue;
+        const parts = spec.split(/\/|\\/).filter(Boolean);
+        if (parts.length >= 2) add(`${parts[0].toLowerCase()}/${parts[1].toLowerCase()}`);
+      }
+      break;
+    }
+    case 'ruby': {
+      for (const m of content.matchAll(/^\s*require(?!_relative)\s+['"]([^'"]+)['"]/gm)) {
+        const spec = m[1];
+        if (['bundler', 'rubygems'].includes(spec)) continue;
+        add(spec.split('/')[0]);
+      }
+      break;
+    }
+    case 'java': {
+      for (const m of content.matchAll(/^\s*import\s+(?:static\s+)?([a-z_][\w]*(?:\.[a-zA-Z_]\w*)+)\s*;/gm)) {
+        const imp = m[1];
+        if (/^(java|javax|jdk|sun|com\.sun)\./.test(imp)) continue;
+        add(imp);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return Array.from(imports);
+}
+
+/** Compares extracted imports to declared dependency keys; returns the missing packages to install. */
+function computeMissing(
+  ecosystem: DependencyEcosystem,
+  imports: string[],
+  declaredKeys: Set<string>,
+  modulePath?: string
+): string[] {
+  const missing = new Set<string>();
+  const isDeclared = (name: string) => declaredKeys.has(dependencyKey(name));
+
+  for (const imp of imports) {
+    switch (ecosystem) {
+      case 'go': {
+        const lower = imp.toLowerCase();
+        const first = lower.split('/')[0];
+        if (!first.includes('.')) continue; // Go standard library
+        if (modulePath && (lower === modulePath || lower.startsWith(modulePath + '/'))) continue; // internal
+        let covered = false;
+        for (const key of declaredKeys) {
+          if (lower === key || lower.startsWith(key + '/')) {
+            covered = true;
+            break;
+          }
+        }
+        if (covered) continue;
+        const segs = lower.split('/');
+        let module: string;
+        if (lower.startsWith('gopkg.in/')) module = segs.slice(0, 2).join('/');
+        else if (lower.startsWith('golang.org/x/')) module = segs.slice(0, 3).join('/');
+        else if (segs[0].includes('.') && segs.length >= 3) module = segs.slice(0, 3).join('/');
+        else module = segs[0];
+        missing.add(module);
+        break;
+      }
+      case 'java': {
+        const parts = imp.toLowerCase().split('.');
+        let covered = false;
+        // Prefix match of groupIds (e.g. org.springframework) against ancestor prefixes
+        for (let end = parts.length; end >= 2 && !covered; end--) {
+          if (declaredKeys.has(dependencyKey(parts.slice(0, end).join('.')))) covered = true;
+        }
+        // Single-segment artifactId match (e.g. "gson")
+        if (!covered) {
+          for (const part of parts) {
+            if (declaredKeys.has(dependencyKey(part))) {
+              covered = true;
+              break;
+            }
+          }
+        }
+        if (!covered) missing.add(parts.slice(0, 3).join('.'));
+        break;
+      }
+      default: {
+        if (!isDeclared(imp)) missing.add(imp);
+      }
+    }
+  }
+  return Array.from(missing).sort();
+}
+
+app.post('/api/github/analyze-dependencies', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+
+  const repo = typeof req.body?.repo === 'string' ? req.body.repo.trim().replace(/^\/+|\/+$/g, '') : '';
+  const branch = typeof req.body?.branch === 'string' && req.body.branch.trim() ? req.body.branch.trim() : 'main';
+  const rawPaths: string[] = Array.isArray(req.body?.filePaths)
+    ? req.body.filePaths.filter((f: unknown): f is string => typeof f === 'string')
+    : [];
+  const filePaths = Array.from(
+    new Set(rawPaths.map((p) => p.trim().replace(/^\/+/, '').replace(/\/+$/, '')).filter(Boolean))
+  );
+
+  if (!repo || !GITHUB_REPO_FULL_NAME_RE.test(repo) || /\/\.{1,2}$/.test(repo)) {
+    return res.status(400).json({ error: 'Invalid repository. Use the owner/repo format (e.g. facebook/react).' });
+  }
+  if (branch.length > 255 || /[\u0000-\u001f\u007f]/.test(branch)) {
+    return res.status(400).json({ error: 'Invalid branch name.' });
+  }
+  if (filePaths.length === 0) {
+    return res.status(400).json({ error: 'Please enter at least one file path to analyze.' });
+  }
+  if (filePaths.length > DEPENDENCY_MAX_SCAN_FILES) {
+    return res.status(400).json({ error: `Too many file paths. Analyze at most ${DEPENDENCY_MAX_SCAN_FILES} files at a time.` });
+  }
+
+  const ecosystem = detectEcosystem(filePaths);
+  const ecosystemLabel = ECOSYSTEM_LABELS[ecosystem];
+
+  // C++ / C# / unknown: no in-scope package manager — fail gracefully.
+  if (ecosystem === 'csharp' || ecosystem === 'cpp' || ecosystem === 'unknown') {
+    return res.json({
+      ecosystem,
+      ecosystemLabel,
+      supported: false,
+      manifestFound: false,
+      manifestFiles: [],
+      scannedFiles: 0,
+      checkedImports: 0,
+      missingPackages: [],
+      message: 'Dependency verification is not supported for this language ecosystem yet.',
+    });
+  }
+
+  const connection = await getStoredGitHubConnection(userEmail);
+  if (!connection) {
+    return res.status(404).json({ error: 'No GitHub account is connected. Connect GitHub to continue.', code: 'github_not_connected' });
+  }
+
+  const [owner, repoName] = repo.split('/');
+  const encodedRepo = `${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`;
+  const encodedBranch = encodeURIComponent(branch);
+
+  try {
+    let authExpired = false;
+
+    // 1. Fetch the manifest file(s) for the detected ecosystem from the repo root
+    const manifestCandidates = ECOSYSTEM_MANIFESTS[ecosystem] || [];
+    const manifestFiles = new Map<string, string>();
+    await Promise.all(
+      manifestCandidates.map(async (name) => {
+        const resp = await githubApiFetch(
+          connection.token,
+          `/repos/${encodedRepo}/contents/${encodeURIComponent(name)}?ref=${encodedBranch}`
+        );
+        if (resp.status === 401) {
+          authExpired = true;
+          return;
+        }
+        if (!resp.ok) return; // missing manifest candidate — fine
+        const data = await resp.json();
+        const content = decodeGitHubFileContent(data);
+        if (content !== null) manifestFiles.set(name, content);
+      })
+    );
+
+    if (authExpired) {
+      await deleteStoredGitHubConnection(userEmail);
+      return res.status(401).json({
+        error: 'Your GitHub authorization has expired. Reconnect GitHub to continue.',
+        code: 'github_reconnect_required',
+      });
+    }
+
+    if (manifestFiles.size === 0) {
+      return res.json({
+        ecosystem,
+        ecosystemLabel,
+        supported: true,
+        manifestFound: false,
+        manifestFiles: [],
+        scannedFiles: 0,
+        checkedImports: 0,
+        missingPackages: [],
+        message: 'Manifest file (e.g., package.json, requirements.txt) not found in repository root. Unable to verify dependencies.',
+      });
+    }
+
+    // 2. Parse the manifest(s) into a set of declared dependency keys
+    const { keys: declaredKeys, modulePath } = extractDeclaredDependencies(ecosystem, manifestFiles);
+
+    // 3. Fetch the source files relevant to the ecosystem and extract imports
+    const exts = Object.entries(ECOSYSTEM_FILE_EXTENSIONS)
+      .filter(([, eco]) => eco === ecosystem)
+      .map(([ext]) => ext);
+    const sourcePaths = filePaths
+      .filter((p) => {
+        const m = /\.[A-Za-z0-9]+$/.exec(p);
+        return m ? exts.includes(m[0].toLowerCase()) : false;
+      })
+      .slice(0, DEPENDENCY_MAX_SCAN_FILES);
+
+    const allImports = new Set<string>();
+    let scannedFiles = 0;
+    let cursor = 0;
+
+    async function worker() {
+      while (cursor < sourcePaths.length && !authExpired) {
+        const cleanPath = sourcePaths[cursor++];
+        const encodedPath = cleanPath
+          .split('/')
+          .filter(Boolean)
+          .map((segment) => encodeURIComponent(segment))
+          .join('/');
+        try {
+          const resp = await githubApiFetch(
+            connection!.token,
+            `/repos/${encodedRepo}/contents/${encodedPath}?ref=${encodedBranch}`
+          );
+          if (resp.status === 401) {
+            authExpired = true;
+            return;
+          }
+          if (!resp.ok) continue;
+          const data = await resp.json();
+          if (Array.isArray(data)) continue; // directory listing
+          if (typeof data?.size === 'number' && data.size > DEPENDENCY_MAX_FILE_BYTES) continue;
+          const content = decodeGitHubFileContent(data);
+          if (content === null) continue;
+          scannedFiles++;
+          for (const imp of extractImports(ecosystem, content)) allImports.add(imp);
+        } catch {
+          // Skip unreadable files; other files still contribute to the analysis
+        }
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(DEPENDENCY_FETCH_CONCURRENCY, sourcePaths.length) }, () => worker())
+    );
+
+    if (authExpired) {
+      await deleteStoredGitHubConnection(userEmail);
+      return res.status(401).json({
+        error: 'Your GitHub authorization has expired. Reconnect GitHub to continue.',
+        code: 'github_reconnect_required',
+      });
+    }
+
+    // 4. Compare imports against the declared dependencies
+    const imports = Array.from(allImports);
+    const missingPackages = computeMissing(ecosystem, imports, declaredKeys, modulePath);
+
+    return res.json({
+      ecosystem,
+      ecosystemLabel,
+      supported: true,
+      manifestFound: true,
+      manifestFiles: Array.from(manifestFiles.keys()),
+      scannedFiles,
+      checkedImports: imports.length,
+      missingPackages,
+    });
+  } catch (err) {
+    console.error('GitHub dependency analysis proxy error:', err);
+    return res.status(502).json({ error: 'Could not reach GitHub to analyze dependencies. Please try again.' });
+  }
+});
+
 function generateFileSuggestions(filePath: string): string[] {
   const parts = filePath.split('/');
   const filename = parts[parts.length - 1];

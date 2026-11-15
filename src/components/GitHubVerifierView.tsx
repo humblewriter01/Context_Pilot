@@ -7,6 +7,7 @@ import {
   type GitHubRepoSummary,
   type GitHubConnectionStatus,
   type GitHubRepoStructure,
+  type GitHubDependencyAnalysis,
 } from '../services/github';
 import { storageService } from '../services/storage';
 import { getOrInitSupabase } from '../services/supabase';
@@ -26,7 +27,9 @@ import {
   Copy,
   Check,
   Zap,
-  X
+  X,
+  PackageSearch,
+  AlertTriangle
 } from 'lucide-react';
 
 interface GitHubVerifierViewProps {
@@ -102,6 +105,85 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     const timer = setTimeout(() => setToast(null), 4500);
     return () => clearTimeout(timer);
   }, [toast]);
+
+  // Universal dependency verification state (polyglot)
+  const [depResult, setDepResult] = useState<GitHubDependencyAnalysis | null>(null);
+  const [depLoading, setDepLoading] = useState(false);
+  const [depCopied, setDepCopied] = useState(false);
+
+  useEffect(() => {
+    if (!depCopied) return;
+    const timer = setTimeout(() => setDepCopied(false), 1800);
+    return () => clearTimeout(timer);
+  }, [depCopied]);
+
+  const handleAnalyzeDependencies = async () => {
+    const targetRepo = normalizeRepoFullName(repoName);
+    if (!githubConnected) {
+      setToast({ text: 'Connect with GitHub before analyzing dependencies.' });
+      return;
+    }
+    if (!targetRepo) {
+      setToast({ text: 'Select a valid repository (owner/repo) before analyzing dependencies.' });
+      return;
+    }
+    const filePaths = filesInput
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (filePaths.length === 0) {
+      setToast({ text: 'Enter at least one file path to analyze.' });
+      return;
+    }
+    setDepLoading(true);
+    setDepResult(null);
+    try {
+      const res = await githubService.analyzeDependencies(targetRepo, filePaths, branch.trim() || 'main');
+      setDepResult(res);
+    } catch (err: any) {
+      console.error('[Dependency analysis]', err);
+      if (err?.status === 401 || err?.code === 'github_not_connected' || err?.code === 'github_reconnect_required') {
+        setConnection({ connected: false, login: null, avatarUrl: null, scopes: [] });
+        setToast({ text: 'GitHub authorization expired. Reconnect GitHub to analyze dependencies.' });
+      } else {
+        setToast({ text: err?.message || 'Failed to analyze dependencies. Please try again.' });
+      }
+    } finally {
+      setDepLoading(false);
+    }
+  };
+
+  /** Builds the ecosystem-specific remediation snippet for the missing packages. */
+  const buildDependencyFix = (analysis: GitHubDependencyAnalysis): { caption: string; command: string } => {
+    const pkgs = analysis.missingPackages;
+    switch (analysis.ecosystem) {
+      case 'node':
+        return { caption: 'Install the missing packages', command: `npm install ${pkgs.join(' ')}` };
+      case 'python':
+        return {
+          caption: 'Install the missing packages (or add them to requirements.txt)',
+          command: `pip install ${pkgs.join(' ')}`,
+        };
+      case 'rust':
+        return { caption: 'Add the missing crates', command: `cargo add ${pkgs.join(' ')}` };
+      case 'go':
+        return { caption: 'Fetch the missing modules', command: `go get ${pkgs.join(' ')}` };
+      case 'php':
+        return { caption: 'Require the missing packages', command: `composer require ${pkgs.join(' ')}` };
+      case 'ruby':
+        return {
+          caption: 'Add the following gems to your Gemfile',
+          command: pkgs.map((p) => `gem '${p}'`).join('\n'),
+        };
+      case 'java':
+        return {
+          caption: 'Add these as dependencies in pom.xml (<dependency>) or build.gradle',
+          command: pkgs.map((p) => `• ${p}`).join('\n'),
+        };
+      default:
+        return { caption: 'Install the missing packages', command: pkgs.join(' ') };
+    }
+  };
 
   /**
    * Verifies a single suggested path (from "Potential paths") against the
@@ -647,6 +729,29 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 </>
               )}
             </button>
+
+            <button
+              type="button"
+              onClick={handleAnalyzeDependencies}
+              disabled={depLoading || loading || !repoName.trim() || !githubConnected}
+              className="w-full py-2.5 px-4 bg-white hover:bg-slate-50 border border-slate-300 text-slate-800 font-semibold rounded-lg text-sm shadow-2xs transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+              title="Scan imports in the paths above against the repository's package manifest (package.json, requirements.txt, Cargo.toml, go.mod, composer.json, Gemfile, pom.xml / build.gradle)"
+            >
+              {depLoading ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin text-indigo-500" />
+                  <span>Checking Dependencies…</span>
+                </>
+              ) : (
+                <>
+                  <PackageSearch className="w-4 h-4 text-indigo-600" />
+                  <span>Check Dependencies</span>
+                </>
+              )}
+            </button>
+            <p className="text-[10px] text-slate-400 leading-snug -mt-3">
+              Polyglot: detects Node.js, Python, Rust, Go, PHP, Ruby, and Java from the file extensions, then compares imports against the repo's root manifest.
+            </p>
           </form>
 
           {structure && structure.detectedFiles?.length > 0 && (
@@ -670,6 +775,97 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
 
         {/* Results Panel */}
         <div className="lg:col-span-2 space-y-6">
+          {/* Universal Dependency Verification Card */}
+          {depResult && (
+            <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-2xs space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2 min-w-0">
+                  <PackageSearch className="w-4 h-4 text-indigo-600 shrink-0" />
+                  <span>Dependency Check</span>
+                  {depResult.ecosystemLabel && (
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 whitespace-nowrap">
+                      {depResult.ecosystemLabel}
+                    </span>
+                  )}
+                </h3>
+                {depResult.supported && depResult.manifestFound && (
+                  <span className="text-[10px] text-slate-400 font-mono shrink-0">
+                    {depResult.scannedFiles} files · {depResult.checkedImports} imports · {depResult.manifestFiles.join(' + ')}
+                  </span>
+                )}
+              </div>
+
+              {/* Unsupported ecosystem or missing manifest */}
+              {!depResult.supported || !depResult.manifestFound || depResult.message ? (
+                <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-xs flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-amber-500" />
+                  <span>{depResult.message || 'Dependency verification could not be completed for this repository.'}</span>
+                </div>
+              ) : depResult.missingPackages.length === 0 ? (
+                <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>All imported packages are declared in <span className="font-mono">{depResult.manifestFiles.join(', ')}</span>. Your dependency manifest looks complete.</span>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <p className="text-xs text-rose-800 font-semibold flex items-center gap-1.5">
+                    <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                    {depResult.missingPackages.length} imported {depResult.missingPackages.length === 1 ? 'package is' : 'packages are'} not declared in {depResult.manifestFiles.join(', ')}:
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {depResult.missingPackages.map((pkg) => (
+                      <span
+                        key={pkg}
+                        className="px-2 py-0.5 rounded-md bg-rose-50 text-rose-700 border border-rose-200 font-mono text-[11px] max-w-[260px] truncate"
+                        title={pkg}
+                      >
+                        {pkg}
+                      </span>
+                    ))}
+                  </div>
+                  {(() => {
+                    const fix = buildDependencyFix(depResult);
+                    return (
+                      <div className="rounded-lg border border-slate-200 bg-slate-950 overflow-hidden">
+                        <div className="flex items-center justify-between gap-3 px-3 py-1.5 border-b border-slate-800">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 truncate">
+                            {fix.caption}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard?.writeText?.(fix.command);
+                              setDepCopied(true);
+                            }}
+                            className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-slate-300 hover:text-white transition-colors"
+                          >
+                            {depCopied ? (
+                              <>
+                                <Check className="w-3 h-3 text-emerald-400" />
+                                <span className="text-emerald-400">Copied!</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3 h-3" />
+                                <span>Copy</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                        <pre className="px-3 py-2.5 text-[11px] font-mono text-emerald-300 overflow-x-auto whitespace-pre leading-relaxed">
+                          {fix.command}
+                        </pre>
+                      </div>
+                    );
+                  })()}
+                  <p className="text-[10px] text-slate-400 leading-snug">
+                    Best-effort analysis: import-to-package mapping is heuristic and may include project-internal modules. Review the list before changing your manifest.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+
           {result ? (
             <div className="space-y-6">
               {/* Rate & Summary Banner */}
