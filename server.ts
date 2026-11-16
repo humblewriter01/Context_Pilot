@@ -3415,6 +3415,145 @@ app.get('/api/github/repos', authenticateUser, async (req: express.Request, res:
   }
 });
 
+// GET /api/github/branches?repo=owner/repo - Branches for the branch picker.
+//
+// GitHub's "List branches" endpoint has no sort parameter, so the closest
+// approximation of "the 100 most recent branches" is one page of up to 100
+// branches, ordered newest-first using the repository activity feed (pushes
+// inside the last 31 days). The default branch is always pinned first, and the
+// activity lookup is best effort: if it is unavailable the alphabetical order
+// GitHub returns is kept.
+const GITHUB_MAX_BRANCHES = 100;
+
+interface GitHubBranchSummary {
+  name: string;
+  sha: string;
+  protected: boolean;
+  isDefault: boolean;
+  pushedAt: string | null;
+}
+
+/**
+ * Orders branches for the picker: the default branch first (the UI preselects
+ * it), then most recently pushed (from the activity feed), then the rest
+ * alphabetically. Pure so the ordering is easy to reason about and test.
+ */
+function orderBranchesForPicker(
+  branches: Array<{ name: string; sha: string; protected: boolean }>,
+  defaultBranch: string | null,
+  pushedAt: Map<string, string>
+): GitHubBranchSummary[] {
+  const enriched = branches.map((entry) => ({
+    name: entry.name,
+    sha: entry.sha,
+    protected: entry.protected,
+    isDefault: defaultBranch !== null && entry.name === defaultBranch,
+    pushedAt: pushedAt.get(entry.name) ?? null,
+  }));
+
+  return enriched.sort((a, b) => {
+    if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
+    const aTime = a.pushedAt ? Date.parse(a.pushedAt) : NaN;
+    const bTime = b.pushedAt ? Date.parse(b.pushedAt) : NaN;
+    const aDated = Number.isFinite(aTime);
+    const bDated = Number.isFinite(bTime);
+    if (aDated !== bDated) return aDated ? -1 : 1;
+    if (aDated && bDated && aTime !== bTime) return bTime - aTime;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+app.get('/api/github/branches', authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userEmail = (req as any).userEmail as string;
+  const repo = typeof req.query?.repo === 'string' ? req.query.repo.trim().replace(/^\/+|\/+$/g, '') : '';
+
+  if (!repo || !GITHUB_REPO_FULL_NAME_RE.test(repo) || /\/\.{1,2}$/.test(repo)) {
+    return res.status(400).json({ error: 'Invalid repository. Use the owner/repo format (e.g. facebook/react).' });
+  }
+
+  const connection = await getStoredGitHubConnection(userEmail);
+  if (!connection) {
+    return res.status(404).json({ error: 'No GitHub account is connected. Connect GitHub to continue.', code: 'github_not_connected' });
+  }
+
+  const [owner, repoName] = repo.split('/');
+  const encodedRepo = `${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`;
+
+  try {
+    // Repository metadata tells us the default branch (and that the repo is visible).
+    const metaRes = await githubApiFetch(connection.token, `/repos/${encodedRepo}`);
+    if (!metaRes.ok) {
+      if (metaRes.status === 404) {
+        return res.status(404).json({
+          error: `Repository "${repo}" was not found or your GitHub account cannot access it.`,
+          code: 'github_repo_not_found',
+        });
+      }
+      const failure = await githubUpstreamError(metaRes, userEmail, 'read this repository');
+      return res.status(failure.status).json(failure.body);
+    }
+    const meta = await metaRes.json();
+    const defaultBranch = typeof meta?.default_branch === 'string' && meta.default_branch ? meta.default_branch : null;
+
+    const listRes = await githubApiFetch(connection.token, `/repos/${encodedRepo}/branches?per_page=${GITHUB_MAX_BRANCHES}`);
+    if (!listRes.ok) {
+      const failure = await githubUpstreamError(listRes, userEmail, 'list the branches of this repository');
+      return res.status(failure.status).json(failure.body);
+    }
+
+    const rawBranches = await listRes.json();
+    const parsed: Array<{ name: string; sha: string; protected: boolean }> = [];
+    if (Array.isArray(rawBranches)) {
+      for (const item of rawBranches) {
+        if (!item || typeof item.name !== 'string' || !item.name) continue;
+        parsed.push({
+          name: item.name,
+          sha: typeof item.commit?.sha === 'string' ? item.commit.sha : '',
+          protected: Boolean(item.protected),
+        });
+      }
+    }
+
+    // Any further pages are dropped: the picker stays a single, predictable page.
+    const link = listRes.headers.get('link');
+    const truncated = link !== null
+      ? /rel="next"/.test(link)
+      : Array.isArray(rawBranches) && rawBranches.length >= GITHUB_MAX_BRANCHES;
+
+    // Best-effort recency: activity events carry the ref that was pushed, newest first.
+    const pushedAt = new Map<string, string>();
+    try {
+      const activityRes = await githubApiFetch(connection.token, `/repos/${encodedRepo}/activity?per_page=100`);
+      if (activityRes.ok) {
+        const events = await activityRes.json();
+        if (Array.isArray(events)) {
+          for (const event of events) {
+            if (!event || typeof event.ref !== 'string' || typeof event.timestamp !== 'string') continue;
+            const ref = event.ref.replace(/^refs\/heads\//, '');
+            if (!ref || pushedAt.has(ref)) continue; // feed is newest-first
+            pushedAt.set(ref, event.timestamp);
+          }
+        }
+      }
+    } catch {
+      // Ordering is cosmetic; the alphabetical GitHub order is still usable.
+    }
+
+    const branches = orderBranchesForPicker(parsed, defaultBranch, pushedAt);
+
+    return res.json({
+      repo,
+      defaultBranch,
+      branches,
+      truncated,
+      total: branches.length,
+    });
+  } catch (err) {
+    console.error('GitHub branches proxy error:', err);
+    return res.status(502).json({ error: 'Could not reach GitHub to list the branches. Please try again.' });
+  }
+});
+
 // POST /api/github/verify - Verify file paths (and repo structure) server-side.
 // Body: { repo: "owner/repo", branch?: string, files: string[] }
 app.post('/api/github/verify', authenticateUser, async (req: express.Request, res: express.Response) => {
@@ -3679,6 +3818,37 @@ const ECOSYSTEM_MANIFESTS: Partial<Record<DependencyEcosystem, string[]>> = {
 const DEPENDENCY_MAX_SCAN_FILES = 30;
 const DEPENDENCY_MAX_FILE_BYTES = 512 * 1024;
 const DEPENDENCY_FETCH_CONCURRENCY = 4;
+/** How many parent directories to try above a file's own directory (monorepos). */
+const DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH = 3;
+/** Upper bound on GitHub directory listings spent discovering a manifest. */
+const DEPENDENCY_MAX_DIRECTORY_LISTINGS = 12;
+
+/**
+ * Directories to try when resolving the manifest of one source file, ordered
+ * from the file's own directory up to (at most) three ancestors. The most
+ * specific directory is searched first, so `frontend/src/App.tsx` prefers
+ * `frontend/package.json` over the repository root manifest.
+ */
+function manifestSearchDirectories(filePath: string): string[] {
+  const segments = filePath.split('/').filter((segment) => segment !== '');
+  segments.pop(); // drop the file name — its directory is the first candidate
+  // Anything deeper than three levels above the file is out of scope.
+  const maxDepth = Math.min(segments.length, DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH);
+  const directories: string[] = [];
+  for (let depth = 0; depth <= maxDepth; depth += 1) {
+    directories.push(segments.slice(0, segments.length - depth).join('/'));
+  }
+  return directories;
+}
+
+/** Joins a repository-relative directory and file name into an API-safe path. */
+function encodeRepoContentPath(filePath: string): string {
+  return filePath
+    .split('/')
+    .filter((segment) => segment !== '')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
 
 /** Canonical key so import names and manifest names compare across separators and scopes. */
 function dependencyKey(name: string): string {
@@ -4124,6 +4294,92 @@ function computeMissing(
   return Array.from(missing).sort();
 }
 
+interface ManifestDiscovery {
+  /** Repository-relative directory the manifest was found in ('' = repo root). */
+  directory: string;
+  /** Repository-relative manifest paths, in ECOSYSTEM_MANIFESTS priority order. */
+  manifestPaths: string[];
+}
+
+/**
+ * Hierarchical manifest discovery for monorepos.
+ *
+ * Every source file contributes its own directory plus its ancestors (up to
+ * DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH), and the resulting directories are
+ * probed deepest-first. That makes the closest manifest to the analysed code
+ * win, so `frontend/src/App.tsx` resolves to `frontend/package.json` even when
+ * a root `package.json` also exists, while a shallow file still falls back to
+ * the root manifest.
+ *
+ * Each candidate directory is a single listing request, de-duplicated across
+ * files and capped by DEPENDENCY_MAX_DIRECTORY_LISTINGS, and every request
+ * pins `ref={branch}` so discovery follows the branch selected in the UI.
+ *
+ * @returns the nearest manifest directory, or null when nothing was found.
+ */
+async function discoverDependencyManifest(options: {
+  token: string;
+  encodedRepo: string;
+  encodedBranch: string;
+  ecosystem: DependencyEcosystem;
+  sourcePaths: string[];
+}): Promise<{ discovery: ManifestDiscovery | null; authExpired: boolean }> {
+  const { token, encodedRepo, encodedBranch, ecosystem, sourcePaths } = options;
+  const manifestCandidates = ECOSYSTEM_MANIFESTS[ecosystem] || [];
+  if (manifestCandidates.length === 0) return { discovery: null, authExpired: false };
+
+  const manifestCandidatesByName = new Map(manifestCandidates.map((name) => [name.toLowerCase(), name]));
+
+  // Collect candidate directories across all files, deepest first. Ties keep
+  // the order in which the paths were submitted.
+  const candidates: Array<{ directory: string; depth: number; order: number }> = [];
+  const seen = new Set<string>();
+  let order = 0;
+  for (const sourcePath of sourcePaths) {
+    for (const directory of manifestSearchDirectories(sourcePath)) {
+      if (seen.has(directory)) continue;
+      seen.add(directory);
+      candidates.push({ directory, depth: directory ? directory.split('/').length : 0, order: order++ });
+    }
+  }
+  candidates.sort((a, b) => (b.depth - a.depth) || (a.order - b.order));
+
+  let listings = 0;
+  for (const { directory } of candidates) {
+    if (listings >= DEPENDENCY_MAX_DIRECTORY_LISTINGS) break;
+    listings += 1;
+
+    const encodedDirectory = encodeRepoContentPath(directory);
+    const contentsPath = encodedDirectory
+      ? `/repos/${encodedRepo}/contents/${encodedDirectory}?ref=${encodedBranch}`
+      : `/repos/${encodedRepo}/contents?ref=${encodedBranch}`;
+    const listingRes = await githubApiFetch(token, contentsPath);
+    if (listingRes.status === 401) return { discovery: null, authExpired: true };
+    // 404 = directory does not exist, 403 = no access: the parent may still work.
+    if (!listingRes.ok) continue;
+
+    const entries = await listingRes.json();
+    if (!Array.isArray(entries)) continue; // a file, not a directory
+
+    const found = new Map<string, string>();
+    for (const entry of entries) {
+      if (!entry || entry.type !== 'file' || typeof entry.name !== 'string') continue;
+      const candidateName = manifestCandidatesByName.get(entry.name.toLowerCase());
+      if (candidateName && !found.has(candidateName)) found.set(candidateName, entry.name);
+    }
+    if (found.size === 0) continue;
+
+    // Report the exact on-disk casing, ordered by manifest priority.
+    const manifestPaths = manifestCandidates
+      .filter((name) => found.has(name))
+      .map((name) => (directory ? `${directory}/${found.get(name)}` : (found.get(name) as string)));
+
+    return { discovery: { directory, manifestPaths }, authExpired: false };
+  }
+
+  return { discovery: null, authExpired: false };
+}
+
 app.post('/api/github/analyze-dependencies', authenticateUser, async (req: express.Request, res: express.Response) => {
   const userEmail = (req as any).userEmail as string;
 
@@ -4159,7 +4415,10 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
       ecosystemLabel,
       supported: false,
       manifestFound: false,
+      manifestPath: null,
+      manifestDirectory: null,
       manifestFiles: [],
+      searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
       scannedFiles: 0,
       checkedImports: 0,
       missingPackages: [],
@@ -4179,23 +4438,82 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
   try {
     let authExpired = false;
 
-    // 1. Fetch the manifest file(s) for the detected ecosystem from the repo root
-    const manifestCandidates = ECOSYSTEM_MANIFESTS[ecosystem] || [];
+    // 1. Source files relevant to the detected ecosystem (manifest search starts here).
+    const exts = Object.entries(ECOSYSTEM_FILE_EXTENSIONS)
+      .filter(([, eco]) => eco === ecosystem)
+      .map(([ext]) => ext);
+    const sourcePaths = filePaths
+      .filter((p) => {
+        const m = /\.[A-Za-z0-9]+$/.exec(p);
+        return m ? exts.includes(m[0].toLowerCase()) : false;
+      })
+      .slice(0, DEPENDENCY_MAX_SCAN_FILES);
+
+    // 2. Hierarchical manifest discovery: the file's own directory first, then up
+    //    to three ancestors (monorepo support). Always pinned to `branch`.
+    const { discovery, authExpired: discoveryAuthExpired } = await discoverDependencyManifest({
+      token: connection.token,
+      encodedRepo,
+      encodedBranch,
+      ecosystem,
+      sourcePaths,
+    });
+    if (discoveryAuthExpired) {
+      await deleteStoredGitHubConnection(userEmail);
+      return res.status(401).json({
+        error: 'Your GitHub authorization has expired. Reconnect GitHub to continue.',
+        code: 'github_reconnect_required',
+      });
+    }
+
+    if (!discovery) {
+      return res.json({
+        ecosystem,
+        ecosystemLabel,
+        supported: true,
+        manifestFound: false,
+        manifestPath: null,
+        manifestDirectory: null,
+        manifestFiles: [],
+        searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
+        scannedFiles: 0,
+        checkedImports: 0,
+        missingPackages: [],
+        message: `No manifest file (e.g. ${ECOSYSTEM_MANIFESTS[ecosystem]?.[0] || 'package.json'}) was found in the analysed files' directory or up to ${DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH} parent directories on branch "${branch}". Unable to verify dependencies.`,
+      });
+    }
+
+    // 3. Fetch the discovered manifest file(s), keyed by their canonical name so
+    //    the existing parsers keep working regardless of the directory.
     const manifestFiles = new Map<string, string>();
+    const manifestPaths = discovery.manifestPaths;
+    const manifestBaseNames = new Map<string, string>(); // exact path -> canonical name
+    for (const manifestPath of manifestPaths) {
+      const baseName = manifestPath.split('/').pop() as string;
+      const canonical = (ECOSYSTEM_MANIFESTS[ecosystem] || []).find(
+        (name) => name.toLowerCase() === baseName.toLowerCase()
+      );
+      if (canonical) manifestBaseNames.set(manifestPath, canonical);
+    }
+
     await Promise.all(
-      manifestCandidates.map(async (name) => {
-        const resp = await githubApiFetch(
-          connection.token,
-          `/repos/${encodedRepo}/contents/${encodeURIComponent(name)}?ref=${encodedBranch}`
-        );
-        if (resp.status === 401) {
-          authExpired = true;
-          return;
+      Array.from(manifestBaseNames.entries()).map(async ([manifestPath, canonicalName]) => {
+        try {
+          const resp = await githubApiFetch(
+            connection.token,
+            `/repos/${encodedRepo}/contents/${encodeRepoContentPath(manifestPath)}?ref=${encodedBranch}`
+          );
+          if (resp.status === 401) {
+            authExpired = true;
+            return;
+          }
+          if (!resp.ok) return;
+          const data = await resp.json();
+          const content = decodeGitHubFileContent(data);
+          if (content !== null) manifestFiles.set(canonicalName, content);
+        } catch {
+          // A single unreadable manifest should not abort the analysis.
         }
-        if (!resp.ok) return; // missing manifest candidate — fine
-        const data = await resp.json();
-        const content = decodeGitHubFileContent(data);
-        if (content !== null) manifestFiles.set(name, content);
       })
     );
 
@@ -4208,33 +4526,27 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
     }
 
     if (manifestFiles.size === 0) {
+      // The directory listing advertised a manifest but its content was unreadable.
       return res.json({
         ecosystem,
         ecosystemLabel,
         supported: true,
         manifestFound: false,
+        manifestPath: null,
+        manifestDirectory: null,
         manifestFiles: [],
+        searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
         scannedFiles: 0,
         checkedImports: 0,
         missingPackages: [],
-        message: 'Manifest file (e.g., package.json, requirements.txt) not found in repository root. Unable to verify dependencies.',
+        message: `A manifest was located in ${discovery.directory ? `"${discovery.directory}"` : 'the repository root'} but its contents could not be read from branch "${branch}".`,
       });
     }
 
-    // 2. Parse the manifest(s) into a set of declared dependency keys
+    // 4. Parse the manifest(s) into a set of declared dependency keys
     const { keys: declaredKeys, modulePath } = extractDeclaredDependencies(ecosystem, manifestFiles);
 
-    // 3. Fetch the source files relevant to the ecosystem and extract imports
-    const exts = Object.entries(ECOSYSTEM_FILE_EXTENSIONS)
-      .filter(([, eco]) => eco === ecosystem)
-      .map(([ext]) => ext);
-    const sourcePaths = filePaths
-      .filter((p) => {
-        const m = /\.[A-Za-z0-9]+$/.exec(p);
-        return m ? exts.includes(m[0].toLowerCase()) : false;
-      })
-      .slice(0, DEPENDENCY_MAX_SCAN_FILES);
-
+    // 5. Fetch the source files relevant to the ecosystem and extract imports
     const allImports = new Set<string>();
     let scannedFiles = 0;
     let cursor = 0;
@@ -4282,16 +4594,26 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
       });
     }
 
-    // 4. Compare imports against the declared dependencies
+    // 6. Compare imports against the declared dependencies
     const imports = Array.from(allImports);
     const missingPackages = computeMissing(ecosystem, imports, declaredKeys, modulePath);
+
+    // Only report manifests that were actually read, keeping the priority order.
+    const resolvedManifestPaths = manifestPaths.filter((manifestPath) => {
+      const canonical = manifestBaseNames.get(manifestPath);
+      return Boolean(canonical && manifestFiles.has(canonical));
+    });
 
     return res.json({
       ecosystem,
       ecosystemLabel,
       supported: true,
       manifestFound: true,
-      manifestFiles: Array.from(manifestFiles.keys()),
+      // Exact repository-relative path, e.g. "frontend/package.json".
+      manifestPath: resolvedManifestPaths[0] || null,
+      manifestDirectory: discovery.directory || null,
+      manifestFiles: resolvedManifestPaths,
+      searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
       scannedFiles,
       checkedImports: imports.length,
       missingPackages,

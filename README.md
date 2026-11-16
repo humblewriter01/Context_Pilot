@@ -81,7 +81,8 @@ Then run `supabase/schema.sql` in the Supabase SQL editor. GitHub verification u
 redirect. The frontend captures it in that moment (`onAuthStateChange` / initial session) and posts it to
 `POST /api/user/github-token`, which stores it **encrypted at rest** (AES-256-GCM) in `public.user_github_tokens`.
 The verifier then reads connection status from `GET /api/user/github-token` and every GitHub API call (repository list,
-file verification) is proxied by the backend (`GET /api/github/repos`, `POST /api/github/verify`). The raw token never
+branch list, file verification, dependency analysis) is proxied by the backend (`GET /api/github/repos`,
+`GET /api/github/branches`, `POST /api/github/verify`, `POST /api/github/analyze-dependencies`). The raw token never
 returns to the browser, and the connection survives refreshes, sign-outs and serverless cold starts. Users can remove
 the stored authorization with the **Disconnect** button (`DELETE /api/user/github-token`); account deletion removes it too.
 
@@ -159,7 +160,9 @@ Context Pilot includes a production `render.yaml` blueprint:
 | `GET /api/user/github-token` | Supabase JWT | GitHub connection status only — never the token. |
 | `DELETE /api/user/github-token` | Supabase JWT | Disconnect GitHub (removes the stored token). |
 | `GET /api/github/repos` | Supabase JWT | Proxied GitHub repository list using the stored token. |
+| `GET /api/github/branches?repo={owner}/{repo}` | Supabase JWT | Proxied branch list for the branch picker: default branch pinned first, then the 100 most recent branches. |
 | `POST /api/github/verify` | Supabase JWT | Proxied file-path verification + repo structure snapshot. |
+| `POST /api/github/analyze-dependencies` | Supabase JWT | Polyglot import check against a manifest discovered hierarchically (the file's directory, then up to 3 parents) on the selected branch; returns the exact `manifestPath` (e.g. `frontend/package.json`). |
 | `DELETE /api/history/:id` | Supabase JWT (owner only) | Delete one record (UUID or ticket key). |
 | `POST /api/feedback` / `GET /api/feedback` | Supabase JWT | Accuracy feedback, scoped to the caller. |
 | `POST /api/paystack/initialize` | public | Server-priced checkout (client amounts are ignored). |
