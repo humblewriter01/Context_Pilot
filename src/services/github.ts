@@ -42,6 +42,28 @@ export interface GitHubRepoStructure {
   detectedFiles: string[];
 }
 
+/** A branch of a repository, as returned by GET /api/github/branches. */
+export interface GitHubBranchSummary {
+  name: string;
+  /** Commit SHA at the branch tip (empty when GitHub omits it). */
+  sha: string;
+  protected: boolean;
+  isDefault: boolean;
+  /** Last push seen in the repository activity feed, ISO 8601, when known. */
+  pushedAt: string | null;
+}
+
+export interface GitHubBranchListing {
+  /** `owner/repo` the branches belong to. */
+  repo: string;
+  /** The repository's default branch (`main`, `master`, …), when known. */
+  defaultBranch: string | null;
+  branches: GitHubBranchSummary[];
+  /** True when the repository has more branches than were returned. */
+  truncated: boolean;
+  total: number;
+}
+
 export type DependencyEcosystem =
   | 'node'
   | 'python'
@@ -60,10 +82,19 @@ export interface GitHubDependencyAnalysis {
   ecosystemLabel?: string;
   /** False for ecosystems with no in-scope package manager (e.g. C++, C#). */
   supported: boolean;
-  /** False when no manifest file exists in the repository root. */
+  /** False when no manifest file was found up to 3 directories above the sources. */
   manifestFound: boolean;
-  /** Manifest files that were found and parsed. */
+  /**
+   * Exact repository-relative path of the manifest that was parsed, e.g.
+   * `frontend/package.json` for a monorepo. Null when none was found.
+   */
+  manifestPath: string | null;
+  /** Directory holding the manifest (`''` for the repository root). */
+  manifestDirectory: string | null;
+  /** Manifest files that were found and parsed (repository-relative paths). */
   manifestFiles: string[];
+  /** How many parent directories above each source file were searched. */
+  searchDepth?: number;
   scannedFiles: number;
   checkedImports: number;
   /** Third-party packages that are imported but not declared in the manifest. */
@@ -259,9 +290,22 @@ export const githubService = {
   },
 
   /**
+   * Lists the branches of a repository for the branch picker
+   * (GET /api/github/branches?repo=owner/repo). The default branch is pinned
+   * first; at most 100 branches are returned.
+   */
+  async listBranches(repoName: string, signal?: AbortSignal): Promise<GitHubBranchListing> {
+    const res = await authorizedFetch(`/api/github/branches?repo=${encodeURIComponent(repoName)}`, { signal });
+    if (!res.ok) throw await toApiError(res, 'Could not load the branches of this repository.');
+    return (await res.json()) as GitHubBranchListing;
+  },
+
+  /**
    * Analyzes the dependency manifest for the repository and reports imported
    * third-party packages that are not declared (POST /api/github/analyze-dependencies).
-   * Supports Node.js, Python, Rust, Go, PHP, Ruby, and Java.
+   * Supports Node.js, Python, Rust, Go, PHP, Ruby, and Java. The manifest is
+   * discovered hierarchically, so monorepo packages resolve to their own
+   * manifest (e.g. `frontend/package.json`).
    */
   async analyzeDependencies(
     repoName: string,

@@ -8,11 +8,13 @@ import {
   type GitHubConnectionStatus,
   type GitHubRepoStructure,
   type GitHubDependencyAnalysis,
+  type GitHubBranchSummary,
 } from '../services/github';
 import { storageService } from '../services/storage';
 import { getOrInitSupabase } from '../services/supabase';
 import { describeAuthError } from '../services/authErrors';
 import { RepoPicker } from './RepoPicker';
+import { BranchPicker } from './BranchPicker';
 import {
   GitBranch,
   CheckCircle2,
@@ -29,11 +31,27 @@ import {
   Zap,
   X,
   PackageSearch,
-  AlertTriangle
+  AlertTriangle,
+  FolderTree
 } from 'lucide-react';
 
 interface GitHubVerifierViewProps {
   initialFiles?: string[];
+}
+
+/**
+ * Monospace list of the manifests that were parsed, including their directory
+ * (e.g. `frontend/package.json`), so monorepo discoveries are unambiguous.
+ * Falls back to the manifest file names for older API responses.
+ */
+function manifestDisplayPaths(analysis: GitHubDependencyAnalysis): string {
+  const paths =
+    analysis.manifestFiles && analysis.manifestFiles.length > 0
+      ? analysis.manifestFiles
+      : analysis.manifestPath
+        ? [analysis.manifestPath]
+        : [];
+  return paths.join(', ');
 }
 
 export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialFiles }) => {
@@ -59,10 +77,23 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
   // Manual owner/repo entry: the fallback for public repositories the account does not own.
   const [manualEntry, setManualEntry] = useState(false);
 
+  // Branches of the selected repository (GitHub: GET /repos/{owner}/{repo}/branches).
+  const [branches, setBranches] = useState<GitHubBranchSummary[]>([]);
+  const [repoDefaultBranch, setRepoDefaultBranch] = useState<string | null>(null);
+  const [branchesLoading, setBranchesLoading] = useState(false);
+  const [branchesError, setBranchesError] = useState<string | null>(null);
+  const [branchesTruncated, setBranchesTruncated] = useState(false);
+  const [branchReloadKey, setBranchReloadKey] = useState(0);
+  // Manual branch entry: the fallback for branches missing from the list (edge cases).
+  const [manualBranch, setManualBranch] = useState(false);
+
   // Latest values for async callbacks that must not re-run when they change.
   const repoNameRef = useRef(repoName);
   repoNameRef.current = repoName;
   const branchEditedRef = useRef(false);
+  // Repository a branch was explicitly chosen for (list or manual entry). While
+  // this is null or names another repository, the default branch wins.
+  const branchChosenForRepoRef = useRef<string | null>(null);
 
   const [filesInput, setFilesInput] = useState<string>(() => {
     if (initialFiles && initialFiles.length > 0) {
@@ -384,20 +415,95 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
     return () => controller.abort();
   }, [githubConnected, repoReloadKey]);
 
+  // Load the branches whenever a valid repository is selected, so the picker is
+  // ready before the visitor opens it. Re-runs on repo change and on refresh.
+  const normalizedRepoName = normalizeRepoFullName(repoName);
+  useEffect(() => {
+    if (!githubConnected || !normalizedRepoName) {
+      setBranches([]);
+      setRepoDefaultBranch(null);
+      setBranchesLoading(false);
+      setBranchesError(null);
+      setBranchesTruncated(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    setBranchesLoading(true);
+    setBranchesError(null);
+
+    githubService
+      .listBranches(normalizedRepoName, controller.signal)
+      .then((listing) => {
+        if (controller.signal.aborted) return;
+        setBranches(listing.branches);
+        setBranchesTruncated(listing.truncated);
+        setRepoDefaultBranch(listing.defaultBranch);
+
+        // Default the selection to the repository's default branch (usually
+        // main or master) unless the visitor already picked a branch for this
+        // same repository (a refresh must not overwrite that choice).
+        const chosenForSameRepo =
+          branchChosenForRepoRef.current !== null &&
+          branchChosenForRepoRef.current.toLowerCase() === normalizedRepoName.toLowerCase();
+        if (!chosenForSameRepo) {
+          const fallback =
+            listing.defaultBranch ||
+            listing.branches.find((entry) => entry.isDefault)?.name ||
+            '';
+          if (fallback) {
+            branchEditedRef.current = false;
+            setBranch(fallback);
+            branchChosenForRepoRef.current = null;
+          }
+        }
+      })
+      .catch((err: any) => {
+        if (controller.signal.aborted) return;
+        console.error('[GitHub branches]', err);
+        setBranches([]);
+        setBranchesTruncated(false);
+        if (err?.status === 401 || err?.code === 'github_not_connected' || err?.code === 'github_reconnect_required') {
+          setConnection({ connected: false, login: null, avatarUrl: null, scopes: [] });
+          setBranchesError(err.message);
+          return;
+        }
+        setBranchesError(err?.message || 'Could not load the branches of this repository.');
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setBranchesLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [githubConnected, normalizedRepoName, branchReloadKey]);
+
   const handleRepoSelect = (repo: GitHubRepoSummary) => {
     setRepoName(repo.fullName);
     setBranch(repo.defaultBranch);
     branchEditedRef.current = false;
+    branchChosenForRepoRef.current = null;
+    setManualBranch(false);
     setErrorMsg(null);
   };
 
   const handleUseCustomRepo = (fullName: string) => {
     setRepoName(fullName);
     setManualEntry(true);
+    branchEditedRef.current = false;
+    branchChosenForRepoRef.current = null;
+    setManualBranch(false);
+    setErrorMsg(null);
+  };
+
+  const handleBranchSelect = (branchName: string) => {
+    branchEditedRef.current = true;
+    branchChosenForRepoRef.current = normalizeRepoFullName(repoName) || null;
+    setBranch(branchName);
     setErrorMsg(null);
   };
 
   const reloadRepos = () => setRepoReloadKey((key) => key + 1);
+  const reloadBranches = () => setBranchReloadKey((key) => key + 1);
 
   // Private repositories are only listed when the `repo` scope was granted.
   const privateReposHidden = tokenScopes !== null && !tokenScopes.includes('repo');
@@ -675,17 +781,78 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
             </div>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">Branch</label>
-              <input
-                type="text"
-                placeholder="main"
-                value={branch}
-                onChange={(e) => {
-                  branchEditedRef.current = true;
-                  setBranch(e.target.value);
-                }}
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-indigo-500 font-mono"
-              />
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <label
+                  htmlFor="verifier-branch-input"
+                  className="block text-xs font-semibold text-slate-700 uppercase"
+                >
+                  Branch
+                </label>
+                {githubConnected && (
+                  <button
+                    type="button"
+                    onClick={() => setManualBranch((manual) => !manual)}
+                    className="text-[11px] text-indigo-600 hover:text-indigo-800 font-medium shrink-0 whitespace-nowrap"
+                  >
+                    {manualBranch ? 'Choose from branches' : 'Enter manually'}
+                  </button>
+                )}
+              </div>
+
+              {githubConnected && !manualBranch ? (
+                <BranchPicker
+                  id="verifier-branch-input"
+                  branches={branches}
+                  defaultBranch={repoDefaultBranch}
+                  value={branch}
+                  onSelect={handleBranchSelect}
+                  onRefresh={reloadBranches}
+                  loading={branchesLoading}
+                  error={branchesError}
+                  truncated={branchesTruncated}
+                  disabled={!normalizedRepoName}
+                  emptyHint={
+                    normalizedRepoName
+                      ? 'No branches were returned for this repository.'
+                      : 'Select a repository to load its branches.'
+                  }
+                />
+              ) : (
+                <input
+                  id="verifier-branch-input"
+                  type="text"
+                  placeholder={repoDefaultBranch || 'main'}
+                  value={branch}
+                  onChange={(e) => {
+                    branchEditedRef.current = true;
+                    branchChosenForRepoRef.current = normalizeRepoFullName(repoName) || null;
+                    setBranch(e.target.value);
+                  }}
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-indigo-500 font-mono"
+                />
+              )}
+
+              {githubConnected && manualBranch && (
+                <p className="mt-1 text-[11px] text-slate-500">
+                  For branch names the list does not show (for example a pull-request ref).
+                </p>
+              )}
+
+              {githubConnected && !manualBranch && branchesError && (
+                <p className="mt-1 text-[11px] text-amber-700">
+                  {branchesError}{' '}
+                  <button
+                    type="button"
+                    onClick={reloadBranches}
+                    disabled={branchesLoading}
+                    className="font-semibold underline hover:text-amber-900 disabled:opacity-50"
+                  >
+                    {branchesLoading ? 'Retrying…' : 'Retry'}
+                  </button>
+                </p>
+              )}
             </div>
 
             <div>
@@ -750,7 +917,8 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
               )}
             </button>
             <p className="text-[10px] text-slate-400 leading-snug -mt-3">
-              Polyglot: detects Node.js, Python, Rust, Go, PHP, Ruby, and Java from the file extensions, then compares imports against the repo's root manifest.
+              Polyglot: detects Node.js, Python, Rust, Go, PHP, Ruby, and Java from the file extensions, then compares imports
+              against the nearest manifest — monorepo aware: the file's own directory is checked first, then up to 3 parent directories.
             </p>
           </form>
 
@@ -790,10 +958,31 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 </h3>
                 {depResult.supported && depResult.manifestFound && (
                   <span className="text-[10px] text-slate-400 font-mono shrink-0">
-                    {depResult.scannedFiles} files · {depResult.checkedImports} imports · {depResult.manifestFiles.join(' + ')}
+                    {depResult.scannedFiles} files · {depResult.checkedImports} imports · {manifestDisplayPaths(depResult)}
                   </span>
                 )}
               </div>
+
+              {/* Where the manifest was resolved from — makes monorepo discovery transparent. */}
+              {depResult.supported && depResult.manifestFound && depResult.manifestPath ? (
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500">
+                  <FolderTree className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                  <span>Manifest located at</span>
+                  <span className="font-mono font-semibold text-slate-700">{depResult.manifestPath}</span>
+                  {depResult.manifestDirectory ? (
+                    <span className="text-[10px] bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full px-1.5 py-px">
+                      monorepo sub-directory
+                    </span>
+                  ) : (
+                    <span className="text-[10px] bg-slate-100 text-slate-600 border border-slate-200 rounded-full px-1.5 py-px">
+                      repository root
+                    </span>
+                  )}
+                  <span className="text-[10px] text-slate-400">
+                    on branch <span className="font-mono">{branch.trim() || 'main'}</span>
+                  </span>
+                </div>
+              ) : null}
 
               {/* Unsupported ecosystem or missing manifest */}
               {!depResult.supported || !depResult.manifestFound || depResult.message ? (
@@ -804,13 +993,21 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
               ) : depResult.missingPackages.length === 0 ? (
                 <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-2">
                   <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span>All imported packages are declared in <span className="font-mono">{depResult.manifestFiles.join(', ')}</span>. Your dependency manifest looks complete.</span>
+                  <span>
+                    {(() => {
+                      const paths = manifestDisplayPaths(depResult);
+                      return paths
+                        ? `All imported packages are declared in ${paths}.`
+                        : 'All imported packages are declared in the dependency manifest.';
+                    })()}{' '}
+                    Your dependency manifest looks complete.
+                  </span>
                 </div>
               ) : (
                 <div className="space-y-3">
                   <p className="text-xs text-rose-800 font-semibold flex items-center gap-1.5">
                     <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
-                    {depResult.missingPackages.length} imported {depResult.missingPackages.length === 1 ? 'package is' : 'packages are'} not declared in {depResult.manifestFiles.join(', ')}:
+                    {depResult.missingPackages.length} imported {depResult.missingPackages.length === 1 ? 'package is' : 'packages are'} not declared in {manifestDisplayPaths(depResult) || 'the dependency manifest'}:
                   </p>
                   <div className="flex flex-wrap gap-1.5">
                     {depResult.missingPackages.map((pkg) => (

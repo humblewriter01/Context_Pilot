@@ -2543,6 +2543,100 @@ app.get("/api/github/repos", authenticateUser, async (req, res) => {
     return res.status(502).json({ error: "Could not reach GitHub to list your repositories. Please try again." });
   }
 });
+var GITHUB_MAX_BRANCHES = 100;
+function orderBranchesForPicker(branches, defaultBranch, pushedAt) {
+  const enriched = branches.map((entry) => ({
+    name: entry.name,
+    sha: entry.sha,
+    protected: entry.protected,
+    isDefault: defaultBranch !== null && entry.name === defaultBranch,
+    pushedAt: pushedAt.get(entry.name) ?? null
+  }));
+  return enriched.sort((a, b) => {
+    if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
+    const aTime = a.pushedAt ? Date.parse(a.pushedAt) : NaN;
+    const bTime = b.pushedAt ? Date.parse(b.pushedAt) : NaN;
+    const aDated = Number.isFinite(aTime);
+    const bDated = Number.isFinite(bTime);
+    if (aDated !== bDated) return aDated ? -1 : 1;
+    if (aDated && bDated && aTime !== bTime) return bTime - aTime;
+    return a.name.localeCompare(b.name);
+  });
+}
+app.get("/api/github/branches", authenticateUser, async (req, res) => {
+  const userEmail = req.userEmail;
+  const repo = typeof req.query?.repo === "string" ? req.query.repo.trim().replace(/^\/+|\/+$/g, "") : "";
+  if (!repo || !GITHUB_REPO_FULL_NAME_RE.test(repo) || /\/\.{1,2}$/.test(repo)) {
+    return res.status(400).json({ error: "Invalid repository. Use the owner/repo format (e.g. facebook/react)." });
+  }
+  const connection = await getStoredGitHubConnection(userEmail);
+  if (!connection) {
+    return res.status(404).json({ error: "No GitHub account is connected. Connect GitHub to continue.", code: "github_not_connected" });
+  }
+  const [owner, repoName] = repo.split("/");
+  const encodedRepo = `${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`;
+  try {
+    const metaRes = await githubApiFetch(connection.token, `/repos/${encodedRepo}`);
+    if (!metaRes.ok) {
+      if (metaRes.status === 404) {
+        return res.status(404).json({
+          error: `Repository "${repo}" was not found or your GitHub account cannot access it.`,
+          code: "github_repo_not_found"
+        });
+      }
+      const failure = await githubUpstreamError(metaRes, userEmail, "read this repository");
+      return res.status(failure.status).json(failure.body);
+    }
+    const meta = await metaRes.json();
+    const defaultBranch = typeof meta?.default_branch === "string" && meta.default_branch ? meta.default_branch : null;
+    const listRes = await githubApiFetch(connection.token, `/repos/${encodedRepo}/branches?per_page=${GITHUB_MAX_BRANCHES}`);
+    if (!listRes.ok) {
+      const failure = await githubUpstreamError(listRes, userEmail, "list the branches of this repository");
+      return res.status(failure.status).json(failure.body);
+    }
+    const rawBranches = await listRes.json();
+    const parsed = [];
+    if (Array.isArray(rawBranches)) {
+      for (const item of rawBranches) {
+        if (!item || typeof item.name !== "string" || !item.name) continue;
+        parsed.push({
+          name: item.name,
+          sha: typeof item.commit?.sha === "string" ? item.commit.sha : "",
+          protected: Boolean(item.protected)
+        });
+      }
+    }
+    const link = listRes.headers.get("link");
+    const truncated = link !== null ? /rel="next"/.test(link) : Array.isArray(rawBranches) && rawBranches.length >= GITHUB_MAX_BRANCHES;
+    const pushedAt = /* @__PURE__ */ new Map();
+    try {
+      const activityRes = await githubApiFetch(connection.token, `/repos/${encodedRepo}/activity?per_page=100`);
+      if (activityRes.ok) {
+        const events = await activityRes.json();
+        if (Array.isArray(events)) {
+          for (const event of events) {
+            if (!event || typeof event.ref !== "string" || typeof event.timestamp !== "string") continue;
+            const ref = event.ref.replace(/^refs\/heads\//, "");
+            if (!ref || pushedAt.has(ref)) continue;
+            pushedAt.set(ref, event.timestamp);
+          }
+        }
+      }
+    } catch {
+    }
+    const branches = orderBranchesForPicker(parsed, defaultBranch, pushedAt);
+    return res.json({
+      repo,
+      defaultBranch,
+      branches,
+      truncated,
+      total: branches.length
+    });
+  } catch (err) {
+    console.error("GitHub branches proxy error:", err);
+    return res.status(502).json({ error: "Could not reach GitHub to list the branches. Please try again." });
+  }
+});
 app.post("/api/github/verify", authenticateUser, async (req, res) => {
   const userEmail = req.userEmail;
   const repo = typeof req.body?.repo === "string" ? req.body.repo.trim().replace(/^\/+|\/+$/g, "") : "";
@@ -2770,6 +2864,21 @@ var ECOSYSTEM_MANIFESTS = {
 var DEPENDENCY_MAX_SCAN_FILES = 30;
 var DEPENDENCY_MAX_FILE_BYTES = 512 * 1024;
 var DEPENDENCY_FETCH_CONCURRENCY = 4;
+var DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH = 3;
+var DEPENDENCY_MAX_DIRECTORY_LISTINGS = 12;
+function manifestSearchDirectories(filePath) {
+  const segments = filePath.split("/").filter((segment) => segment !== "");
+  segments.pop();
+  const maxDepth = Math.min(segments.length, DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH);
+  const directories = [];
+  for (let depth = 0; depth <= maxDepth; depth += 1) {
+    directories.push(segments.slice(0, segments.length - depth).join("/"));
+  }
+  return directories;
+}
+function encodeRepoContentPath(filePath) {
+  return filePath.split("/").filter((segment) => segment !== "").map((segment) => encodeURIComponent(segment)).join("/");
+}
 function dependencyKey(name) {
   return name.trim().toLowerCase().replace(/^@/, "").replace(/[._]+/g, "-").replace(/-+/g, "-").replace(/^[-/]+|[-/]+$/g, "");
 }
@@ -3294,6 +3403,45 @@ function computeMissing(ecosystem, imports, declaredKeys, modulePath) {
   }
   return Array.from(missing).sort();
 }
+async function discoverDependencyManifest(options) {
+  const { token, encodedRepo, encodedBranch, ecosystem, sourcePaths } = options;
+  const manifestCandidates = ECOSYSTEM_MANIFESTS[ecosystem] || [];
+  if (manifestCandidates.length === 0) return { discovery: null, authExpired: false };
+  const manifestCandidatesByName = new Map(manifestCandidates.map((name) => [name.toLowerCase(), name]));
+  const candidates = [];
+  const seen = /* @__PURE__ */ new Set();
+  let order = 0;
+  for (const sourcePath of sourcePaths) {
+    for (const directory of manifestSearchDirectories(sourcePath)) {
+      if (seen.has(directory)) continue;
+      seen.add(directory);
+      candidates.push({ directory, depth: directory ? directory.split("/").length : 0, order: order++ });
+    }
+  }
+  candidates.sort((a, b) => b.depth - a.depth || a.order - b.order);
+  let listings = 0;
+  for (const { directory } of candidates) {
+    if (listings >= DEPENDENCY_MAX_DIRECTORY_LISTINGS) break;
+    listings += 1;
+    const encodedDirectory = encodeRepoContentPath(directory);
+    const contentsPath = encodedDirectory ? `/repos/${encodedRepo}/contents/${encodedDirectory}?ref=${encodedBranch}` : `/repos/${encodedRepo}/contents?ref=${encodedBranch}`;
+    const listingRes = await githubApiFetch(token, contentsPath);
+    if (listingRes.status === 401) return { discovery: null, authExpired: true };
+    if (!listingRes.ok) continue;
+    const entries = await listingRes.json();
+    if (!Array.isArray(entries)) continue;
+    const found = /* @__PURE__ */ new Map();
+    for (const entry of entries) {
+      if (!entry || entry.type !== "file" || typeof entry.name !== "string") continue;
+      const candidateName = manifestCandidatesByName.get(entry.name.toLowerCase());
+      if (candidateName && !found.has(candidateName)) found.set(candidateName, entry.name);
+    }
+    if (found.size === 0) continue;
+    const manifestPaths = manifestCandidates.filter((name) => found.has(name)).map((name) => directory ? `${directory}/${found.get(name)}` : found.get(name));
+    return { discovery: { directory, manifestPaths }, authExpired: false };
+  }
+  return { discovery: null, authExpired: false };
+}
 app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) => {
   const userEmail = req.userEmail;
   const repo = typeof req.body?.repo === "string" ? req.body.repo.trim().replace(/^\/+|\/+$/g, "") : "";
@@ -3322,7 +3470,10 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
       ecosystemLabel,
       supported: false,
       manifestFound: false,
+      manifestPath: null,
+      manifestDirectory: null,
       manifestFiles: [],
+      searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
       scannedFiles: 0,
       checkedImports: 0,
       missingPackages: [],
@@ -3338,22 +3489,68 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
   const encodedBranch = encodeURIComponent(branch);
   try {
     let authExpired = false;
-    const manifestCandidates = ECOSYSTEM_MANIFESTS[ecosystem] || [];
+    const exts = Object.entries(ECOSYSTEM_FILE_EXTENSIONS).filter(([, eco]) => eco === ecosystem).map(([ext]) => ext);
+    const sourcePaths = filePaths.filter((p) => {
+      const m = /\.[A-Za-z0-9]+$/.exec(p);
+      return m ? exts.includes(m[0].toLowerCase()) : false;
+    }).slice(0, DEPENDENCY_MAX_SCAN_FILES);
+    const { discovery, authExpired: discoveryAuthExpired } = await discoverDependencyManifest({
+      token: connection.token,
+      encodedRepo,
+      encodedBranch,
+      ecosystem,
+      sourcePaths
+    });
+    if (discoveryAuthExpired) {
+      await deleteStoredGitHubConnection(userEmail);
+      return res.status(401).json({
+        error: "Your GitHub authorization has expired. Reconnect GitHub to continue.",
+        code: "github_reconnect_required"
+      });
+    }
+    if (!discovery) {
+      return res.json({
+        ecosystem,
+        ecosystemLabel,
+        supported: true,
+        manifestFound: false,
+        manifestPath: null,
+        manifestDirectory: null,
+        manifestFiles: [],
+        searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
+        scannedFiles: 0,
+        checkedImports: 0,
+        missingPackages: [],
+        message: `No manifest file (e.g. ${ECOSYSTEM_MANIFESTS[ecosystem]?.[0] || "package.json"}) was found in the analysed files' directory or up to ${DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH} parent directories on branch "${branch}". Unable to verify dependencies.`
+      });
+    }
     const manifestFiles = /* @__PURE__ */ new Map();
+    const manifestPaths = discovery.manifestPaths;
+    const manifestBaseNames = /* @__PURE__ */ new Map();
+    for (const manifestPath of manifestPaths) {
+      const baseName = manifestPath.split("/").pop();
+      const canonical = (ECOSYSTEM_MANIFESTS[ecosystem] || []).find(
+        (name) => name.toLowerCase() === baseName.toLowerCase()
+      );
+      if (canonical) manifestBaseNames.set(manifestPath, canonical);
+    }
     await Promise.all(
-      manifestCandidates.map(async (name) => {
-        const resp = await githubApiFetch(
-          connection.token,
-          `/repos/${encodedRepo}/contents/${encodeURIComponent(name)}?ref=${encodedBranch}`
-        );
-        if (resp.status === 401) {
-          authExpired = true;
-          return;
+      Array.from(manifestBaseNames.entries()).map(async ([manifestPath, canonicalName]) => {
+        try {
+          const resp = await githubApiFetch(
+            connection.token,
+            `/repos/${encodedRepo}/contents/${encodeRepoContentPath(manifestPath)}?ref=${encodedBranch}`
+          );
+          if (resp.status === 401) {
+            authExpired = true;
+            return;
+          }
+          if (!resp.ok) return;
+          const data = await resp.json();
+          const content = decodeGitHubFileContent(data);
+          if (content !== null) manifestFiles.set(canonicalName, content);
+        } catch {
         }
-        if (!resp.ok) return;
-        const data = await resp.json();
-        const content = decodeGitHubFileContent(data);
-        if (content !== null) manifestFiles.set(name, content);
       })
     );
     if (authExpired) {
@@ -3369,19 +3566,17 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
         ecosystemLabel,
         supported: true,
         manifestFound: false,
+        manifestPath: null,
+        manifestDirectory: null,
         manifestFiles: [],
+        searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
         scannedFiles: 0,
         checkedImports: 0,
         missingPackages: [],
-        message: "Manifest file (e.g., package.json, requirements.txt) not found in repository root. Unable to verify dependencies."
+        message: `A manifest was located in ${discovery.directory ? `"${discovery.directory}"` : "the repository root"} but its contents could not be read from branch "${branch}".`
       });
     }
     const { keys: declaredKeys, modulePath } = extractDeclaredDependencies(ecosystem, manifestFiles);
-    const exts = Object.entries(ECOSYSTEM_FILE_EXTENSIONS).filter(([, eco]) => eco === ecosystem).map(([ext]) => ext);
-    const sourcePaths = filePaths.filter((p) => {
-      const m = /\.[A-Za-z0-9]+$/.exec(p);
-      return m ? exts.includes(m[0].toLowerCase()) : false;
-    }).slice(0, DEPENDENCY_MAX_SCAN_FILES);
     const allImports = /* @__PURE__ */ new Set();
     let scannedFiles = 0;
     let cursor = 0;
@@ -3422,12 +3617,20 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
     }
     const imports = Array.from(allImports);
     const missingPackages = computeMissing(ecosystem, imports, declaredKeys, modulePath);
+    const resolvedManifestPaths = manifestPaths.filter((manifestPath) => {
+      const canonical = manifestBaseNames.get(manifestPath);
+      return Boolean(canonical && manifestFiles.has(canonical));
+    });
     return res.json({
       ecosystem,
       ecosystemLabel,
       supported: true,
       manifestFound: true,
-      manifestFiles: Array.from(manifestFiles.keys()),
+      // Exact repository-relative path, e.g. "frontend/package.json".
+      manifestPath: resolvedManifestPaths[0] || null,
+      manifestDirectory: discovery.directory || null,
+      manifestFiles: resolvedManifestPaths,
+      searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
       scannedFiles,
       checkedImports: imports.length,
       missingPackages
