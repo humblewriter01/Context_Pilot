@@ -2637,6 +2637,108 @@ app.get("/api/github/branches", authenticateUser, async (req, res) => {
     return res.status(502).json({ error: "Could not reach GitHub to list the branches. Please try again." });
   }
 });
+var MONOREPO_PACKAGE_DIRECTORIES = [
+  "client",
+  "frontend",
+  "web",
+  "app",
+  "apps",
+  "packages",
+  "server",
+  "backend",
+  "api",
+  "services"
+];
+var FRONTEND_SOURCE_DIRECTORIES = ["src", "pages", "components", "public"];
+var FRONTEND_MANIFESTS = ["package.json", "tsconfig.json", "vite.config.js", "vite.config.ts", "next.config.js", "next.config.mjs"];
+async function readRepositoryStructure(token, encodedRepo, encodedBranch) {
+  const commonFiles = [
+    "package.json",
+    "tsconfig.json",
+    "requirements.txt",
+    "Dockerfile",
+    "docker-compose.yml",
+    "pom.xml",
+    "go.mod",
+    "Cargo.toml",
+    "README.md"
+  ];
+  const detectedFiles = [];
+  const rootNames = /* @__PURE__ */ new Set();
+  const directoryNames = /* @__PURE__ */ new Set();
+  try {
+    const structureRes = await githubApiFetch(token, `/repos/${encodedRepo}/contents?ref=${encodedBranch}`);
+    if (structureRes.ok) {
+      const contents = await structureRes.json();
+      if (Array.isArray(contents)) {
+        for (const item of contents) {
+          if (!item || typeof item.name !== "string") continue;
+          if (item.type === "dir") directoryNames.add(item.name);
+          else rootNames.add(item.name);
+        }
+        for (const cf of commonFiles) {
+          if (rootNames.has(cf)) detectedFiles.push(cf);
+        }
+      }
+    }
+  } catch {
+  }
+  const hasRootNodeManifest = rootNames.has("package.json");
+  const hasRootHostManifest = rootNames.has("requirements.txt") || rootNames.has("pom.xml") || rootNames.has("go.mod") || rootNames.has("Cargo.toml") || rootNames.has("Dockerfile") || rootNames.has("docker-compose.yml");
+  const scannedDirectories = [];
+  let packageHasFrontendSources = false;
+  let packageDirWithManifest = null;
+  let packageDirWithSources = null;
+  if (!hasRootNodeManifest && !hasRootHostManifest) {
+    const candidates = MONOREPO_PACKAGE_DIRECTORIES.filter((dir) => directoryNames.has(dir));
+    const probes = candidates.slice(0, 4);
+    for (const dir of probes) {
+      scannedDirectories.push(dir);
+      try {
+        const res = await githubApiFetch(
+          token,
+          `/repos/${encodedRepo}/contents/${encodeRepoContentPath(dir)}?ref=${encodedBranch}`
+        );
+        if (!res.ok) continue;
+        const entries = await res.json();
+        if (!Array.isArray(entries)) continue;
+        const names = new Set(
+          entries.filter((item) => item && typeof item.name === "string").map((item) => item.name)
+        );
+        const fileNames = new Set(
+          entries.filter((item) => item && item.type === "file" && typeof item.name === "string").map((item) => item.name)
+        );
+        const manifest = FRONTEND_MANIFESTS.find((name) => fileNames.has(name));
+        if (manifest) {
+          detectedFiles.push(`${dir}/${manifest}`);
+          if (!packageDirWithManifest) packageDirWithManifest = dir;
+        }
+        const hasFrontendSources = FRONTEND_SOURCE_DIRECTORIES.some(
+          (sub) => names.has(sub) && entries.some((item) => item.name === sub && item.type === "dir")
+        );
+        if (hasFrontendSources) {
+          if (!packageDirWithSources) packageDirWithSources = dir;
+          if (manifest && FRONTEND_MANIFESTS.includes(manifest)) packageHasFrontendSources = true;
+        }
+      } catch {
+      }
+    }
+  }
+  const hasNodeManifest = hasRootNodeManifest || detectedFiles.some((f) => /(^|\/)package\.json$/.test(f));
+  const hasPythonOrJavaManifest = rootNames.has("requirements.txt") || rootNames.has("pom.xml") || rootNames.has("go.mod");
+  const hasDockerFiles = rootNames.has("Dockerfile") || rootNames.has("docker-compose.yml");
+  const likelyFrontend = hasNodeManifest && (hasRootNodeManifest || packageHasFrontendSources);
+  return {
+    detectedFiles,
+    hasNodeManifest,
+    hasPythonOrJavaManifest,
+    hasDockerFiles,
+    likelyFrontend,
+    monorepo: !hasRootNodeManifest && (Boolean(packageDirWithManifest) || Boolean(packageDirWithSources)),
+    scannedDirectories,
+    packageHasFrontendSources
+  };
+}
 app.post("/api/github/verify", authenticateUser, async (req, res) => {
   const userEmail = req.userEmail;
   const repo = typeof req.body?.repo === "string" ? req.body.repo.trim().replace(/^\/+|\/+$/g, "") : "";
@@ -2739,34 +2841,11 @@ app.post("/api/github/verify", authenticateUser, async (req, res) => {
         code: "github_reconnect_required"
       });
     }
-    const commonFiles = [
-      "package.json",
-      "tsconfig.json",
-      "requirements.txt",
-      "Dockerfile",
-      "docker-compose.yml",
-      "pom.xml",
-      "go.mod",
-      "Cargo.toml",
-      "README.md"
-    ];
-    const detectedFiles = [];
-    try {
-      const structureRes = await githubApiFetch(connection.token, `/repos/${encodedRepo}/contents?ref=${encodedBranch}`);
-      if (structureRes.ok) {
-        const contents = await structureRes.json();
-        if (Array.isArray(contents)) {
-          const names = new Set(contents.map((item) => item.name));
-          for (const cf of commonFiles) {
-            if (names.has(cf)) detectedFiles.push(cf);
-          }
-        }
-      }
-    } catch {
-    }
-    const hasPackageJson = detectedFiles.includes("package.json");
-    const hasPythonOrJava = detectedFiles.includes("requirements.txt") || detectedFiles.includes("pom.xml") || detectedFiles.includes("go.mod");
-    const hasDocker = detectedFiles.includes("Dockerfile") || detectedFiles.includes("docker-compose.yml");
+    const structure = await readRepositoryStructure(connection.token, encodedRepo, encodedBranch);
+    const detectedFiles = structure.detectedFiles;
+    const hasPackageJson = structure.hasNodeManifest;
+    const hasPythonOrJava = structure.hasPythonOrJavaManifest;
+    const hasDocker = structure.hasDockerFiles;
     const total = verifiedFiles.length + missingFiles.length;
     const verificationRate = total > 0 ? verifiedFiles.length / total : 0;
     const order = new Map(cleanPaths.map((p, i) => [p, i]));
@@ -2784,10 +2863,16 @@ app.post("/api/github/verify", authenticateUser, async (req, res) => {
         checkedAt: (/* @__PURE__ */ new Date()).toISOString()
       },
       structure: {
-        likelyFrontend: hasPackageJson,
+        likelyFrontend: structure.likelyFrontend || hasPackageJson,
         likelyBackend: hasPythonOrJava || hasPackageJson && hasDocker,
         likelyFullstack: hasPackageJson && (hasPythonOrJava || hasDocker),
-        detectedFiles
+        detectedFiles,
+        /** Manifests/app files are in these sub-directories, not the root. */
+        monorepo: structure.monorepo,
+        /** Sub-directories that were probed, e.g. ["client", "frontend"]. */
+        scannedDirectories: structure.scannedDirectories,
+        /** True when a frontend-style source tree was detected in a package dir. */
+        packageHasFrontendSources: structure.packageHasFrontendSources
       }
     });
   } catch (err) {
@@ -3434,44 +3519,82 @@ function computeMissing(ecosystem, imports, declaredKeys, modulePath) {
   }
   return Array.from(missing).sort();
 }
-async function discoverDependencyManifest(options) {
+async function resolveManifestsPerFile(options) {
   const { token, encodedRepo, encodedBranch, ecosystem, sourcePaths } = options;
+  const resolutions = /* @__PURE__ */ new Map();
   const manifestCandidates = ECOSYSTEM_MANIFESTS[ecosystem] || [];
-  if (manifestCandidates.length === 0) return { discovery: null, authExpired: false };
-  const manifestCandidatesByName = new Map(manifestCandidates.map((name) => [name.toLowerCase(), name]));
-  const candidates = [];
-  const seen = /* @__PURE__ */ new Set();
-  let order = 0;
-  for (const sourcePath of sourcePaths) {
-    for (const directory of manifestSearchDirectories(sourcePath)) {
-      if (seen.has(directory)) continue;
-      seen.add(directory);
-      candidates.push({ directory, depth: directory ? directory.split("/").length : 0, order: order++ });
-    }
+  if (manifestCandidates.length === 0) {
+    for (const sourcePath of sourcePaths) resolutions.set(sourcePath, null);
+    return { resolutions, authExpired: false, budgetExhausted: false };
   }
-  candidates.sort((a, b) => b.depth - a.depth || a.order - b.order);
+  const candidatesByName = new Map(manifestCandidates.map((name) => [name.toLowerCase(), name]));
+  const listingCache = /* @__PURE__ */ new Map();
   let listings = 0;
-  for (const { directory } of candidates) {
-    if (listings >= DEPENDENCY_MAX_DIRECTORY_LISTINGS) break;
+  let budgetExhausted = false;
+  async function listManifestsIn(directory) {
+    const cached = listingCache.get(directory);
+    if (cached) return cached;
+    if (listings >= DEPENDENCY_MAX_DIRECTORY_LISTINGS) {
+      budgetExhausted = true;
+      return null;
+    }
     listings += 1;
     const encodedDirectory = encodeRepoContentPath(directory);
     const contentsPath = encodedDirectory ? `/repos/${encodedRepo}/contents/${encodedDirectory}?ref=${encodedBranch}` : `/repos/${encodedRepo}/contents?ref=${encodedBranch}`;
     const listingRes = await githubApiFetch(token, contentsPath);
-    if (listingRes.status === 401) return { discovery: null, authExpired: true };
-    if (!listingRes.ok) continue;
+    if (listingRes.status === 401) throw Object.assign(new Error("auth"), { authExpired: true });
+    if (!listingRes.ok) {
+      const empty = /* @__PURE__ */ new Map();
+      listingCache.set(directory, empty);
+      return empty;
+    }
     const entries = await listingRes.json();
-    if (!Array.isArray(entries)) continue;
+    if (!Array.isArray(entries)) {
+      const empty = /* @__PURE__ */ new Map();
+      listingCache.set(directory, empty);
+      return empty;
+    }
     const found = /* @__PURE__ */ new Map();
     for (const entry of entries) {
       if (!entry || entry.type !== "file" || typeof entry.name !== "string") continue;
-      const candidateName = manifestCandidatesByName.get(entry.name.toLowerCase());
+      const candidateName = candidatesByName.get(entry.name.toLowerCase());
       if (candidateName && !found.has(candidateName)) found.set(candidateName, entry.name);
     }
-    if (found.size === 0) continue;
-    const manifestPaths = manifestCandidates.filter((name) => found.has(name)).map((name) => directory ? `${directory}/${found.get(name)}` : found.get(name));
-    return { discovery: { directory, manifestPaths }, authExpired: false };
+    listingCache.set(directory, found);
+    return found;
   }
-  return { discovery: null, authExpired: false };
+  for (const sourcePath of sourcePaths) {
+    let resolved = null;
+    try {
+      for (const directory of manifestSearchDirectories(sourcePath)) {
+        const found = await listManifestsIn(directory);
+        if (!found || found.size === 0) continue;
+        const manifestPaths = manifestCandidates.filter((name) => found.has(name)).map((name) => directory ? `${directory}/${found.get(name)}` : found.get(name));
+        resolved = { directory, manifestPaths };
+        break;
+      }
+    } catch (err) {
+      if (err?.authExpired) {
+        for (const remaining of sourcePaths) {
+          if (!resolutions.has(remaining)) resolutions.set(remaining, null);
+        }
+        return { resolutions, authExpired: true, budgetExhausted };
+      }
+      resolved = null;
+    }
+    resolutions.set(sourcePath, resolved);
+  }
+  return { resolutions, authExpired: false, budgetExhausted };
+}
+function buildManifestSummary(groups, unresolvedCount) {
+  if (groups.length === 0) return "";
+  const parts = groups.map((group) => {
+    const missing = group.missingPackages.length > 0 ? group.missingPackages.join(", ") : "none";
+    return `${group.manifestPath} (missing: ${missing})`;
+  });
+  const head = `Scanned ${groups.length} manifest${groups.length === 1 ? "" : "s"}: ${parts.join("; ")}.`;
+  if (unresolvedCount === 0) return head;
+  return `${head} ${unresolvedCount} file${unresolvedCount === 1 ? " has" : "s have"} no manifest within ${DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH} levels.`;
 }
 app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) => {
   const userEmail = req.userEmail;
@@ -3525,7 +3648,11 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
       const m = /\.[A-Za-z0-9]+$/.exec(p);
       return m ? exts.includes(m[0].toLowerCase()) : false;
     }).slice(0, DEPENDENCY_MAX_SCAN_FILES);
-    const { discovery, authExpired: discoveryAuthExpired } = await discoverDependencyManifest({
+    const {
+      resolutions,
+      authExpired: discoveryAuthExpired,
+      budgetExhausted
+    } = await resolveManifestsPerFile({
       token: connection.token,
       encodedRepo,
       encodedBranch,
@@ -3539,7 +3666,27 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
         code: "github_reconnect_required"
       });
     }
-    if (!discovery) {
+    const groupsByManifest = /* @__PURE__ */ new Map();
+    const unresolvedFiles = [];
+    for (const sourcePath of sourcePaths) {
+      const resolution = resolutions.get(sourcePath) ?? null;
+      if (!resolution) {
+        unresolvedFiles.push(sourcePath);
+        continue;
+      }
+      const groupKey = resolution.manifestPaths[0];
+      const existing = groupsByManifest.get(groupKey);
+      if (existing) {
+        existing.files.push(sourcePath);
+      } else {
+        groupsByManifest.set(groupKey, {
+          directory: resolution.directory,
+          manifestPaths: resolution.manifestPaths,
+          files: [sourcePath]
+        });
+      }
+    }
+    if (groupsByManifest.size === 0) {
       return res.json({
         ecosystem,
         ecosystemLabel,
@@ -3548,25 +3695,28 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
         manifestPath: null,
         manifestDirectory: null,
         manifestFiles: [],
+        manifests: [],
         searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
         scannedFiles: 0,
         checkedImports: 0,
         missingPackages: [],
+        unresolvedFiles,
         message: `No manifest file (e.g. ${ECOSYSTEM_MANIFESTS[ecosystem]?.[0] || "package.json"}) was found in the analysed files' directory or up to ${DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH} parent directories on branch "${branch}". Unable to verify dependencies.`
       });
     }
-    const manifestFiles = /* @__PURE__ */ new Map();
-    const manifestPaths = discovery.manifestPaths;
-    const manifestBaseNames = /* @__PURE__ */ new Map();
-    for (const manifestPath of manifestPaths) {
-      const baseName = manifestPath.split("/").pop();
-      const canonical = (ECOSYSTEM_MANIFESTS[ecosystem] || []).find(
-        (name) => name.toLowerCase() === baseName.toLowerCase()
-      );
-      if (canonical) manifestBaseNames.set(manifestPath, canonical);
+    const manifestContents = /* @__PURE__ */ new Map();
+    const canonicalNameByPath = /* @__PURE__ */ new Map();
+    for (const group of groupsByManifest.values()) {
+      for (const manifestPath of group.manifestPaths) {
+        const baseName = manifestPath.split("/").pop();
+        const canonical = (ECOSYSTEM_MANIFESTS[ecosystem] || []).find(
+          (name) => name.toLowerCase() === baseName.toLowerCase()
+        );
+        if (canonical) canonicalNameByPath.set(manifestPath, canonical);
+      }
     }
     await Promise.all(
-      Array.from(manifestBaseNames.entries()).map(async ([manifestPath, canonicalName]) => {
+      Array.from(canonicalNameByPath.keys()).map(async (manifestPath) => {
         try {
           const resp = await githubApiFetch(
             connection.token,
@@ -3579,7 +3729,7 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
           if (!resp.ok) return;
           const data = await resp.json();
           const content = decodeGitHubFileContent(data);
-          if (content !== null) manifestFiles.set(canonicalName, content);
+          if (content !== null) manifestContents.set(manifestPath, content);
         } catch {
         }
       })
@@ -3591,34 +3741,15 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
         code: "github_reconnect_required"
       });
     }
-    if (manifestFiles.size === 0) {
-      return res.json({
-        ecosystem,
-        ecosystemLabel,
-        supported: true,
-        manifestFound: false,
-        manifestPath: null,
-        manifestDirectory: null,
-        manifestFiles: [],
-        searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
-        scannedFiles: 0,
-        checkedImports: 0,
-        missingPackages: [],
-        message: `A manifest was located in ${discovery.directory ? `"${discovery.directory}"` : "the repository root"} but its contents could not be read from branch "${branch}".`
-      });
-    }
-    const { keys: declaredKeys, modulePath } = extractDeclaredDependencies(ecosystem, manifestFiles);
-    const allImports = /* @__PURE__ */ new Set();
-    let scannedFiles = 0;
+    const sourceContents = /* @__PURE__ */ new Map();
     let cursor = 0;
-    async function worker() {
-      while (cursor < sourcePaths.length && !authExpired) {
+    async function sourceWorker() {
+      while (cursor < sourcePaths.length) {
         const cleanPath = sourcePaths[cursor++];
-        const encodedPath = cleanPath.split("/").filter(Boolean).map((segment) => encodeURIComponent(segment)).join("/");
         try {
           const resp = await githubApiFetch(
             connection.token,
-            `/repos/${encodedRepo}/contents/${encodedPath}?ref=${encodedBranch}`
+            `/repos/${encodedRepo}/contents/${encodeRepoContentPath(cleanPath)}?ref=${encodedBranch}`
           );
           if (resp.status === 401) {
             authExpired = true;
@@ -3630,14 +3761,13 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
           if (typeof data?.size === "number" && data.size > DEPENDENCY_MAX_FILE_BYTES) continue;
           const content = decodeGitHubFileContent(data);
           if (content === null) continue;
-          scannedFiles++;
-          for (const imp of extractImports(ecosystem, content)) allImports.add(imp);
+          sourceContents.set(cleanPath, content);
         } catch {
         }
       }
     }
     await Promise.all(
-      Array.from({ length: Math.min(DEPENDENCY_FETCH_CONCURRENCY, sourcePaths.length) }, () => worker())
+      Array.from({ length: Math.min(DEPENDENCY_FETCH_CONCURRENCY, sourcePaths.length) }, () => sourceWorker())
     );
     if (authExpired) {
       await deleteStoredGitHubConnection(userEmail);
@@ -3646,25 +3776,90 @@ app.post("/api/github/analyze-dependencies", authenticateUser, async (req, res) 
         code: "github_reconnect_required"
       });
     }
-    const imports = Array.from(allImports);
-    const missingPackages = computeMissing(ecosystem, imports, declaredKeys, modulePath);
-    const resolvedManifestPaths = manifestPaths.filter((manifestPath) => {
-      const canonical = manifestBaseNames.get(manifestPath);
-      return Boolean(canonical && manifestFiles.has(canonical));
+    const groups = [];
+    for (const [manifestPath, group] of groupsByManifest) {
+      const groupManifestFiles = /* @__PURE__ */ new Map();
+      const readablePaths = [];
+      for (const path2 of group.manifestPaths) {
+        const canonical = canonicalNameByPath.get(path2);
+        const content = manifestContents.get(path2);
+        if (!canonical || content === void 0) continue;
+        groupManifestFiles.set(canonical, content);
+        readablePaths.push(path2);
+      }
+      if (groupManifestFiles.size === 0) continue;
+      const { keys: declaredKeys, modulePath } = extractDeclaredDependencies(ecosystem, groupManifestFiles);
+      const groupImports = /* @__PURE__ */ new Set();
+      let groupScanned = 0;
+      for (const file of group.files) {
+        const content = sourceContents.get(file);
+        if (content === void 0) continue;
+        groupScanned += 1;
+        for (const imp of extractImports(ecosystem, content)) groupImports.add(imp);
+      }
+      const imports = Array.from(groupImports);
+      groups.push({
+        manifestPath,
+        manifestDirectory: group.directory,
+        manifestFiles: readablePaths,
+        matchedFiles: group.files,
+        scannedFiles: groupScanned,
+        checkedImports: imports.length,
+        missingPackages: computeMissing(ecosystem, imports, declaredKeys, modulePath)
+      });
+    }
+    if (groups.length === 0) {
+      return res.json({
+        ecosystem,
+        ecosystemLabel,
+        supported: true,
+        manifestFound: false,
+        manifestPath: null,
+        manifestDirectory: null,
+        manifestFiles: [],
+        manifests: [],
+        searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
+        scannedFiles: 0,
+        checkedImports: 0,
+        missingPackages: [],
+        unresolvedFiles,
+        message: `A manifest was located for the analysed files but its contents could not be read from branch "${branch}".`
+      });
+    }
+    groups.sort((a, b) => {
+      const depthA = a.manifestDirectory ? a.manifestDirectory.split("/").length : 0;
+      const depthB = b.manifestDirectory ? b.manifestDirectory.split("/").length : 0;
+      return depthA - depthB || a.manifestPath.localeCompare(b.manifestPath);
     });
+    const allManifestFiles = Array.from(
+      new Set(groups.flatMap((group) => group.manifestFiles))
+    );
+    const missingPackages = Array.from(
+      new Set(groups.flatMap((group) => group.missingPackages))
+    ).sort();
+    const summary = buildManifestSummary(groups, unresolvedFiles.length);
     return res.json({
       ecosystem,
       ecosystemLabel,
       supported: true,
       manifestFound: true,
-      // Exact repository-relative path, e.g. "frontend/package.json".
-      manifestPath: resolvedManifestPaths[0] || null,
-      manifestDirectory: discovery.directory || null,
-      manifestFiles: resolvedManifestPaths,
+      // Flat fields describe the first group, so single-manifest batches (the
+      // common case) read exactly as before.
+      manifestPath: groups[0].manifestPath,
+      manifestDirectory: groups[0].manifestDirectory || null,
+      manifestFiles: allManifestFiles,
+      manifests: groups,
+      manifestSummary: summary,
+      manifestCount: groups.length,
       searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
-      scannedFiles,
-      checkedImports: imports.length,
-      missingPackages
+      scannedFiles: groups.reduce((sum, group) => sum + group.scannedFiles, 0),
+      checkedImports: groups.reduce((sum, group) => sum + group.checkedImports, 0),
+      missingPackages,
+      unresolvedFiles,
+      listingBudgetExhausted: budgetExhausted,
+      ...unresolvedFiles.length > 0 ? {
+        message: `${unresolvedFiles.length} file${unresolvedFiles.length === 1 ? "" : "s"} could not be matched to a manifest within ${DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH} levels (${unresolvedFiles.slice(0, 3).join(", ")}${unresolvedFiles.length > 3 ? ", \u2026" : ""}).`
+      } : {}
     });
   } catch (err) {
     console.error("GitHub dependency analysis proxy error:", err);
