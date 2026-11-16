@@ -918,7 +918,8 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
             </button>
             <p className="text-[10px] text-slate-400 leading-snug -mt-3">
               Polyglot: detects Node.js, Python, Rust, Go, PHP, Ruby, and Java from the file extensions, then compares imports
-              against the nearest manifest — monorepo aware: the file's own directory is checked first, then up to 3 parent directories.
+              against the nearest manifest — monorepo aware: each file is matched to its own package manifest (its directory first,
+              then up to 3 parents), so mixed frontend/backend batches are checked against their respective manifests.
             </p>
           </form>
 
@@ -963,26 +964,93 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 )}
               </div>
 
-              {/* Where the manifest was resolved from — makes monorepo discovery transparent. */}
+              {/* Where the manifest(s) came from — makes monorepo discovery transparent. */}
               {depResult.supported && depResult.manifestFound && depResult.manifestPath ? (
                 <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500">
                   <FolderTree className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                  <span>Manifest located at</span>
-                  <span className="font-mono font-semibold text-slate-700">{depResult.manifestPath}</span>
-                  {depResult.manifestDirectory ? (
-                    <span className="text-[10px] bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full px-1.5 py-px">
-                      monorepo sub-directory
+                  <span>{(depResult.manifests?.length ?? 1) > 1 ? 'Manifests resolved:' : 'Manifest located at'}</span>
+                  {(depResult.manifests && depResult.manifests.length > 1
+                    ? depResult.manifests.map((group) => group.manifestPath)
+                    : [depResult.manifestPath]
+                  ).map((path) => (
+                    <span key={path} className="font-mono font-semibold text-slate-700">
+                      {path}
                     </span>
-                  ) : (
-                    <span className="text-[10px] bg-slate-100 text-slate-600 border border-slate-200 rounded-full px-1.5 py-px">
-                      repository root
-                    </span>
-                  )}
+                  ))}
+                  {(() => {
+                    const dirs = new Set(
+                      (depResult.manifests || []).map((group) => group.manifestDirectory)
+                    );
+                    const isMonorepo = dirs.size > 0 && [...dirs].some((dir) => dir);
+                    return (
+                      <span
+                        className={
+                          isMonorepo
+                            ? 'text-[10px] bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full px-1.5 py-px'
+                            : 'text-[10px] bg-slate-100 text-slate-600 border border-slate-200 rounded-full px-1.5 py-px'
+                        }
+                      >
+                        {isMonorepo ? 'monorepo sub-directory' : 'repository root'}
+                      </span>
+                    );
+                  })()}
                   <span className="text-[10px] text-slate-400">
                     on branch <span className="font-mono">{branch.trim() || 'main'}</span>
                   </span>
                 </div>
               ) : null}
+
+              {/* Multi-manifest roll-up: which manifest each package was checked against. */}
+              {depResult.supported && depResult.manifestFound && (depResult.manifests?.length ?? 0) > 0 && (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 space-y-2">
+                  <p className="text-[11px] font-semibold text-slate-700">
+                    Scanned {depResult.manifests!.length} manifest{depResult.manifests!.length === 1 ? '' : 's'}
+                    {depResult.manifests!.length > 1 && (
+                      <span className="font-normal text-slate-500"> · each file checked against its nearest manifest</span>
+                    )}
+                  </p>
+                  <ul className="space-y-1.5">
+                    {depResult.manifests!.map((group) => (
+                      <li key={group.manifestPath} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+                        {group.missingPackages.length === 0 ? (
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                        ) : (
+                          <AlertTriangle className="w-3.5 h-3.5 text-rose-500 shrink-0" />
+                        )}
+                        <span className="font-mono font-semibold text-slate-800">{group.manifestPath}</span>
+                        <span className="text-slate-400">
+                          {group.matchedFiles.length} file{group.matchedFiles.length === 1 ? '' : 's'} ·{' '}
+                          {group.checkedImports} import{group.checkedImports === 1 ? '' : 's'}
+                        </span>
+                        {group.missingPackages.length === 0 ? (
+                          <span className="text-emerald-700">missing: none</span>
+                        ) : (
+                          <span className="text-rose-700">
+                            missing:{' '}
+                            {group.missingPackages.map((pkg, index) => (
+                              <span key={pkg} className="font-mono">
+                                {pkg}
+                                {index < group.missingPackages.length - 1 ? ', ' : ''}
+                              </span>
+                            ))}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Files that never reached a manifest within the search depth. */}
+              {(depResult.unresolvedFiles?.length ?? 0) > 0 && (
+                <p className="text-[11px] text-amber-700">
+                  {depResult.unresolvedFiles!.length} file
+                  {depResult.unresolvedFiles!.length === 1 ? ' has' : 's have'} no manifest within{' '}
+                  {depResult.searchDepth ?? 3} levels:{' '}
+                  <span className="font-mono">{depResult.unresolvedFiles!.slice(0, 3).join(', ')}</span>
+                  {depResult.unresolvedFiles!.length > 3 ? ', …' : ''}
+                </p>
+              )}
 
               {/* Unsupported ecosystem or missing manifest */}
               {!depResult.supported || !depResult.manifestFound || depResult.message ? (
@@ -995,6 +1063,12 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                   <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                   <span>
                     {(() => {
+                      const groups = depResult.manifests || [];
+                      if (groups.length > 1) {
+                        return `All imported packages are declared in each of the ${groups.length} manifests (${groups
+                          .map((group) => group.manifestPath)
+                          .join(', ')}).`;
+                      }
                       const paths = manifestDisplayPaths(depResult);
                       return paths
                         ? `All imported packages are declared in ${paths}.`
@@ -1007,7 +1081,16 @@ export const GitHubVerifierView: React.FC<GitHubVerifierViewProps> = ({ initialF
                 <div className="space-y-3">
                   <p className="text-xs text-rose-800 font-semibold flex items-center gap-1.5">
                     <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
-                    {depResult.missingPackages.length} imported {depResult.missingPackages.length === 1 ? 'package is' : 'packages are'} not declared in {manifestDisplayPaths(depResult) || 'the dependency manifest'}:
+                    {(() => {
+                      const groups = depResult.manifests || [];
+                      const count = depResult.missingPackages.length;
+                      const noun = `${count} imported ${count === 1 ? 'package is' : 'packages are'}`;
+                      if (groups.length > 1) {
+                        const affected = groups.filter((group) => group.missingPackages.length > 0).length;
+                        return `${noun} not declared in ${affected === 1 ? '1 of' : `${affected} of`} ${groups.length} manifests — see the breakdown above:`;
+                      }
+                      return `${noun} not declared in ${manifestDisplayPaths(depResult) || 'the dependency manifest'}:`;
+                    })()}
                   </p>
                   <div className="flex flex-wrap gap-1.5">
                     {depResult.missingPackages.map((pkg) => (

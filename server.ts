@@ -3554,6 +3554,150 @@ app.get('/api/github/branches', authenticateUser, async (req: express.Request, r
   }
 });
 
+/** Well-known monorepo package directories probed when the root has no manifest. */
+const MONOREPO_PACKAGE_DIRECTORIES = [
+  'client', 'frontend', 'web', 'app', 'apps', 'packages',
+  'server', 'backend', 'api', 'services',
+];
+/** Sub-directories that mark a package directory as holding frontend sources. */
+const FRONTEND_SOURCE_DIRECTORIES = ['src', 'pages', 'components', 'public'];
+const FRONTEND_MANIFESTS = ['package.json', 'tsconfig.json', 'vite.config.js', 'vite.config.ts', 'next.config.js', 'next.config.mjs'];
+
+interface RepositoryStructure {
+  detectedFiles: string[];
+  hasNodeManifest: boolean;
+  hasPythonOrJavaManifest: boolean;
+  hasDockerFiles: boolean;
+  likelyFrontend: boolean;
+  monorepo: boolean;
+  scannedDirectories: string[];
+  packageHasFrontendSources: boolean;
+}
+
+/**
+ * Reads the repository layout for the verify endpoint's structure snapshot.
+ *
+ * Signals are collected from the repository root first. When the root carries no
+ * node manifest and no Docker/host manifest, the well-known monorepo package
+ * directories are listed one level deep: a `client/package.json`, or a
+ * `frontend/src` style source tree, is enough to classify the repository as a
+ * frontend. Detected entries are reported with their full path (`client/package.json`)
+ * so the UI can show where the signal came from.
+ *
+ * The extra listings are bounded (one per candidate directory) and only run when
+ * the root is inconclusive, so ordinary single-package repositories cost exactly
+ * one request as before.
+ */
+async function readRepositoryStructure(
+  token: string,
+  encodedRepo: string,
+  encodedBranch: string
+): Promise<RepositoryStructure> {
+  const commonFiles = [
+    'package.json', 'tsconfig.json', 'requirements.txt', 'Dockerfile',
+    'docker-compose.yml', 'pom.xml', 'go.mod', 'Cargo.toml', 'README.md',
+  ];
+  const detectedFiles: string[] = [];
+  const rootNames = new Set<string>();
+  const directoryNames = new Set<string>();
+
+  try {
+    const structureRes = await githubApiFetch(token, `/repos/${encodedRepo}/contents?ref=${encodedBranch}`);
+    if (structureRes.ok) {
+      const contents = await structureRes.json();
+      if (Array.isArray(contents)) {
+        for (const item of contents) {
+          if (!item || typeof item.name !== 'string') continue;
+          if (item.type === 'dir') directoryNames.add(item.name);
+          else rootNames.add(item.name);
+        }
+        for (const cf of commonFiles) {
+          if (rootNames.has(cf)) detectedFiles.push(cf);
+        }
+      }
+    }
+  } catch {
+    // Structure is supplementary; verification results still stand.
+  }
+
+  const hasRootNodeManifest = rootNames.has('package.json');
+  const hasRootHostManifest =
+    rootNames.has('requirements.txt') ||
+    rootNames.has('pom.xml') ||
+    rootNames.has('go.mod') ||
+    rootNames.has('Cargo.toml') ||
+    rootNames.has('Dockerfile') ||
+    rootNames.has('docker-compose.yml');
+
+  const scannedDirectories: string[] = [];
+  let packageHasFrontendSources = false;
+  let packageDirWithManifest: string | null = null;
+  let packageDirWithSources: string | null = null;
+
+  // Probe monorepo packages only when the root tells us nothing conclusive.
+  if (!hasRootNodeManifest && !hasRootHostManifest) {
+    const candidates = MONOREPO_PACKAGE_DIRECTORIES.filter((dir) => directoryNames.has(dir));
+    // `apps/` and `packages/` hold many packages; only look inside them when the
+    // root exposes nothing else, and cap the fan-out.
+    const probes = candidates.slice(0, 4);
+
+    for (const dir of probes) {
+      scannedDirectories.push(dir);
+      try {
+        const res = await githubApiFetch(
+          token,
+          `/repos/${encodedRepo}/contents/${encodeRepoContentPath(dir)}?ref=${encodedBranch}`
+        );
+        if (!res.ok) continue;
+        const entries = await res.json();
+        if (!Array.isArray(entries)) continue;
+        const names = new Set(
+          entries.filter((item: any) => item && typeof item.name === 'string').map((item: any) => item.name)
+        );
+        const fileNames = new Set(
+          entries
+            .filter((item: any) => item && item.type === 'file' && typeof item.name === 'string')
+            .map((item: any) => item.name)
+        );
+
+        const manifest = FRONTEND_MANIFESTS.find((name) => fileNames.has(name));
+        if (manifest) {
+          detectedFiles.push(`${dir}/${manifest}`);
+          if (!packageDirWithManifest) packageDirWithManifest = dir;
+        }
+        const hasFrontendSources = FRONTEND_SOURCE_DIRECTORIES.some(
+          (sub) => names.has(sub) && entries.some((item: any) => item.name === sub && item.type === 'dir')
+        );
+        if (hasFrontendSources) {
+          if (!packageDirWithSources) packageDirWithSources = dir;
+          // `src/` next to a package manifest is the signature of a frontend package.
+          if (manifest && FRONTEND_MANIFESTS.includes(manifest)) packageHasFrontendSources = true;
+        }
+      } catch {
+        // A single unreadable directory must not fail the snapshot.
+      }
+    }
+  }
+
+  const hasNodeManifest =
+    hasRootNodeManifest || detectedFiles.some((f) => /(^|\/)package\.json$/.test(f));
+  const hasPythonOrJavaManifest =
+    rootNames.has('requirements.txt') || rootNames.has('pom.xml') || rootNames.has('go.mod');
+  const hasDockerFiles = rootNames.has('Dockerfile') || rootNames.has('docker-compose.yml');
+  const likelyFrontend = hasNodeManifest && (hasRootNodeManifest || packageHasFrontendSources);
+
+  return {
+    detectedFiles,
+    hasNodeManifest,
+    hasPythonOrJavaManifest,
+    hasDockerFiles,
+    likelyFrontend,
+    monorepo: !hasRootNodeManifest && (Boolean(packageDirWithManifest) || Boolean(packageDirWithSources)),
+    scannedDirectories,
+    packageHasFrontendSources,
+  };
+}
+
 // POST /api/github/verify - Verify file paths (and repo structure) server-side.
 // Body: { repo: "owner/repo", branch?: string, files: string[] }
 app.post('/api/github/verify', authenticateUser, async (req: express.Request, res: express.Response) => {
@@ -3680,33 +3824,18 @@ app.post('/api/github/verify', authenticateUser, async (req: express.Request, re
       });
     }
 
-    // Repository structure snapshot (root contents), best effort.
-    const commonFiles = [
-      'package.json', 'tsconfig.json', 'requirements.txt', 'Dockerfile',
-      'docker-compose.yml', 'pom.xml', 'go.mod', 'Cargo.toml', 'README.md',
-    ];
-    const detectedFiles: string[] = [];
-    try {
-      const structureRes = await githubApiFetch(connection.token, `/repos/${encodedRepo}/contents?ref=${encodedBranch}`);
-      if (structureRes.ok) {
-        const contents = await structureRes.json();
-        if (Array.isArray(contents)) {
-          const names = new Set(contents.map((item: any) => item.name));
-          for (const cf of commonFiles) {
-            if (names.has(cf)) detectedFiles.push(cf);
-          }
-        }
-      }
-    } catch {
-      // Structure is supplementary; verification results still stand.
-    }
-
-    const hasPackageJson = detectedFiles.includes('package.json');
-    const hasPythonOrJava =
-      detectedFiles.includes('requirements.txt') ||
-      detectedFiles.includes('pom.xml') ||
-      detectedFiles.includes('go.mod');
-    const hasDocker = detectedFiles.includes('Dockerfile') || detectedFiles.includes('docker-compose.yml');
+    // Repository structure snapshot, best effort.
+    //
+    // A monorepo keeps its manifests one level down (client/, frontend/, app/)
+    // and often has no root package.json at all, so a root-only look reported
+    // `likelyFrontend: false` for perfectly ordinary frontends. When the root
+    // shows no application signal the well-known monorepo directories are
+    // probed one level deep, and anything found there is reported with its path.
+    const structure = await readRepositoryStructure(connection.token, encodedRepo, encodedBranch);
+    const detectedFiles = structure.detectedFiles;
+    const hasPackageJson = structure.hasNodeManifest;
+    const hasPythonOrJava = structure.hasPythonOrJavaManifest;
+    const hasDocker = structure.hasDockerFiles;
 
     const total = verifiedFiles.length + missingFiles.length;
     const verificationRate = total > 0 ? verifiedFiles.length / total : 0;
@@ -3728,10 +3857,16 @@ app.post('/api/github/verify', authenticateUser, async (req: express.Request, re
         checkedAt: new Date().toISOString(),
       },
       structure: {
-        likelyFrontend: hasPackageJson,
+        likelyFrontend: structure.likelyFrontend || hasPackageJson,
         likelyBackend: hasPythonOrJava || (hasPackageJson && hasDocker),
         likelyFullstack: hasPackageJson && (hasPythonOrJava || hasDocker),
         detectedFiles,
+        /** Manifests/app files are in these sub-directories, not the root. */
+        monorepo: structure.monorepo,
+        /** Sub-directories that were probed, e.g. ["client", "frontend"]. */
+        scannedDirectories: structure.scannedDirectories,
+        /** True when a frontend-style source tree was detected in a package dir. */
+        packageHasFrontendSources: structure.packageHasFrontendSources,
       },
     });
   } catch (err) {
@@ -4366,7 +4501,7 @@ function computeMissing(
   return Array.from(missing).sort();
 }
 
-interface ManifestDiscovery {
+interface ManifestResolution {
   /** Repository-relative directory the manifest was found in ('' = repo root). */
   directory: string;
   /** Repository-relative manifest paths, in ECOSYSTEM_MANIFESTS priority order. */
@@ -4374,51 +4509,54 @@ interface ManifestDiscovery {
 }
 
 /**
- * Hierarchical manifest discovery for monorepos.
+ * Resolves the nearest manifest for **each** submitted file independently.
  *
- * Every source file contributes its own directory plus its ancestors (up to
- * DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH), and the resulting directories are
- * probed deepest-first. That makes the closest manifest to the analysed code
- * win, so `frontend/src/App.tsx` resolves to `frontend/package.json` even when
- * a root `package.json` also exists, while a shallow file still falls back to
- * the root manifest.
+ * Every file walks from its own directory up to DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH
+ * ancestors (and no further than the repository root), stopping at the first
+ * directory that holds a manifest of the detected ecosystem. That makes a mixed
+ * batch work: `client/src/App.jsx` resolves to `client/package.json` and
+ * `server/index.js` to `server/package.json` in the same request, instead of the
+ * whole batch being judged against whichever manifest happened to be deepest.
  *
- * Each candidate directory is a single listing request, de-duplicated across
- * files and capped by DEPENDENCY_MAX_DIRECTORY_LISTINGS, and every request
- * pins `ref={branch}` so discovery follows the branch selected in the UI.
- *
- * @returns the nearest manifest directory, or null when nothing was found.
+ * Directory listings are cached for the request, so files that share a tree cost
+ * one call per directory (a `client/src` + `client/lib` batch lists `client/src`,
+ * `client/lib`, `client` and the root once each). The total is bounded by
+ * DEPENDENCY_MAX_DIRECTORY_LISTINGS as a safety valve against a pathologically
+ * spread-out batch. Every request pins `ref={branch}`.
  */
-async function discoverDependencyManifest(options: {
+async function resolveManifestsPerFile(options: {
   token: string;
   encodedRepo: string;
   encodedBranch: string;
   ecosystem: DependencyEcosystem;
   sourcePaths: string[];
-}): Promise<{ discovery: ManifestDiscovery | null; authExpired: boolean }> {
+}): Promise<{
+  resolutions: Map<string, ManifestResolution | null>;
+  authExpired: boolean;
+  budgetExhausted: boolean;
+}> {
   const { token, encodedRepo, encodedBranch, ecosystem, sourcePaths } = options;
+  const resolutions = new Map<string, ManifestResolution | null>();
   const manifestCandidates = ECOSYSTEM_MANIFESTS[ecosystem] || [];
-  if (manifestCandidates.length === 0) return { discovery: null, authExpired: false };
-
-  const manifestCandidatesByName = new Map(manifestCandidates.map((name) => [name.toLowerCase(), name]));
-
-  // Collect candidate directories across all files, deepest first. Ties keep
-  // the order in which the paths were submitted.
-  const candidates: Array<{ directory: string; depth: number; order: number }> = [];
-  const seen = new Set<string>();
-  let order = 0;
-  for (const sourcePath of sourcePaths) {
-    for (const directory of manifestSearchDirectories(sourcePath)) {
-      if (seen.has(directory)) continue;
-      seen.add(directory);
-      candidates.push({ directory, depth: directory ? directory.split('/').length : 0, order: order++ });
-    }
+  if (manifestCandidates.length === 0) {
+    for (const sourcePath of sourcePaths) resolutions.set(sourcePath, null);
+    return { resolutions, authExpired: false, budgetExhausted: false };
   }
-  candidates.sort((a, b) => (b.depth - a.depth) || (a.order - b.order));
 
+  const candidatesByName = new Map(manifestCandidates.map((name) => [name.toLowerCase(), name]));
+  // directory -> manifests present there (canonical name -> exact on-disk name)
+  const listingCache = new Map<string, Map<string, string>>();
   let listings = 0;
-  for (const { directory } of candidates) {
-    if (listings >= DEPENDENCY_MAX_DIRECTORY_LISTINGS) break;
+  let budgetExhausted = false;
+
+  /** Files never change within one request, so each directory is listed once. */
+  async function listManifestsIn(directory: string): Promise<Map<string, string> | null> {
+    const cached = listingCache.get(directory);
+    if (cached) return cached;
+    if (listings >= DEPENDENCY_MAX_DIRECTORY_LISTINGS) {
+      budgetExhausted = true;
+      return null;
+    }
     listings += 1;
 
     const encodedDirectory = encodeRepoContentPath(directory);
@@ -4426,30 +4564,81 @@ async function discoverDependencyManifest(options: {
       ? `/repos/${encodedRepo}/contents/${encodedDirectory}?ref=${encodedBranch}`
       : `/repos/${encodedRepo}/contents?ref=${encodedBranch}`;
     const listingRes = await githubApiFetch(token, contentsPath);
-    if (listingRes.status === 401) return { discovery: null, authExpired: true };
+    if (listingRes.status === 401) throw Object.assign(new Error('auth'), { authExpired: true });
     // 404 = directory does not exist, 403 = no access: the parent may still work.
-    if (!listingRes.ok) continue;
-
+    if (!listingRes.ok) {
+      const empty = new Map<string, string>();
+      listingCache.set(directory, empty);
+      return empty;
+    }
     const entries = await listingRes.json();
-    if (!Array.isArray(entries)) continue; // a file, not a directory
+    if (!Array.isArray(entries)) {
+      const empty = new Map<string, string>();
+      listingCache.set(directory, empty);
+      return empty; // a file, not a directory
+    }
 
     const found = new Map<string, string>();
     for (const entry of entries) {
       if (!entry || entry.type !== 'file' || typeof entry.name !== 'string') continue;
-      const candidateName = manifestCandidatesByName.get(entry.name.toLowerCase());
+      const candidateName = candidatesByName.get(entry.name.toLowerCase());
       if (candidateName && !found.has(candidateName)) found.set(candidateName, entry.name);
     }
-    if (found.size === 0) continue;
-
-    // Report the exact on-disk casing, ordered by manifest priority.
-    const manifestPaths = manifestCandidates
-      .filter((name) => found.has(name))
-      .map((name) => (directory ? `${directory}/${found.get(name)}` : (found.get(name) as string)));
-
-    return { discovery: { directory, manifestPaths }, authExpired: false };
+    listingCache.set(directory, found);
+    return found;
   }
 
-  return { discovery: null, authExpired: false };
+  for (const sourcePath of sourcePaths) {
+    let resolved: ManifestResolution | null = null;
+    try {
+      for (const directory of manifestSearchDirectories(sourcePath)) {
+        const found = await listManifestsIn(directory);
+        if (!found || found.size === 0) continue;
+        // Report the exact on-disk casing, ordered by manifest priority.
+        const manifestPaths = manifestCandidates
+          .filter((name) => found.has(name))
+          .map((name) => (directory ? `${directory}/${found.get(name)}` : (found.get(name) as string)));
+        resolved = { directory, manifestPaths };
+        break;
+      }
+    } catch (err) {
+      if ((err as any)?.authExpired) {
+        for (const remaining of sourcePaths) {
+          if (!resolutions.has(remaining)) resolutions.set(remaining, null);
+        }
+        return { resolutions, authExpired: true, budgetExhausted };
+      }
+      // Network hiccup on one file must not abort the whole batch.
+      resolved = null;
+    }
+    resolutions.set(sourcePath, resolved);
+  }
+
+  return { resolutions, authExpired: false, budgetExhausted };
+}
+
+/** One manifest directory's share of an analysis batch. */
+interface ManifestGroupResult {
+  manifestPath: string;
+  manifestDirectory: string;
+  manifestFiles: string[];
+  /** Source files in this batch that resolved to this manifest. */
+  matchedFiles: string[];
+  scannedFiles: number;
+  checkedImports: number;
+  missingPackages: string[];
+}
+
+/** Renders the human-readable roll-up shown above the Dependency Check results. */
+function buildManifestSummary(groups: ManifestGroupResult[], unresolvedCount: number): string {
+  if (groups.length === 0) return '';
+  const parts = groups.map((group) => {
+    const missing = group.missingPackages.length > 0 ? group.missingPackages.join(', ') : 'none';
+    return `${group.manifestPath} (missing: ${missing})`;
+  });
+  const head = `Scanned ${groups.length} manifest${groups.length === 1 ? '' : 's'}: ${parts.join('; ')}.`;
+  if (unresolvedCount === 0) return head;
+  return `${head} ${unresolvedCount} file${unresolvedCount === 1 ? ' has' : 's have'} no manifest within ${DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH} levels.`;
 }
 
 app.post('/api/github/analyze-dependencies', authenticateUser, async (req: express.Request, res: express.Response) => {
@@ -4521,9 +4710,12 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
       })
       .slice(0, DEPENDENCY_MAX_SCAN_FILES);
 
-    // 2. Hierarchical manifest discovery: the file's own directory first, then up
-    //    to three ancestors (monorepo support). Always pinned to `branch`.
-    const { discovery, authExpired: discoveryAuthExpired } = await discoverDependencyManifest({
+    // 2. Resolve the nearest manifest for EACH file (monorepo aware, branch pinned).
+    const {
+      resolutions,
+      authExpired: discoveryAuthExpired,
+      budgetExhausted,
+    } = await resolveManifestsPerFile({
       token: connection.token,
       encodedRepo,
       encodedBranch,
@@ -4538,7 +4730,30 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
       });
     }
 
-    if (!discovery) {
+    // 3. Group the files by the manifest they resolved to. Files with no manifest
+    //    are counted but do not contribute imports to any group.
+    const groupsByManifest = new Map<string, { directory: string; manifestPaths: string[]; files: string[] }>();
+    const unresolvedFiles: string[] = [];
+    for (const sourcePath of sourcePaths) {
+      const resolution = resolutions.get(sourcePath) ?? null;
+      if (!resolution) {
+        unresolvedFiles.push(sourcePath);
+        continue;
+      }
+      const groupKey = resolution.manifestPaths[0];
+      const existing = groupsByManifest.get(groupKey);
+      if (existing) {
+        existing.files.push(sourcePath);
+      } else {
+        groupsByManifest.set(groupKey, {
+          directory: resolution.directory,
+          manifestPaths: resolution.manifestPaths,
+          files: [sourcePath],
+        });
+      }
+    }
+
+    if (groupsByManifest.size === 0) {
       return res.json({
         ecosystem,
         ecosystemLabel,
@@ -4547,29 +4762,32 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
         manifestPath: null,
         manifestDirectory: null,
         manifestFiles: [],
+        manifests: [],
         searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
         scannedFiles: 0,
         checkedImports: 0,
         missingPackages: [],
+        unresolvedFiles,
         message: `No manifest file (e.g. ${ECOSYSTEM_MANIFESTS[ecosystem]?.[0] || 'package.json'}) was found in the analysed files' directory or up to ${DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH} parent directories on branch "${branch}". Unable to verify dependencies.`,
       });
     }
 
-    // 3. Fetch the discovered manifest file(s), keyed by their canonical name so
-    //    the existing parsers keep working regardless of the directory.
-    const manifestFiles = new Map<string, string>();
-    const manifestPaths = discovery.manifestPaths;
-    const manifestBaseNames = new Map<string, string>(); // exact path -> canonical name
-    for (const manifestPath of manifestPaths) {
-      const baseName = manifestPath.split('/').pop() as string;
-      const canonical = (ECOSYSTEM_MANIFESTS[ecosystem] || []).find(
-        (name) => name.toLowerCase() === baseName.toLowerCase()
-      );
-      if (canonical) manifestBaseNames.set(manifestPath, canonical);
+    // 4. Fetch every manifest that at least one file resolved to. De-duplicated
+    //    across groups, keyed by exact repository path.
+    const manifestContents = new Map<string, string>(); // exact path -> content
+    const canonicalNameByPath = new Map<string, string>();
+    for (const group of groupsByManifest.values()) {
+      for (const manifestPath of group.manifestPaths) {
+        const baseName = manifestPath.split('/').pop() as string;
+        const canonical = (ECOSYSTEM_MANIFESTS[ecosystem] || []).find(
+          (name) => name.toLowerCase() === baseName.toLowerCase()
+        );
+        if (canonical) canonicalNameByPath.set(manifestPath, canonical);
+      }
     }
 
     await Promise.all(
-      Array.from(manifestBaseNames.entries()).map(async ([manifestPath, canonicalName]) => {
+      Array.from(canonicalNameByPath.keys()).map(async (manifestPath) => {
         try {
           const resp = await githubApiFetch(
             connection.token,
@@ -4582,7 +4800,7 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
           if (!resp.ok) return;
           const data = await resp.json();
           const content = decodeGitHubFileContent(data);
-          if (content !== null) manifestFiles.set(canonicalName, content);
+          if (content !== null) manifestContents.set(manifestPath, content);
         } catch {
           // A single unreadable manifest should not abort the analysis.
         }
@@ -4597,44 +4815,16 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
       });
     }
 
-    if (manifestFiles.size === 0) {
-      // The directory listing advertised a manifest but its content was unreadable.
-      return res.json({
-        ecosystem,
-        ecosystemLabel,
-        supported: true,
-        manifestFound: false,
-        manifestPath: null,
-        manifestDirectory: null,
-        manifestFiles: [],
-        searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
-        scannedFiles: 0,
-        checkedImports: 0,
-        missingPackages: [],
-        message: `A manifest was located in ${discovery.directory ? `"${discovery.directory}"` : 'the repository root'} but its contents could not be read from branch "${branch}".`,
-      });
-    }
-
-    // 4. Parse the manifest(s) into a set of declared dependency keys
-    const { keys: declaredKeys, modulePath } = extractDeclaredDependencies(ecosystem, manifestFiles);
-
-    // 5. Fetch the source files relevant to the ecosystem and extract imports
-    const allImports = new Set<string>();
-    let scannedFiles = 0;
+    // 5. Fetch each source file once; the bytes are shared by every group.
+    const sourceContents = new Map<string, string>();
     let cursor = 0;
-
-    async function worker() {
-      while (cursor < sourcePaths.length && !authExpired) {
+    async function sourceWorker() {
+      while (cursor < sourcePaths.length) {
         const cleanPath = sourcePaths[cursor++];
-        const encodedPath = cleanPath
-          .split('/')
-          .filter(Boolean)
-          .map((segment) => encodeURIComponent(segment))
-          .join('/');
         try {
           const resp = await githubApiFetch(
             connection!.token,
-            `/repos/${encodedRepo}/contents/${encodedPath}?ref=${encodedBranch}`
+            `/repos/${encodedRepo}/contents/${encodeRepoContentPath(cleanPath)}?ref=${encodedBranch}`
           );
           if (resp.status === 401) {
             authExpired = true;
@@ -4646,16 +4836,15 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
           if (typeof data?.size === 'number' && data.size > DEPENDENCY_MAX_FILE_BYTES) continue;
           const content = decodeGitHubFileContent(data);
           if (content === null) continue;
-          scannedFiles++;
-          for (const imp of extractImports(ecosystem, content)) allImports.add(imp);
+          sourceContents.set(cleanPath, content);
         } catch {
-          // Skip unreadable files; other files still contribute to the analysis
+          // Skip unreadable files; other files still contribute to the analysis.
         }
       }
     }
 
     await Promise.all(
-      Array.from({ length: Math.min(DEPENDENCY_FETCH_CONCURRENCY, sourcePaths.length) }, () => worker())
+      Array.from({ length: Math.min(DEPENDENCY_FETCH_CONCURRENCY, sourcePaths.length) }, () => sourceWorker())
     );
 
     if (authExpired) {
@@ -4666,29 +4855,103 @@ app.post('/api/github/analyze-dependencies', authenticateUser, async (req: expre
       });
     }
 
-    // 6. Compare imports against the declared dependencies
-    const imports = Array.from(allImports);
-    const missingPackages = computeMissing(ecosystem, imports, declaredKeys, modulePath);
+    // 6. Analyse each manifest group against its OWN declared dependencies.
+    const groups: ManifestGroupResult[] = [];
+    for (const [manifestPath, group] of groupsByManifest) {
+      // The parsers expect canonical file names, so build a per-group view.
+      const groupManifestFiles = new Map<string, string>();
+      const readablePaths: string[] = [];
+      for (const path of group.manifestPaths) {
+        const canonical = canonicalNameByPath.get(path);
+        const content = manifestContents.get(path);
+        if (!canonical || content === undefined) continue;
+        groupManifestFiles.set(canonical, content);
+        readablePaths.push(path);
+      }
+      if (groupManifestFiles.size === 0) continue; // advertised but unreadable
 
-    // Only report manifests that were actually read, keeping the priority order.
-    const resolvedManifestPaths = manifestPaths.filter((manifestPath) => {
-      const canonical = manifestBaseNames.get(manifestPath);
-      return Boolean(canonical && manifestFiles.has(canonical));
+      const { keys: declaredKeys, modulePath } = extractDeclaredDependencies(ecosystem, groupManifestFiles);
+
+      const groupImports = new Set<string>();
+      let groupScanned = 0;
+      for (const file of group.files) {
+        const content = sourceContents.get(file);
+        if (content === undefined) continue;
+        groupScanned += 1;
+        for (const imp of extractImports(ecosystem, content)) groupImports.add(imp);
+      }
+
+      const imports = Array.from(groupImports);
+      groups.push({
+        manifestPath,
+        manifestDirectory: group.directory,
+        manifestFiles: readablePaths,
+        matchedFiles: group.files,
+        scannedFiles: groupScanned,
+        checkedImports: imports.length,
+        missingPackages: computeMissing(ecosystem, imports, declaredKeys, modulePath),
+      });
+    }
+
+    if (groups.length === 0) {
+      return res.json({
+        ecosystem,
+        ecosystemLabel,
+        supported: true,
+        manifestFound: false,
+        manifestPath: null,
+        manifestDirectory: null,
+        manifestFiles: [],
+        manifests: [],
+        searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
+        scannedFiles: 0,
+        checkedImports: 0,
+        missingPackages: [],
+        unresolvedFiles,
+        message: `A manifest was located for the analysed files but its contents could not be read from branch "${branch}".`,
+      });
+    }
+
+    // Stable, readable ordering: shallowest manifest first (root before packages).
+    groups.sort((a, b) => {
+      const depthA = a.manifestDirectory ? a.manifestDirectory.split('/').length : 0;
+      const depthB = b.manifestDirectory ? b.manifestDirectory.split('/').length : 0;
+      return depthA - depthB || a.manifestPath.localeCompare(b.manifestPath);
     });
+
+    // 7. Roll the groups up into the flat, backwards-compatible top-level fields.
+    const allManifestFiles = Array.from(
+      new Set(groups.flatMap((group) => group.manifestFiles))
+    );
+    const missingPackages = Array.from(
+      new Set(groups.flatMap((group) => group.missingPackages))
+    ).sort();
+    const summary = buildManifestSummary(groups, unresolvedFiles.length);
 
     return res.json({
       ecosystem,
       ecosystemLabel,
       supported: true,
       manifestFound: true,
-      // Exact repository-relative path, e.g. "frontend/package.json".
-      manifestPath: resolvedManifestPaths[0] || null,
-      manifestDirectory: discovery.directory || null,
-      manifestFiles: resolvedManifestPaths,
+      // Flat fields describe the first group, so single-manifest batches (the
+      // common case) read exactly as before.
+      manifestPath: groups[0].manifestPath,
+      manifestDirectory: groups[0].manifestDirectory || null,
+      manifestFiles: allManifestFiles,
+      manifests: groups,
+      manifestSummary: summary,
+      manifestCount: groups.length,
       searchDepth: DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH,
-      scannedFiles,
-      checkedImports: imports.length,
+      scannedFiles: groups.reduce((sum, group) => sum + group.scannedFiles, 0),
+      checkedImports: groups.reduce((sum, group) => sum + group.checkedImports, 0),
       missingPackages,
+      unresolvedFiles,
+      listingBudgetExhausted: budgetExhausted,
+      ...(unresolvedFiles.length > 0
+        ? {
+            message: `${unresolvedFiles.length} file${unresolvedFiles.length === 1 ? '' : 's'} could not be matched to a manifest within ${DEPENDENCY_MAX_MANIFEST_ANCESTOR_DEPTH} levels (${unresolvedFiles.slice(0, 3).join(', ')}${unresolvedFiles.length > 3 ? ', …' : ''}).`,
+          }
+        : {}),
     });
   } catch (err) {
     console.error('GitHub dependency analysis proxy error:', err);
