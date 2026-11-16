@@ -40,6 +40,12 @@ export interface GitHubRepoStructure {
   likelyBackend: boolean;
   likelyFullstack: boolean;
   detectedFiles: string[];
+  /** True when the manifests live in package sub-directories rather than the root. */
+  monorepo?: boolean;
+  /** Sub-directories the snapshot probed, e.g. `["client", "server"]`. */
+  scannedDirectories?: string[];
+  /** True when a package sub-directory held both a manifest and frontend sources. */
+  packageHasFrontendSources?: boolean;
 }
 
 /** A branch of a repository, as returned by GET /api/github/branches. */
@@ -76,6 +82,22 @@ export type DependencyEcosystem =
   | 'cpp'
   | 'unknown';
 
+/** One manifest's share of a dependency analysis batch (monorepo aware). */
+export interface GitHubManifestGroup {
+  /** Repository-relative manifest path, e.g. `server/package.json`. */
+  manifestPath: string;
+  /** Directory holding the manifest (`''` for the repository root). */
+  manifestDirectory: string;
+  /** Every manifest read for this group (e.g. package.json + package-lock.json). */
+  manifestFiles: string[];
+  /** Submitted files that resolved to this manifest. */
+  matchedFiles: string[];
+  scannedFiles: number;
+  checkedImports: number;
+  /** Packages imported by this group's files but absent from its own manifest. */
+  missingPackages: string[];
+}
+
 /** Result of POST /api/github/analyze-dependencies (Universal Dependency Verification). */
 export interface GitHubDependencyAnalysis {
   ecosystem: DependencyEcosystem;
@@ -85,14 +107,23 @@ export interface GitHubDependencyAnalysis {
   /** False when no manifest file was found up to 3 directories above the sources. */
   manifestFound: boolean;
   /**
-   * Exact repository-relative path of the manifest that was parsed, e.g.
-   * `frontend/package.json` for a monorepo. Null when none was found.
+   * Exact repository-relative path of the first manifest that was parsed, e.g.
+   * `frontend/package.json` for a monorepo. Null when none was found. In a mixed
+   * batch this is the shallowest group; see `manifests` for every group.
    */
   manifestPath: string | null;
   /** Directory holding the manifest (`''` for the repository root). */
   manifestDirectory: string | null;
   /** Manifest files that were found and parsed (repository-relative paths). */
   manifestFiles: string[];
+  /** One entry per manifest in the batch — the monorepo view of the results. */
+  manifests?: GitHubManifestGroup[];
+  /** Roll-up sentence, e.g. `Scanned 2 manifests: client/package.json (missing: react); …`. */
+  manifestSummary?: string;
+  /** Number of manifests analysed (equals `manifests.length` when present). */
+  manifestCount?: number;
+  /** Files that resolved to no manifest within the search depth. */
+  unresolvedFiles?: string[];
   /** How many parent directories above each source file were searched. */
   searchDepth?: number;
   scannedFiles: number;

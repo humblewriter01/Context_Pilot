@@ -161,8 +161,8 @@ Context Pilot includes a production `render.yaml` blueprint:
 | `DELETE /api/user/github-token` | Supabase JWT | Disconnect GitHub (removes the stored token). |
 | `GET /api/github/repos` | Supabase JWT | Proxied GitHub repository list using the stored token. |
 | `GET /api/github/branches?repo={owner}/{repo}` | Supabase JWT | Proxied branch list for the branch picker: default branch pinned first, then the 100 most recent branches. |
-| `POST /api/github/verify` | Supabase JWT | Proxied file-path verification + repo structure snapshot. |
-| `POST /api/github/analyze-dependencies` | Supabase JWT | Polyglot import check against a manifest discovered hierarchically (the file's directory, then up to 3 parents) on the selected branch; returns the exact `manifestPath` (e.g. `frontend/package.json`). |
+| `POST /api/github/verify` | Supabase JWT | Proxied file-path verification + repo structure snapshot. When the root has no manifest, `client/`, `frontend/`, `app/` (and other package dirs) are probed one level deep, so monorepos report `likelyFrontend` correctly. |
+| `POST /api/github/analyze-dependencies` | Supabase JWT | Polyglot import check. The manifest is discovered per file (its own directory, then up to 3 parents) on the selected branch, files are grouped by the manifest they resolve to, and **each group is compared against its own manifest** — so a mixed `client/` + `server/` batch reports both. Returns `manifests[]`, a roll-up `manifestSummary`, and the exact `manifestPath`. |
 | `DELETE /api/history/:id` | Supabase JWT (owner only) | Delete one record (UUID or ticket key). |
 | `POST /api/feedback` / `GET /api/feedback` | Supabase JWT | Accuracy feedback, scoped to the caller. |
 | `POST /api/paystack/initialize` | public | Server-priced checkout (client amounts are ignored). |
