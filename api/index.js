@@ -3102,7 +3102,16 @@ var JS_BUILTINS = /* @__PURE__ */ new Set([
   "vm",
   "wasi",
   "worker_threads",
-  "zlib"
+  "zlib",
+  // Added in later Node releases; `node:test` in particular is used by every
+  // modern test file.
+  "test",
+  "sqlite",
+  "diagnostics_channel",
+  "inspector",
+  "sea",
+  "node:test",
+  "node:sqlite"
 ]);
 var PYTHON_STDLIB = /* @__PURE__ */ new Set([
   "abc",
@@ -3267,18 +3276,38 @@ function resolvePhpPackage(useStatement) {
   if (alias) return alias;
   return `${vendor}/${kebabCase(parts[1])}`;
 }
+function maskSource(content) {
+  const withoutRegex = content.replace(
+    /(^|[=(,:;[{!&|?+\-*%<>~^]|\breturn\b|\btypeof\b|\bcase\b)\s*\/(?![*/])(?:[^\/\\\n[]|\\[^\n]|\[(?:[^\]\\\n]|\\[^\n])*\])+\/[gimsuyd]*/g,
+    "$1 /@@regex@@/"
+  );
+  let masked = withoutRegex.replace(/`(?:[^`\\]|\\.)*`/g, "``").replace(/'(?:[^'\\\n]|\\.)*'/g, "''").replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
+  masked = masked.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:\\])\/\/[^\n]*/g, "$1").replace(/<!--[\s\S]*?-->/g, " ");
+  const uncommented = withoutRegex.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:\\])\/\/[^\n]*/g, "$1").replace(/<!--[\s\S]*?-->/g, " ");
+  return { code: uncommented, proseFree: masked };
+}
 function extractImports(ecosystem, content) {
   const imports = /* @__PURE__ */ new Set();
   const add = (name) => {
     const trimmed = name?.trim();
     if (trimmed) imports.add(trimmed);
   };
+  const { code, proseFree } = maskSource(content);
   switch (ecosystem) {
     case "node": {
-      const re = /(?:import\s+(?:[\s\S]*?\sfrom\s*)?|export\s+[\s\S]*?\sfrom\s*|require\s*\(\s*|import\s*\(\s*)['"]([^'"]+)['"]/g;
-      for (const m of content.matchAll(re)) {
+      const staticRe = /\b(?:import|export)\s+(?:type\s+)?(?:[^;='"`()!=]{1,500}?\s*from\s*)?['"]([^'"\n]+)['"]/g;
+      for (const m of code.matchAll(staticRe)) {
         let spec = m[1];
-        if (spec.startsWith("node:")) spec = spec.slice(5);
+        if (spec.startsWith("node:")) continue;
+        if (spec.startsWith(".") || spec.startsWith("/") || spec.startsWith("#")) continue;
+        const top = spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0];
+        if (!top || JS_BUILTINS.has(top)) continue;
+        add(top);
+      }
+      const dynamicRe = /\b(?:require|import)\s*\(\s*['"]([^'"]+)['"]/g;
+      for (const m of code.matchAll(dynamicRe)) {
+        let spec = m[1];
+        if (spec.startsWith("node:")) continue;
         if (spec.startsWith(".") || spec.startsWith("/") || spec.startsWith("#")) continue;
         const top = spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0];
         if (!top || JS_BUILTINS.has(top)) continue;
@@ -3287,12 +3316,13 @@ function extractImports(ecosystem, content) {
       break;
     }
     case "python": {
-      for (const m of content.matchAll(/^\s*from\s+([A-Za-z_][\w.]*)\s+import/gm)) {
+      const pythonCode = proseFree.replace(/(^|[^#'"\\])#[^\n]*/g, "$1");
+      for (const m of pythonCode.matchAll(/^\s*from\s+([A-Za-z_][\w.]*)\s+import/gm)) {
         const root = m[1].split(".")[0];
         if (PYTHON_STDLIB.has(root)) continue;
         add(PYTHON_IMPORT_TO_PACKAGE[root] || root);
       }
-      for (const m of content.matchAll(/^[ \t]*import[ \t]+([A-Za-z_][\w., \t]*)/gm)) {
+      for (const m of pythonCode.matchAll(/^[ \t]*import[ \t]+([A-Za-z_][\w., \t]*)/gm)) {
         for (const part of m[1].split(",")) {
           const root = part.trim().split(/\s+as\s+/)[0].trim().split(".")[0];
           if (root && !PYTHON_STDLIB.has(root)) add(PYTHON_IMPORT_TO_PACKAGE[root] || root);
@@ -3332,7 +3362,8 @@ function extractImports(ecosystem, content) {
       break;
     }
     case "ruby": {
-      for (const m of content.matchAll(/^\s*require(?!_relative)\s+['"]([^'"]+)['"]/gm)) {
+      const rubyCode = proseFree.replace(/(^|[^#'"\\])#[^\n]*/g, "$1");
+      for (const m of rubyCode.matchAll(/^\s*require(?!_relative)\s+['"]([^'"]+)['"]/gm)) {
         const spec = m[1];
         if (["bundler", "rubygems"].includes(spec)) continue;
         add(spec.split("/")[0]);

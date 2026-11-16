@@ -4069,6 +4069,9 @@ const JS_BUILTINS = new Set([
   'dgram', 'dns', 'domain', 'events', 'fs', 'http', 'http2', 'https', 'module', 'net', 'os', 'path',
   'perf_hooks', 'process', 'punycode', 'querystring', 'readline', 'repl', 'stream', 'string_decoder',
   'sys', 'timers', 'tls', 'tty', 'url', 'util', 'v8', 'vm', 'wasi', 'worker_threads', 'zlib',
+  // Added in later Node releases; `node:test` in particular is used by every
+  // modern test file.
+  'test', 'sqlite', 'diagnostics_channel', 'inspector', 'sea', 'node:test', 'node:sqlite',
 ]);
 
 const PYTHON_STDLIB = new Set([
@@ -4140,6 +4143,52 @@ function resolvePhpPackage(useStatement: string): string | null {
   return `${vendor}/${kebabCase(parts[1])}`;
 }
 
+/**
+ * Masks prose so it cannot look like code, while leaving real statements intact.
+ *
+ * Import scanning is deliberately regex-based (no parser, so it works for every
+ * ecosystem and for partial files), which means comments can look like imports:
+ * a doc line reading "export const … from the queue" or a note saying "nobody
+ * was home" would otherwise surface as a package. Real repositories are full of
+ * such lines, so two masks are produced:
+ *
+ *  - `code`: comments removed, string literals preserved. This is what import
+ *    patterns read, so specifiers are still available.
+ *  - `proseFree`: additionally blanks string and template literal bodies. This
+ *    is what anchored `^\s*import` patterns read, so prose cannot satisfy them.
+ *
+ * String literals are blanked before comments so an apostrophe in prose
+ * ("the customer's session") cannot open a bogus string and swallow the file.
+ */
+function maskSource(content: string): { code: string; proseFree: string } {
+  // 0. Blank regex literals first. A test that asserts on source text embeds
+  //    patterns like /import \* as x from '[^']*'/ whose contents would
+  //    otherwise be read as a real import. Only literals in expression position
+  //    are matched (after an operator, `(`/`,`/`=`), never after `//` or `/*`,
+  //    so URLs and comments are untouched.
+  const withoutRegex = content.replace(
+    /(^|[=(,:;[{!&|?+\-*%<>~^]|\breturn\b|\btypeof\b|\bcase\b)\s*\/(?![*/])(?:[^\/\\\n[]|\\[^\n]|\[(?:[^\]\\\n]|\\[^\n])*\])+\/[gimsuyd]*/g,
+    '$1 /@@regex@@/'
+  );
+  // 1. Blank string and template literal bodies, keeping the delimiters.
+  let masked = withoutRegex
+    .replace(/`(?:[^`\\]|\\.)*`/g, '``')
+    .replace(/'(?:[^'\\\n]|\\.)*'/g, "''")
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
+  // 2. Remove comments from the masked copy.
+  masked = masked
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:\\])\/\/[^\n]*/g, '$1')
+    .replace(/<!--[\s\S]*?-->/g, ' ');
+  // 3. Comments removed from the regex-masked original, so specifier literals
+  //    stay available while fixture patterns cannot impersonate an import.
+  const uncommented = withoutRegex
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:\\])\/\/[^\n]*/g, '$1')
+    .replace(/<!--[\s\S]*?-->/g, ' ');
+  return { code: uncommented, proseFree: masked };
+}
+
 /** Extracts third-party import identifiers from a source file for the ecosystem. */
 function extractImports(ecosystem: DependencyEcosystem, content: string): string[] {
   const imports = new Set<string>();
@@ -4148,12 +4197,31 @@ function extractImports(ecosystem: DependencyEcosystem, content: string): string
     if (trimmed) imports.add(trimmed);
   };
 
+  const { code, proseFree } = maskSource(content);
+
   switch (ecosystem) {
     case 'node': {
-      const re = /(?:import\s+(?:[\s\S]*?\sfrom\s*)?|export\s+[\s\S]*?\sfrom\s*|require\s*\(\s*|import\s*\(\s*)['"]([^'"]+)['"]/g;
-      for (const m of content.matchAll(re)) {
+      // `import … from 'x'` / `export … from 'x'`. The clause between the keyword
+      // and `from` is restricted to the characters a real specifier list uses:
+      // identifiers, braces, `*` and commas. Newlines are allowed, but `=`, `!`
+      // and `(` are not, so the bridge cannot cross a statement and latch onto a
+      // later string (e.g. `entry.name === 'test'`).
+      const staticRe = /\b(?:import|export)\s+(?:type\s+)?(?:[^;='"`()!=]{1,500}?\s*from\s*)?['"]([^'"\n]+)['"]/g;
+      for (const m of code.matchAll(staticRe)) {
         let spec = m[1];
-        if (spec.startsWith('node:')) spec = spec.slice(5);
+        // The `node:` scheme is reserved for core modules, so it is never a
+        // third-party dependency (and `node:test` must not become "test").
+        if (spec.startsWith('node:')) continue;
+        if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('#')) continue;
+        const top = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0];
+        if (!top || JS_BUILTINS.has(top)) continue;
+        add(top);
+      }
+      // require('x') / import('x') — dynamic forms.
+      const dynamicRe = /\b(?:require|import)\s*\(\s*['"]([^'"]+)['"]/g;
+      for (const m of code.matchAll(dynamicRe)) {
+        let spec = m[1];
+        if (spec.startsWith('node:')) continue; // core module, see above
         if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('#')) continue;
         const top = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0];
         if (!top || JS_BUILTINS.has(top)) continue;
@@ -4162,12 +4230,14 @@ function extractImports(ecosystem: DependencyEcosystem, content: string): string
       break;
     }
     case 'python': {
-      for (const m of content.matchAll(/^\s*from\s+([A-Za-z_][\w.]*)\s+import/gm)) {
+      // `#` comments are the Python equivalent of the prose noise stripped above.
+      const pythonCode = proseFree.replace(/(^|[^#'"\\])#[^\n]*/g, '$1');
+      for (const m of pythonCode.matchAll(/^\s*from\s+([A-Za-z_][\w.]*)\s+import/gm)) {
         const root = m[1].split('.')[0];
         if (PYTHON_STDLIB.has(root)) continue;
         add(PYTHON_IMPORT_TO_PACKAGE[root] || root);
       }
-      for (const m of content.matchAll(/^[ \t]*import[ \t]+([A-Za-z_][\w., \t]*)/gm)) {
+      for (const m of pythonCode.matchAll(/^[ \t]*import[ \t]+([A-Za-z_][\w., \t]*)/gm)) {
         for (const part of m[1].split(',')) {
           const root = part.trim().split(/\s+as\s+/)[0].trim().split('.')[0];
           if (root && !PYTHON_STDLIB.has(root)) add(PYTHON_IMPORT_TO_PACKAGE[root] || root);
@@ -4212,7 +4282,9 @@ function extractImports(ecosystem: DependencyEcosystem, content: string): string
       break;
     }
     case 'ruby': {
-      for (const m of content.matchAll(/^\s*require(?!_relative)\s+['"]([^'"]+)['"]/gm)) {
+      // `#` comments are the Ruby equivalent of the prose noise stripped above.
+      const rubyCode = proseFree.replace(/(^|[^#'"\\])#[^\n]*/g, '$1');
+      for (const m of rubyCode.matchAll(/^\s*require(?!_relative)\s+['"]([^'"]+)['"]/gm)) {
         const spec = m[1];
         if (['bundler', 'rubygems'].includes(spec)) continue;
         add(spec.split('/')[0]);
